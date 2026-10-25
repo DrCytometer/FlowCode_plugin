@@ -13,12 +13,18 @@ Pages
     4. Debarcode & FRET    backbone characterisation: combo frequencies,
                            FRET/spillover heatmap, panel expression before
                            and after correction, fit diagnostics
-    5. Unmix & Export      FlowCode unmixing and FCS export of the selected
-                           samples
+    5. Unmix & Export      optional Fix My Unmix on FlowCode-corrected data
+                           (flowcode_fix_unmix.py), FlowCode unmixing and FCS
+                           export of the selected samples
+    6. Analysis            differential barcode distributions
+                           (flowcode_analysis_page.py)
 
 Numerics live in flowcode_core.py, the experiment state in flowcode_state.py
-and the section 4 figures in flowcode_plots.py, next to this file. The state
-is saved with the experiment in ``process['flowcode_unmix']`` and the
+and the section 4 figures in flowcode_plots.py, next to this file. Unmixing
+follows the experiment's method set on the AutoSpectral tab
+(flowcode_method.py: per-cell AF, noise model, spectral variants, spectral
+corrections); whole samples are unmixed and written by flowcode_export.py.
+The state is saved with the experiment in ``process['flowcode_unmix']`` and the
 characterised backbone in ``cache/flowcode_spectra.npz``; event data are kept
 for the session only and reloaded on demand.
 """
@@ -31,7 +37,7 @@ import os
 import sys
 from copy import deepcopy
 from datetime import datetime
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,8 +46,8 @@ from PySide6.QtCore import Qt, QObject, QSettings, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListWidget,
-    QListWidgetItem, QMenu, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QTableWidget,
-    QTableWidgetItem, QToolBox, QVBoxLayout, QWidget,
+    QListWidgetItem, QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QTableWidget,
+    QTableWidgetItem, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 from flowkit import GatingStrategy, gates as fk_gates
 
@@ -49,10 +55,12 @@ import honeychrome.settings as hc_settings
 from honeychrome.controller_components.autospectral_functions import af_index_lookup
 from honeychrome.controller_components.cytometer_whitelist import singlet_channels
 from honeychrome.controller_components.functions import calc_hists, calc_stats, define_polygon_gate
-from honeychrome.controller_components.sample_loader import read_raw_events, seeded_subsample_indices
+from honeychrome.controller_components.sample_loader import (
+    read_raw_events, read_raw_subsample, seeded_subsample_indices,
+)
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 from honeychrome.view_components.event_bus import EventBus
-from honeychrome.view_components.help_toggle_widget import HelpToggleWidget, WheelBlocker
+from honeychrome.view_components.help_toggle_widget import WheelBlocker
 from honeychrome.view_components.icon_loader import icon
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +70,12 @@ if _HERE not in sys.path:
 import flowcode_core as fcc  # noqa: E402
 import flowcode_plots as fcp  # noqa: E402
 import flowcode_state as fcs  # noqa: E402
+import flowcode_analysis as fa  # noqa: E402
+import flowcode_analysis_page as fap  # noqa: E402
+import flowcode_export as fce  # noqa: E402
+import flowcode_method as fcm  # noqa: E402
+import flowcode_fix_unmix as fcfu  # noqa: E402
+import flowcode_figure_panel as fcfp  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +95,8 @@ OUTPUT_SUBDIR = 'FlowCode'
 GATE_PLOT_SIZE = 360
 THRESHOLD_PLOT_SIZE = 440
 ASSESS_PLOT_SIZE = 400
+# Widest a sample-name column opens (pixels); longer names are elided in the middle.
+SAMPLE_COLUMN_MAX_WIDTH = 280
 
 # Default export folder (in the experiment folder) and file name suffix.
 EXPORT_SUBDIR = 'FlowCode Unmixed'
@@ -94,14 +110,26 @@ _DONE_STYLE = 'color: #2ca02c;'
 _HINT_STYLE = 'color: grey; font-style: italic;'
 _BANNER_STYLE = ('QLabel { color: #856404; background: #fff3cd; border: 1px solid #ffc107; '
                  'border-radius: 4px; padding: 8px; }')
+_INVALID_STYLE = 'color: #d62728; font-weight: bold;'
 
-SETUP_BANNER = ('Run Setup in the AutoSpectral Optimization tab first. It computes the spectral variants '
-                'used for per-cell optimisation in the final unmix and the unstained-derived positivity '
-                'thresholds used as the rescue noise floor.')
+# Debarcoding without FRET correction (no FRET backbone).
+BACKBONE_TITLE = 'Backbone'
+NO_FRET_BACKBONE_TITLE = 'Samples for gates and thresholds'
+BACKBONE_HINT = 'Tick one or more samples; their events are pooled.'
+NO_FRET_BACKBONE_HINT = ('Tick one or more barcoded samples; their pooled events set the FlowCode gates, the '
+                         'thresholds and the rescue references. No FRET error is fitted on them.')
+NO_FRET_EXPLANATION = ('Without FRET backbone controls, FRET, residual tag spillover and tandem breakdown are '
+                       'not removed, so the combination calls, marker intensities and every statistic built on '
+                       'them can be wrong. Use these results to test the pipeline only.')
+NO_FRET_NOT_PERFORMED = ('FRET correction not performed: "No FRET backbone" is ticked in section 1.\n'
+                         + fcs.NO_FRET_WARNING)
 
-KERNEL_BANNER = ('<b>Compiled AutoSpectral Optimization kernel not found.</b> Per-cell AF unmixing uses '
-                 "Honeychrome's Python implementation and the final unmix runs without per-cell spectral "
-                 'variants. Run <tt>build_autospectral_opt_kernel.py</tt> (in bundled_plugins/) to enable them.')
+METHOD_API_MESSAGE = (f'{plugin_name}: this version of Honeychrome does not apply the experiment\'s unmixing '
+                      'method to plugins (no AutoSpectral tab noise model). Update Honeychrome to use this '
+                      'version of the plugin.')
+
+DEBARCODE_ITEMS = (('Per-cell AF (default)', fcm.DEBARCODE_R1),
+                   ("The experiment's unmixing method (AutoSpectral tab)", fcm.DEBARCODE_EXPERIMENT))
 
 _HELP = {
     1: ('<p><b>Backbone</b>: the samples used to characterise the FlowCode unmixing error, usually pools '
@@ -110,24 +138,43 @@ _HELP = {
         'name are ticked at first; single-stain controls and unstained samples are not listed. '
         '<b>Matched unstained</b>: the unstained sample whose FSC/SSC '
         'distribution is closest to the pooled backbone (Bhattacharyya coefficient of the scatter histograms, '
-        '1 = identical); click a row to choose a different one. Its AF profiles, extracted in the '
-        'AutoSpectral AF tab, are used for per-cell AF unmixing during debarcoding.</p>'
+        '1 = identical); click a row to choose a different one. Its AF profiles, extracted on the '
+        'Autofluorescence page of the AutoSpectral tab, are used for per-cell AF unmixing during debarcoding.</p>'
         '<p><b>Combinations CSV</b> (optional): the FlowCodeUnmix file with an <tt>Id</tt> column and '
-        'three tag columns. Without it, every 3-tag combination of the ticked tags is used.</p>'),
+        'three tag columns. Without it, every 3-tag combination of the ticked tags is used.</p>'
+        '<p><b>No FRET backbone</b>: for samples acquired before FRET backbone controls were run. The ticked '
+        'samples then only set the gates, thresholds and rescue references (section 3); section 4 debarcodes '
+        'them without fitting the FRET error, and sections 5 and 6 leave FRET, residual tag spillover and '
+        'tandem breakdown uncorrected. Switching it on, each export and each Analysis report export ask you '
+        'to acknowledge that the results are invalid, and the exported files, the report and the Analysis '
+        'figures carry the warning. For testing the pipeline only.</p>'),
     2: ('<p>Tick the unmixed channels that carry a FlowCode tag. Channels whose antigen is a known tag '
         '(HA, V5, AU1, AU5, S, C, Flag, NWS, VSVg, Ollas) are ticked automatically. '
         '<b>Nearest tag</b> is the other tag with the most similar reference spectrum; it is the '
         'default y-axis of the threshold plot.</p>'
         '<p>Untick <b>Include</b> to drop a combination: its events are then reported as unresolved. '
-        'Names become exported channels <tt>FC &lt;name&gt;</tt>.</p>'),
+        'Names become exported channels <tt>FC &lt;name&gt;</tt>.</p>'
+        '<p><b>Several libraries</b> (Advanced options): for samples transduced with different guide '
+        'libraries on the same tags. Each library has its own combinations CSV, and each sample is assigned '
+        'to one library, or to <i>Other</i> for samples that belong to none (e.g. FMOs). Debarcoding uses '
+        'every triplet of every library, so combinations are named by their triplet '
+        '(<tt>FC AU1_C_FLAG</tt>); the guide names come from each library\'s CSV. <b>Assign by pattern</b> '
+        'matches each library\'s sample-name pattern (a regular expression, case-insensitive) against the '
+        'sample names; the default pattern finds the library\'s number, letter or name after '
+        '<tt>Librar</tt>, directly or after a space or underscore (<tt>Library1</tt>, <tt>Library 1</tt>, '
+        '<tt>Library_1</tt>, but not <tt>Library10</tt>). It runs once on its own when Several libraries is '
+        'first ticked, for samples without a library. <b>Label</b> is the name shown in the results. With '
+        '<b>Merge guides with the same name</b>, a guide name used by several libraries (e.g. a '
+        'non-targeting control) is one guide in the Analysis.</p>'),
     3: ('<p><b>FlowCode Singlets</b> keeps events whose FSC area/height ratio is below the 85th '
         'percentile. <b>FlowCode Cells</b> surrounds the scatter of the events most clearly positive '
         'for three tags (70% robust Mahalanobis contour), enlarged 1.5 times about its centre so it '
         'does not clip barcoded cells. Drag the gates to edit them, or drag the round handle on FlowCode '
         'Cells to enlarge or shrink the whole gate about its centre; <b>Use experiment gate</b> copies '
         'the Cells or Singlets gate from the Raw Data tab.</p>'
-        '<p><b>Confirm gates</b> unmixes the gated backbone and matched unstained with per-cell AF '
-        '(the debarcoding space) and sets a starting threshold per tag: a two-component mixture '
+        '<p><b>Confirm gates</b> unmixes the gated backbone and matched unstained in the debarcoding space '
+        '(per-cell AF by default; <i>Debarcode with</i> in Advanced settings can use the experiment\'s '
+        'unmixing method instead) and sets a starting threshold per tag: a two-component mixture '
         'crossover when the tag is bimodal, otherwise the upper 1% tail of the negatives, never below '
         'the 99.5th percentile of the unstained. Drag the red line or edit the raw value to change '
         'a threshold. <b>Import thresholds CSV</b> reads a FlowCodeUnmix thresholds file (Fluor, Tag, '
@@ -151,21 +198,32 @@ _HELP = {
         '<p>The heatmap shows how much each channel gains per unit of on-tag abundance at the '
         "combination's median expression (outlined: the combination's own tags); <b>Curvature</b> in "
         'the table is how far the fitted error bends away from a straight line. The panel expression '
-        'plot and the biplots use the final unmix of section 5 (the compiled kernel with per-cell '
-        'variants and cell.weight when they are set) on untransduced and barcoded events, without and '
-        'with the fitted error removed; barcoded events are drawn as larger points. Results are saved '
+        'plot and the biplots use the final unmix of section 5 (the experiment\'s unmixing method, set '
+        'on the AutoSpectral tab) on untransduced and barcoded events, without and with the fitted error '
+        'removed; tick <i>Draw barcoded events as points</i> to show the barcoded events as larger points '
+        'over the density. The plots are drawn again when the method '
+        'changes; the characterisation itself is measured on raw data and stays valid. Results are saved '
         'with the experiment; <tt>FlowCode/thresholds.csv</tt> and <tt>FlowCode/combinations.csv</tt> can '
-        'be read by FlowCodeUnmix in R.</p>'),
+        'be read by FlowCodeUnmix in R.</p>'
+        '<p>With <b>No FRET backbone</b> ticked in section 1, the button debarcodes only: combination '
+        'frequencies and the rescue references, without the error model, the heatmap, the before/after '
+        'plots or the tandem reference.</p>'),
     5: ('<p>Unmixes the selected samples with FlowCode error correction (unmix.flowcode.staged()): '
         'per-cell AF unmixing with the sample\'s own AF library, debarcoding with the backbone '
         'thresholds and too-many and too-few-tag rescue, subtraction of the characterised error from the '
-        'raw data, then the final unmix, with per-cell spectral variants when ticked. Each file gets a '
+        'raw data, then the final unmix with the experiment\'s unmixing method (AutoSpectral tab: per-cell '
+        'AF, the noise model or spectral variants, with the spectral corrections of the sample\'s group '
+        'when they are in use). Each file gets a '
         '<tt>FlowCode</tt> channel (the median final abundance of a barcoded event\'s three tags, 0 '
-        'otherwise) and one <tt>FC &lt;name&gt;</tt> channel per combination.</p>'
+        'otherwise), a <tt>FlowCode ID</tt> channel (0 untransduced, 1 to n the combination in table '
+        'order, n + 1 unresolved) and one <tt>FC &lt;name&gt;</tt> channel per combination. The '
+        'keywords <tt>FLOWCODESOURCE</tt> (the experiment sample) and <tt>FLOWCODECHARACTERISATION</tt> '
+        '(an identifier of the thresholds, combinations and tag spectra used) let the Analysis page '
+        'link each file to its sample and check it is current.</p>'
         '<p>Files are written as <tt>&lt;sample&gt; FlowCode (Unmixed).fcs</tt>, mirroring the raw folder '
         'structure, with <tt>FlowCode_debarcode_summary.csv</tt> (event counts per sample and '
         'combination) and <tt>FlowCode_run.json</tt> (thresholds and settings) beside them.</p>'
-        '<p>Each sample is unmixed with the AF profiles assigned to it in the AutoSpectral AF tab plus the '
+        '<p>Each sample is unmixed with the AF profiles assigned to it on the Autofluorescence page of the AutoSpectral tab plus the '
         'AF profiles the thresholds were set with (section 3), so debarcoding uses at least the AF '
         'spectra the thresholds were set in. Samples whose library has fewer than 2 spectra cannot be '
         'selected.</p>'
@@ -456,11 +514,6 @@ def _cytometer_db_col(controller):
     return controller.experiment.settings.get('raw', {}).get('cytometer_db_col')
 
 
-def _optimization_setup_done(controller) -> bool:
-    return bool(getattr(controller, 'autospectral_variants', None)) and \
-        getattr(controller, 'autospectral_unmixed_pos_thresholds', None) is not None
-
-
 def _sample_name(controller, key) -> str:
     return str((controller.experiment.samples.get('all_samples') or {}).get(key, key))
 
@@ -654,9 +707,9 @@ def match_unstained(experiment_dir, backbone_keys, candidates: list, layout: Raw
     fx, fy = _forward(tr_x), _forward(tr_y)
 
     def scatter(key):
-        raw = read_raw_events(Path(experiment_dir) / key, layout.reader())
-        idx = seeded_subsample_indices(len(raw), max_events, key, seed=42)
-        sc = raw[idx][:, [col_x, col_y]]
+        raw, _rows, _n_file, _n_kept = read_raw_subsample(
+            Path(experiment_dir) / key, layout.reader(), key, max_events, seed=42)
+        sc = raw[:, [col_x, col_y]]
         return sc[~np.any(sc >= 0.999 * ceilings, axis=1)]
 
     def histogram(sc):
@@ -808,11 +861,12 @@ def auto_cells_gate(data: BackboneData, singlet_record: dict | None, layout: Raw
 
 def compute_debarcode_space(backbone_fl: np.ndarray, unstained_fl: np.ndarray, spectra: np.ndarray,
                             fluor_names, tag_fluors, af_spectra: np.ndarray, pos_thresholds,
-                            cell_weight: bool, magnitude_ceiling: float, settings: dict, progress) -> tuple:
-    """Debarcoding space of the gated events and the automatic thresholds."""
-    progress(0, 2, 'per-cell AF unmixing')
+                            magnitude_ceiling: float, settings: dict, progress, unmix_fn, engine: str) -> tuple:
+    """Debarcoding space of the gated events (*unmix_fn*: raw -> unmix
+    dict) and the automatic thresholds."""
+    progress(0, 2, f'unmixing ({engine})')
     space = fcc.debarcoding_space(backbone_fl, unstained_fl, spectra, fluor_names, tag_fluors, af_spectra,
-                                  pos_thresholds=pos_thresholds, cell_weight=cell_weight)
+                                  pos_thresholds=pos_thresholds, unmix_fn=unmix_fn, engine=engine)
     progress(1, 2, 'thresholds')
     names = list(fluor_names)
     tag_cols = [names.index(f) for f in tag_fluors]
@@ -871,7 +925,7 @@ def run_characterisation(raw_fl: np.ndarray, debarcode_unmixed: np.ndarray, unst
                          thresholds: np.ndarray, spectra: np.ndarray, fluor_names, detectors,
                          af_mean: np.ndarray, rescue_floor, magnitude_ceiling: float, settings: dict,
                          final_fn, engine: str, transforms: dict, labels: dict, progress,
-                         tandems=(), debarcode_af_scale=None) -> CharacteriseOutput:
+                         tandems=(), debarcode_af_scale=None, fit_error: bool = True) -> CharacteriseOutput:
     """Characterise the gated backbone, then unmix the events the figures
     show (the display subsample and the panel expression groups) with the
     export's final unmix, without and with the FlowCode correction.
@@ -881,6 +935,8 @@ def run_characterisation(raw_fl: np.ndarray, debarcode_unmixed: np.ndarray, unst
                          each is the reference for the export.
     debarcode_af_scale : per-cell AF abundance in debarcoding space, for the
                          too-few rescue.
+    fit_error          : False debarcodes only (no FRET backbone); the
+                         events are then unmixed once, uncorrected.
     """
     progress(0, 3, 'debarcoding and fitting the FlowCode error')
     char_settings = fcc.CharacteriseSettings(**{f.name: settings[f.name]
@@ -889,7 +945,7 @@ def run_characterisation(raw_fl: np.ndarray, debarcode_unmixed: np.ndarray, unst
         raw_fl, debarcode_unmixed, design, thresholds, spectra, fluor_names, detectors, af_mean,
         fcc.logicle_transform(magnitude_ceiling), _rescue_transform_params(magnitude_ceiling),
         rescue_floor=rescue_floor, unstained_raw=unstained_fl, settings=char_settings, tandems=list(tandems),
-        debarcode_af_scale=debarcode_af_scale,
+        debarcode_af_scale=debarcode_af_scale, fit_error=fit_error,
     )
     display_idx = seeded_subsample_indices(len(raw_fl), int(settings['characterise_display_max_events']),
                                            'flowcode_characterise_display', seed=42)
@@ -898,7 +954,7 @@ def run_characterisation(raw_fl: np.ndarray, debarcode_unmixed: np.ndarray, unst
     rows = np.union1d(np.union1d(display_idx, negative), barcoded)
     progress(1, 3, f'unmixing {rows.size:,} backbone events before and after correction ({engine})')
     before = _unmix_rows(final_fn, raw_fl, rows, len(fluor_names))
-    after = _unmix_rows(final_fn, result.corrected_raw, rows, len(fluor_names))
+    after = _unmix_rows(final_fn, result.corrected_raw, rows, len(fluor_names)) if fit_error else before
     progress(2, 3, 'preparing the figures')
     summary = fcc.debarcode_summary(result.ids, design, rescued=len(result.rescued),
                                     rescued_toofew=len(result.rescued_toofew))
@@ -1042,28 +1098,29 @@ class _SideTabWidget(QWidget):
 class _Page(QWidget):
     """
     Common page frame: title, status line and help above either one
-    scrollable body or, with ``concertina``, a fixed header (``body``) and
-    collapsible sections that fill the rest of the page, one open at a time
-    (``add_section``). The open section is remembered between sessions.
+    scrollable body or, with ``tabbed``, a fixed header (``body``) and a
+    row of tabs (``add_section``) whose pages fill the rest of the page.
+    The open tab is remembered between sessions.
     """
 
-    def __init__(self, plugin: 'PluginWidget', section: int, parent=None, concertina: bool = False):
+    def __init__(self, plugin: 'PluginWidget', section: int, parent=None, tabbed: bool = False):
         super().__init__(parent)
         self.plugin = plugin
         self.section = section
-        self.toolbox = None
+        self.section_tabs = None
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         body = QWidget()
         self.body = QVBoxLayout(body)
         self.body.setAlignment(Qt.AlignTop)
         self.body.setSpacing(10)
-        if concertina:
+        if tabbed:
             outer.setSpacing(6)
             outer.addWidget(body)
-            self.toolbox = QToolBox()
-            outer.addWidget(self.toolbox, stretch=1)
-            self.toolbox.currentChanged.connect(
+            self.section_tabs = QTabWidget()
+            self.section_tabs.setDocumentMode(True)
+            outer.addWidget(self.section_tabs, stretch=1)
+            self.section_tabs.currentChanged.connect(
                 lambda index: plugin.qsettings.setValue(f'open_section_{section}', int(index)))
         else:
             scroll = QScrollArea()
@@ -1077,19 +1134,23 @@ class _Page(QWidget):
         self.body.addWidget(title)
         self.status = _status_label()
         self.body.addWidget(self.status)
-        self.body.addWidget(HelpToggleWidget(text=_HELP[section]))
+        self.body.addWidget(fcfp.scrolling_help(_HELP[section]))
 
-    def add_section(self, title: str) -> QVBoxLayout:
-        """A new concertina section, scrolling on its own; returns its layout."""
+    def add_section(self, title: str, scroll: bool = True) -> QVBoxLayout:
+        """A new tab, scrolling on its own (or, without *scroll*, filling the
+        tab so a figure widget can stretch); returns its layout."""
         content = QWidget()
         lay = QVBoxLayout(content)
-        lay.setAlignment(Qt.AlignTop)
         lay.setSpacing(8)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setWidget(content)
-        self.toolbox.addItem(scroll, title)
+        if not scroll:
+            self.section_tabs.addTab(content, title)
+            return lay
+        lay.setAlignment(Qt.AlignTop)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        area.setWidget(content)
+        self.section_tabs.addTab(area, title)
         return lay
 
     def restore_open_section(self, default: int = 0):
@@ -1098,16 +1159,17 @@ class _Page(QWidget):
             index = int(self.plugin.qsettings.value(f'open_section_{self.section}', default))
         except (TypeError, ValueError):
             index = default
-        if not 0 <= index < self.toolbox.count():
+        if not 0 <= index < self.section_tabs.count():
             index = default
-        self.toolbox.setCurrentIndex(index)
+        self.section_tabs.setCurrentIndex(index)
 
     def open_section(self, index: int):
-        if self.toolbox is not None and 0 <= index < self.toolbox.count():
-            self.toolbox.setCurrentIndex(index)
+        if self.section_tabs is not None and 0 <= index < self.section_tabs.count():
+            self.section_tabs.setCurrentIndex(index)
 
     def set_status(self, kind: str, text: str):
-        style = {'done': _DONE_STYLE, 'error': _ERROR_STYLE, 'stale': _WARN_STYLE}.get(kind, _HINT_STYLE)
+        style = {'done': _DONE_STYLE, 'error': _ERROR_STYLE, 'stale': _WARN_STYLE,
+                 'invalid': _INVALID_STYLE}.get(kind, _HINT_STYLE)
         self.status.setStyleSheet(style)
         self.status.setText(text)
 
@@ -1119,21 +1181,73 @@ class _Page(QWidget):
 # Page 1: inputs
 # ---------------------------------------------------------------------------
 
+_PREREQ_MARKS = {'ok': ('\u2713', _DONE_STYLE), 'warn': ('\u26a0', _WARN_STYLE),
+                 'todo': ('\u2022', _HINT_STYLE), 'info': ('\u2013', _HINT_STYLE)}
+
+
+class PrerequisitesPanel(QGroupBox):
+    """The order of work across the AutoSpectral tab and the FlowCode
+    sections, with each step's state and a button that opens the page
+    concerned (``PluginWidget.prerequisites``)."""
+
+    def __init__(self, plugin, parent=None):
+        super().__init__('Before you start', parent)
+        self.plugin = plugin
+        self.grid = QGridLayout(self)
+        self.grid.setColumnStretch(2, 1)
+        self.rows = {}
+
+    def _row(self, key: str, title: str):
+        if key not in self.rows:
+            r = len(self.rows)
+            mark = QLabel('')
+            name = QLabel(f'<b>{title}</b>')
+            text = QLabel('')
+            text.setWordWrap(True)
+            text.setTextFormat(Qt.RichText)
+            button = QPushButton('')
+            button.clicked.connect(lambda _=False, k=key: self.plugin.open_prerequisite(k))
+            for col, widget in enumerate((mark, name, text, button)):
+                self.grid.addWidget(widget, r, col, Qt.AlignTop)
+            self.rows[key] = (mark, name, text, button)
+        return self.rows[key]
+
+    def refresh(self):
+        for item in self.plugin.prerequisites():
+            mark, _name, text, button = self._row(item['key'], item['title'])
+            symbol, style = _PREREQ_MARKS[item['state']]
+            mark.setText(symbol)
+            mark.setStyleSheet(style)
+            text.setText(item['text'])
+            label, enabled, tip = item.get('button') or ('', False, '')
+            button.setVisible(bool(label))
+            button.setText(label)
+            button.setEnabled(enabled)
+            button.setToolTip(tip)
+
+
 class InputsPage(_Page):
     def __init__(self, plugin, parent=None):
         super().__init__(plugin, 1, parent)
         self._filling = False
 
-        self.setup_banner = QLabel(SETUP_BANNER)
-        self.setup_banner.setWordWrap(True)
-        self.setup_banner.setStyleSheet(_BANNER_STYLE)
-        self.body.addWidget(self.setup_banner)
+        self.prerequisites = PrerequisitesPanel(plugin)
+        self.body.addWidget(self.prerequisites)
 
-        grp = QGroupBox('Backbone')
+        grp = QGroupBox(BACKBONE_TITLE)
+        self.backbone_group = grp
         lay = QVBoxLayout(grp)
-        hint = QLabel('Tick one or more samples; their events are pooled.')
-        hint.setStyleSheet(_HINT_STYLE)
-        lay.addWidget(hint)
+        self.no_fret_check = QCheckBox('No FRET backbone: skip FRET correction (results invalid)')
+        self.no_fret_check.setToolTip('For samples acquired before FRET backbone controls were run: debarcode '
+                                      'them without FRET, spillover or tandem correction, to test the pipeline.')
+        self.no_fret_check.toggled.connect(self._on_no_fret_toggled)
+        lay.addWidget(self.no_fret_check)
+        self.no_fret_msg = _message_label(_INVALID_STYLE)
+        lay.addWidget(self.no_fret_msg)
+        self.backbone_hint = QLabel(BACKBONE_HINT)
+        self.backbone_hint.setWordWrap(True)
+        self.backbone_hint.setStyleSheet(_HINT_STYLE)
+        lay.addWidget(self.backbone_hint)
         self.backbone_list = QListWidget()
         self.backbone_list.setMaximumHeight(160)
         self.backbone_list.itemChanged.connect(self._on_backbone_item_changed)
@@ -1161,7 +1275,10 @@ class InputsPage(_Page):
         self.unstained_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.unstained_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.unstained_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.unstained_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.unstained_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.unstained_table.horizontalHeader().setStretchLastSection(False)
+        self.unstained_table.setTextElideMode(Qt.ElideMiddle)
+        self.unstained_table.setWordWrap(False)
         self.unstained_table.setMaximumHeight(220)
         self.unstained_table.cellClicked.connect(self._on_unstained_clicked)
         lay.addWidget(self.unstained_table)
@@ -1185,11 +1302,11 @@ class InputsPage(_Page):
         grp = QGroupBox('Combinations CSV (optional)')
         lay = QVBoxLayout(grp)
         row = QHBoxLayout()
-        load_btn = QPushButton('Load combinations.csv…')
-        load_btn.clicked.connect(self._on_load_csv)
+        self.load_csv_btn = QPushButton('Load combinations.csv…')
+        self.load_csv_btn.clicked.connect(self._on_load_csv)
         self.clear_csv_btn = QPushButton('Clear')
         self.clear_csv_btn.clicked.connect(self._on_clear_csv)
-        row.addWidget(load_btn)
+        row.addWidget(self.load_csv_btn)
         row.addWidget(self.clear_csv_btn)
         row.addStretch()
         lay.addLayout(row)
@@ -1208,7 +1325,13 @@ class InputsPage(_Page):
         state = self.plugin.state
         self._filling = True
         try:
-            self.setup_banner.setVisible(not _optimization_setup_done(c))
+            self.prerequisites.refresh()
+
+            no_fret = bool(state.no_fret)
+            self.no_fret_check.setChecked(no_fret)
+            self.backbone_group.setTitle(NO_FRET_BACKBONE_TITLE if no_fret else BACKBONE_TITLE)
+            self.backbone_hint.setText(NO_FRET_BACKBONE_HINT if no_fret else BACKBONE_HINT)
+            _set_message(self.no_fret_msg, [fcs.NO_FRET_WARNING] if no_fret else [])
 
             chosen = set(state.backbones())
             self.backbone_list.clear()
@@ -1225,12 +1348,17 @@ class InputsPage(_Page):
             self._fill_unstained_table()
             self._fill_af_list()
 
-            if state.csv_combos:
+            multi = bool(state.multi_library)
+            if multi:
+                self.csv_label.setText('Several libraries: the combinations files are set per library in '
+                                       'section 2 (Tags & Combos).')
+            elif state.csv_combos:
                 self.csv_label.setText(f'{Path(state.combos_csv_path or "").name}: '
                                        f'{len(state.csv_combos)} combination(s).')
             else:
                 self.csv_label.setText('No file loaded: every 3-tag combination of the ticked tags is used.')
-            self.clear_csv_btn.setEnabled(bool(state.csv_combos))
+            self.load_csv_btn.setEnabled(not multi)
+            self.clear_csv_btn.setEnabled(bool(state.csv_combos) and not multi)
         finally:
             self._filling = False
 
@@ -1250,9 +1378,14 @@ class InputsPage(_Page):
                 item.setData(Qt.UserRole, key)
                 if col > 0:
                     item.setTextAlignment(Qt.AlignCenter)
+                else:
+                    item.setToolTip(str(key))
                 self.unstained_table.setItem(row, col, item)
             if key == state.unstained_key:
                 selected_row = row
+        self.unstained_table.resizeColumnsToContents()
+        self.unstained_table.setColumnWidth(
+            0, min(self.unstained_table.columnWidth(0), SAMPLE_COLUMN_MAX_WIDTH))
         self.unstained_table.clearSelection()
         if selected_row >= 0:
             self.unstained_table.selectRow(selected_row)
@@ -1292,6 +1425,16 @@ class InputsPage(_Page):
         _set_message(self.af_msg, [self.plugin.af_library_problem()])
 
     # -- handlers --------------------------------------------------------------
+
+    def _on_no_fret_toggled(self, checked: bool):
+        if self._filling:
+            return
+        if not self.plugin.set_no_fret(checked):
+            self._filling = True
+            try:
+                self.no_fret_check.setChecked(not checked)
+            finally:
+                self._filling = False
 
     def _on_backbone_item_changed(self, _item):
         if self._filling:
@@ -1393,6 +1536,8 @@ def _csv_structure_problems(combos) -> list:
 # ---------------------------------------------------------------------------
 
 _COMBO_HEADERS = ['Include', 'Name', 'Tag 1', 'Tag 2', 'Tag 3', 'Backbone events']
+_LIBRARY_HEADERS = ['Name', 'Label', 'Sample-name pattern (regex)', 'Combinations file', 'Guides']
+_NO_LIBRARY = '—'
 
 
 class TagsPage(_Page):
@@ -1425,6 +1570,22 @@ class TagsPage(_Page):
         lay.addWidget(self.tag_warn)
         self.body.addWidget(grp)
 
+        self._library_signature = None
+        self._library_samples_signature = None
+        self.advanced_btn = QToolButton()
+        self.advanced_btn.setText('Advanced options')
+        self.advanced_btn.setCheckable(True)
+        self.advanced_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.advanced_btn.setChecked(str(plugin.qsettings.value('section2_advanced', 'false')).lower() == 'true')
+        self.advanced_btn.toggled.connect(self._on_advanced_toggled)
+        self.body.addWidget(self.advanced_btn)
+        self.multi_check = QCheckBox('Several libraries: each sample is debarcoded with its own combinations file')
+        self.multi_check.setToolTip('For samples transduced with different guide libraries on the same tags.')
+        self.multi_check.toggled.connect(self._on_multi_toggled)
+        self.body.addWidget(self.multi_check)
+        self.library_group = self._build_library_group()
+        self.body.addWidget(self.library_group)
+
         grp = QGroupBox('Combinations')
         lay = QVBoxLayout(grp)
         row = QHBoxLayout()
@@ -1443,7 +1604,8 @@ class TagsPage(_Page):
         self.combo_table = QTableWidget(0, len(_COMBO_HEADERS))
         self.combo_table.setHorizontalHeaderLabels(_COMBO_HEADERS)
         self.combo_table.verticalHeader().setVisible(False)
-        self.combo_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.combo_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.combo_table.horizontalHeader().setStretchLastSection(False)
         self.combo_table.setMinimumHeight(260)
         self.combo_table.itemChanged.connect(self._on_combo_item_changed)
         lay.addWidget(self.combo_table)
@@ -1469,6 +1631,7 @@ class TagsPage(_Page):
                 cb.setText(_channel_label(ch, antigens))
                 cb.setChecked(ch in ticked)
             self._rebuild_tag_table()
+            self._fill_libraries()
             self._fill_combo_table()
         finally:
             self._filling = False
@@ -1476,6 +1639,7 @@ class TagsPage(_Page):
         _set_message(self.tag_msg, errors)
         _set_message(self.tag_warn, warnings)
         _set_message(self.combo_msg, self.plugin.combo_problems())
+        _set_message(self.library_msg, self.plugin.library_problems())
 
     def _rebuild_grid(self, channels, antigens):
         while self.grid.count():
@@ -1507,9 +1671,15 @@ class TagsPage(_Page):
     def _fill_combo_table(self):
         state = self.plugin.state
         counts = self.plugin.combo_backbone_counts()
-        signature = (tuple((row['include'], row['name'], tuple(row['tags'])) for row in state.combos),
-                     tuple(sorted(counts.items())))
+        libraries = state.library_names() if state.multi_library else []
+        signature = (tuple((row['include'], row['name'], tuple(row['tags']),
+                            tuple(sorted((row.get('names') or {}).items()))) for row in state.combos),
+                     tuple(sorted(counts.items())), tuple(libraries),
+                     tuple(fcs.library_label(lib) for lib in state.libraries) if libraries else ())
         if signature != self._combo_signature:
+            self.combo_table.setColumnCount(len(_COMBO_HEADERS) + len(libraries))
+            self.combo_table.setHorizontalHeaderLabels(
+                _COMBO_HEADERS + [fcs.library_label(lib) for lib in state.libraries if libraries])
             self.combo_table.setRowCount(len(state.combos))
             for r, row in enumerate(state.combos):
                 inc = QTableWidgetItem()
@@ -1517,8 +1687,13 @@ class TagsPage(_Page):
                 inc.setCheckState(Qt.Checked if row['include'] else Qt.Unchecked)
                 self.combo_table.setItem(r, 0, inc)
                 name = QTableWidgetItem(row['name'])
-                name.setFlags(Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                name.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable if libraries
+                              else Qt.ItemIsEditable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 self.combo_table.setItem(r, 1, name)
+                for j, lib in enumerate(libraries):
+                    guide = QTableWidgetItem((row.get('names') or {}).get(lib, ''))
+                    guide.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                    self.combo_table.setItem(r, len(_COMBO_HEADERS) + j, guide)
                 for k in range(3):
                     tag = QTableWidgetItem(str(row['tags'][k]) if k < len(row['tags']) else '')
                     tag.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
@@ -1528,10 +1703,282 @@ class TagsPage(_Page):
                 cnt.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 cnt.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.combo_table.setItem(r, 5, cnt)
+            self.combo_table.resizeColumnsToContents()
             self._combo_signature = signature
         n_inc = len(state.included_combos())
-        self.combo_count.setText(f'{n_inc} of {len(state.combos)} combination(s) included'
-                                 + (' (from the combinations CSV).' if state.csv_combos else '.'))
+        source = (' (from the libraries\' combinations CSVs).' if state.multi_library
+                  else ' (from the combinations CSV).' if state.csv_combos else '.')
+        self.combo_count.setText(f'{n_inc} of {len(state.combos)} combination(s) included' + source)
+
+    # -- libraries -----------------------------------------------------------
+
+    def _build_library_group(self) -> QGroupBox:
+        grp = QGroupBox('Libraries')
+        lay = QVBoxLayout(grp)
+        row = QHBoxLayout()
+        for text, slot, tip in (
+                ('Add library', self._on_add_library, ''),
+                ('Remove library', self._on_remove_library, 'Remove the library selected in the table.'),
+                ('Load combinations CSV…', self._on_load_library_csv,
+                 'Load the combinations file of the library selected in the table.'),
+                ('Assign by pattern', self._on_assign_libraries,
+                 'Match each library\'s pattern (a regular expression, case-insensitive) against the sample '
+                 'names below; the first matching library, in the order above, wins. Every sample listed is '
+                 'reassigned: one matching no pattern loses its library, unless it is assigned to Other.')):
+            button = QPushButton(text)
+            button.setToolTip(tip)
+            button.clicked.connect(slot)
+            row.addWidget(button)
+        row.addStretch()
+        lay.addLayout(row)
+        self.library_table = QTableWidget(0, len(_LIBRARY_HEADERS))
+        self.library_table.setHorizontalHeaderLabels(_LIBRARY_HEADERS)
+        self.library_table.verticalHeader().setVisible(False)
+        self.library_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.library_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.library_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.library_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.library_table.setMaximumHeight(170)
+        self.library_table.setToolTip('Double-click a name, label or pattern to edit it. The label is the name '
+                                      'shown in the results; the name is what the pattern looks for.')
+        self.library_table.itemChanged.connect(self._on_library_item_changed)
+        lay.addWidget(self.library_table)
+        self.merge_check = QCheckBox('Merge guides with the same name across libraries')
+        self.merge_check.setToolTip('A guide name used by several libraries (e.g. a non-targeting control) is '
+                                    'one guide in the Analysis, counted in each sample on its own '
+                                    'library\'s triplet. Unticked, each library\'s guide is kept apart and '
+                                    'named with the library\'s label.')
+        self.merge_check.toggled.connect(self._on_merge_toggled)
+        lay.addWidget(self.merge_check)
+        self.shared_label = QLabel('')
+        self.shared_label.setWordWrap(True)
+        self.shared_label.setStyleSheet(_HINT_STYLE)
+        lay.addWidget(self.shared_label)
+        self.library_msg = _message_label()
+        lay.addWidget(self.library_msg)
+        self.assign_label = QLabel('')
+        self.assign_label.setWordWrap(True)
+        self.assign_label.setStyleSheet(_HINT_STYLE)
+        lay.addWidget(self.assign_label)
+        self.library_samples = QTableWidget(0, 2)
+        self.library_samples.setHorizontalHeaderLabels(['Sample', 'Library'])
+        self.library_samples.verticalHeader().setVisible(False)
+        self.library_samples.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.library_samples.setTextElideMode(Qt.ElideMiddle)
+        self.library_samples.setWordWrap(False)
+        self.library_samples.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.library_samples.setMinimumHeight(260)
+        lay.addWidget(self.library_samples)
+        self.assign_warn = _message_label(_WARN_STYLE)
+        lay.addWidget(self.assign_warn)
+        return grp
+
+    def _fill_libraries(self):
+        state = self.plugin.state
+        multi = bool(state.multi_library)
+        self.multi_check.setChecked(multi)
+        show = multi or self.advanced_btn.isChecked()
+        self.advanced_btn.setArrowType(Qt.DownArrow if show else Qt.RightArrow)
+        self.multi_check.setVisible(show)
+        self.library_group.setVisible(multi)
+        if not multi:
+            return
+        libraries = state.libraries
+        signature = tuple((lib.get('name'), lib.get('label'), lib.get('pattern'), lib.get('csv_path'),
+                           len(lib.get('combos') or [])) for lib in libraries)
+        if signature != self._library_signature:
+            table = self.library_table
+            table.setRowCount(len(libraries))
+            for r, lib in enumerate(libraries):
+                csv_path = lib.get('csv_path') or ''
+                cells = [(str(lib.get('name', '')), True), (str(lib.get('label') or ''), True),
+                         (str(lib.get('pattern') or ''), True),
+                         (Path(csv_path).name if csv_path else ('loaded' if lib.get('combos') else '—'), False),
+                         (f'{len(lib.get("combos") or [])}', False)]
+                for col, (text, editable) in enumerate(cells):
+                    item = QTableWidgetItem(text)
+                    flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+                    item.setFlags(flags | Qt.ItemIsEditable if editable else flags)
+                    if col == 3 and csv_path:
+                        item.setToolTip(csv_path)
+                    if col == 4:
+                        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    table.setItem(r, col, item)
+            fm = table.fontMetrics()
+            for col in (0, 1, 3, 4):
+                texts = [_LIBRARY_HEADERS[col]] + [table.item(r, col).text() for r in range(len(libraries))]
+                width = max(fm.horizontalAdvance(t) for t in texts) + 24
+                table.setColumnWidth(col, min(width, SAMPLE_COLUMN_MAX_WIDTH))
+            self._library_signature = signature
+        self.merge_check.setChecked(bool(state.merge_same_names))
+        shared = fcs.shared_guide_names(libraries)
+        if shared:
+            names = list(shared)
+            listed = ', '.join(names[:8]) + (f' and {len(names) - 8} more' if len(names) > 8 else '')
+            self.shared_label.setText(f'{len(names)} guide name(s) appear in more than one library: {listed}.')
+        else:
+            self.shared_label.setText('No guide name appears in more than one library.')
+        self.shared_label.setVisible(True)
+        self._fill_library_samples()
+
+    def _fill_library_samples(self):
+        c = self.plugin.controller
+        state = self.plugin.state
+        keys = self.plugin.library_samples()
+        libraries = state.libraries
+        signature = (tuple(keys), tuple((lib.get('name'), lib.get('label')) for lib in libraries),
+                     tuple(state.library_of(k) for k in keys))
+        if signature != self._library_samples_signature:
+            table = self.library_samples
+            table.setRowCount(len(keys))
+            for r, key in enumerate(keys):
+                item = QTableWidgetItem(_sample_name(c, key))
+                item.setToolTip(str(key))
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                table.setItem(r, 0, item)
+                combo = QComboBox()
+                combo.addItem(_NO_LIBRARY, '')
+                for lib in libraries:
+                    label = fcs.library_label(lib)
+                    text = lib['name'] if label == lib['name'] else f'{lib["name"]} ({label})'
+                    combo.addItem(text, lib['name'])
+                combo.addItem(fcs.OTHER_LIBRARY, fcs.OTHER_LIBRARY)
+                combo.setCurrentIndex(max(combo.findData(state.library_of(key) or ''), 0))
+                combo.currentIndexChanged.connect(
+                    lambda _i, k=key, box=combo: self._on_sample_library_changed(k, box.currentData()))
+                _no_wheel(combo)
+                table.setCellWidget(r, 1, combo)
+            fm = table.fontMetrics()
+            longest = max((fm.horizontalAdvance(_sample_name(c, k)) for k in keys), default=0)
+            table.setColumnWidth(0, max(120, min(longest + 24, SAMPLE_COLUMN_MAX_WIDTH)))
+            widest = max([fm.horizontalAdvance(fcs.library_label(lib)) + fm.horizontalAdvance(lib['name'])
+                          for lib in libraries] + [fm.horizontalAdvance(fcs.OTHER_LIBRARY)]) + 72
+            table.setColumnWidth(1, max(widest, 140))
+            self._library_samples_signature = signature
+        counts = {name: 0 for name in state.library_names()}
+        counts[fcs.OTHER_LIBRARY] = 0
+        unassigned = []
+        for key in keys:
+            lib = state.library_of(key)
+            if lib is None:
+                unassigned.append(key)
+            else:
+                counts[lib] = counts.get(lib, 0) + 1
+        parts = [f'{name}: {n}' for name, n in counts.items()] + [f'No library: {len(unassigned)}']
+        self.assign_label.setText('  |  '.join(parts))
+        _set_message(self.assign_warn, [] if not unassigned else [
+            f'{len(unassigned)} sample(s) have no library. Assign each to a library, or to Other if it '
+            'belongs to none (e.g. an FMO), before exporting.'])
+
+    def _selected_library(self) -> int | None:
+        rows = {index.row() for index in self.library_table.selectedIndexes()}
+        if len(rows) == 1:
+            return rows.pop()
+        if len(self.plugin.state.libraries) == 1:
+            return 0
+        return None
+
+    def _on_advanced_toggled(self, checked: bool):
+        self.plugin.qsettings.setValue('section2_advanced', 'true' if checked else 'false')
+        if self._filling:
+            return
+        self._filling = True
+        try:
+            self._fill_libraries()
+        finally:
+            self._filling = False
+
+    def _on_multi_toggled(self, checked: bool):
+        if self._filling:
+            return
+        self.plugin.set_multi_library(checked)
+
+    def _on_merge_toggled(self, checked: bool):
+        if self._filling:
+            return
+        self.plugin.state.merge_same_names = bool(checked)
+        self.plugin.state_changed_later()
+
+    def _on_add_library(self):
+        state = self.plugin.state
+        state.libraries.append(fcs.new_library(state.libraries))
+        self.plugin.state_changed()
+
+    def _on_remove_library(self):
+        state = self.plugin.state
+        index = self._selected_library()
+        if index is None:
+            QMessageBox.information(self, 'Remove library', 'Select the library to remove in the table.')
+            return
+        name = state.libraries[index].get('name')
+        answer = QMessageBox.question(self, 'Remove library', f'Remove {name}? Its samples lose their library.',
+                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        del state.libraries[index]
+        state.sample_libraries = {k: v for k, v in state.sample_libraries.items() if v != name}
+        self.plugin.state_changed()
+
+    def _on_load_library_csv(self):
+        state = self.plugin.state
+        index = self._selected_library()
+        if index is None:
+            QMessageBox.information(self, 'Load combinations CSV',
+                                    'Select the library in the table, then load its combinations file.')
+            return
+        lib = state.libraries[index]
+        start = (str(Path(lib['csv_path']).parent) if lib.get('csv_path')
+                 else str(self.plugin.controller.experiment_dir))
+        path, _ = QFileDialog.getOpenFileName(self, f'Load the combinations of {lib.get("name")}', start,
+                                              'CSV files (*.csv)')
+        if path:
+            problems = self.plugin.load_library_csv(index, path)
+            if problems:
+                _set_message(self.library_msg, problems)
+
+    def _on_assign_libraries(self):
+        try:
+            matched = self.plugin.assign_libraries()
+        except ValueError as exc:
+            QMessageBox.warning(self, 'Assign by pattern', f'Invalid pattern for {exc}')
+            return
+        self.assign_label.setText(self.assign_label.text() + '  —  matched: '
+                                  + ', '.join(f'{name} {n}' for name, n in matched.items()))
+
+    def _on_library_item_changed(self, item):
+        if self._filling:
+            return
+        state = self.plugin.state
+        r = item.row()
+        if r >= len(state.libraries):
+            return
+        lib = state.libraries[r]
+        text = item.text().strip()
+        if item.column() == 0:
+            old = str(lib.get('name', ''))
+            if text == old:
+                return
+            if lib.get('pattern') == fcs.default_library_pattern(old):
+                lib['pattern'] = fcs.default_library_pattern(text)
+            lib['name'] = text
+            state.sample_libraries = {k: (text if v == old else v) for k, v in state.sample_libraries.items()}
+        elif item.column() == 1:
+            lib['label'] = text
+        elif item.column() == 2:
+            lib['pattern'] = text
+        else:
+            return
+        self.plugin.state_changed_later()
+
+    def _on_sample_library_changed(self, key, library):
+        if self._filling:
+            return
+        state = self.plugin.state
+        if library:
+            state.sample_libraries[key] = library
+        else:
+            state.sample_libraries.pop(key, None)
+        self.plugin.state_changed_later()
 
     # -- handlers --------------------------------------------------------------
 
@@ -2182,7 +2629,7 @@ class GatesPage(_Page):
     SECTION_GATES, SECTION_THRESHOLDS, SECTION_ADVANCED = range(3)
 
     def __init__(self, plugin, parent=None):
-        super().__init__(plugin, 3, parent, concertina=True)
+        super().__init__(plugin, 3, parent, tabbed=True)
         _ensure_qt_imports()
 
         grp = QGroupBox('Backbone and matched unstained')
@@ -2284,9 +2731,21 @@ class GatesPage(_Page):
                 widget.setToolTip(tips[key])
             signal = widget.valueChanged
             signal.connect(lambda value, k=key: self.plugin.on_setting_changed(k, value))
-        self.cell_weight = QCheckBox('cell.weight')
-        self.cell_weight.toggled.connect(lambda c: self.plugin.on_setting_changed('cell_weight', bool(c)))
-        form.addRow(self.cell_weight)
+        self.debarcode_method = QComboBox()
+        for text, value in DEBARCODE_ITEMS:
+            self.debarcode_method.addItem(text, value)
+        self.debarcode_method.setToolTip(
+            'The unmixing of the debarcoding space, where the thresholds are set and every event is '
+            'debarcoded (here and in the export). Changing it means confirming the gates and running '
+            'section 4 again.')
+        _no_wheel(self.debarcode_method)
+        self.debarcode_method.currentIndexChanged.connect(self._on_debarcode_method)
+        form.addRow('Debarcode with:', self.debarcode_method)
+
+    def _on_debarcode_method(self, _index):
+        value = self.debarcode_method.currentData()
+        if value != self.plugin.state.settings.get('debarcode_method'):
+            self.plugin.on_setting_changed('debarcode_method', value)
 
     def _on_import_thresholds(self):
         c = self.plugin.controller
@@ -2302,9 +2761,10 @@ class GatesPage(_Page):
             widget.blockSignals(True)
             widget.setValue(state.settings[key])
             widget.blockSignals(False)
-        self.cell_weight.blockSignals(True)
-        self.cell_weight.setChecked(plugin.cell_weight())
-        self.cell_weight.blockSignals(False)
+        self.debarcode_method.blockSignals(True)
+        self.debarcode_method.setCurrentIndex(
+            max(self.debarcode_method.findData(plugin.debarcode_method()), 0))
+        self.debarcode_method.blockSignals(False)
 
         ready = plugin.section_ready(3)
         busy = plugin.task_running('load') or plugin.task_running('space') or plugin.task_running('auto_cells')
@@ -2356,81 +2816,8 @@ class GatesPage(_Page):
 
 
 # ---------------------------------------------------------------------------
-# Pages 4 and 5
+# Pages 4 and 5 (section 4 figures: flowcode_figure_panel.FigurePanel)
 # ---------------------------------------------------------------------------
-
-def _figure_canvas(fig):
-    """Qt canvas for *fig* that passes wheel events on to the page's scroll area."""
-    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-
-    class _Canvas(FigureCanvasQTAgg):
-        def wheelEvent(self, event):
-            event.ignore()
-
-    return _Canvas(fig)
-
-
-class FigurePanel(QWidget):
-    """A matplotlib figure shown at its own size, with an export button that
-    saves it in the experiment's FlowCode folder."""
-
-    def __init__(self, name: str, plugin: 'PluginWidget', parent=None):
-        super().__init__(parent)
-        self.plugin = plugin
-        self.name = name
-        self.figure = None
-        self.canvas = None
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        self.holder = QVBoxLayout()
-        lay.addLayout(self.holder)
-        row = QHBoxLayout()
-        self.export_btn = QPushButton('Export graphic')
-        self.export_btn.setEnabled(False)
-        self.export_btn.clicked.connect(self.export)
-        self.export_msg = QLabel('')
-        self.export_msg.setStyleSheet(_HINT_STYLE)
-        row.addWidget(self.export_btn)
-        row.addWidget(self.export_msg, stretch=1)
-        lay.addLayout(row)
-
-    def set_figure(self, fig, exportable: bool = True):
-        self._drop_canvas()
-        self.figure = fig
-        self.canvas = _figure_canvas(fig)
-        width, height = fig.get_size_inches() * fig.dpi
-        self.canvas.setFixedSize(int(round(width)), int(round(height)))
-        self.holder.addWidget(self.canvas, alignment=Qt.AlignLeft)
-        self.canvas.draw_idle()
-        self.export_btn.setEnabled(exportable)
-        self.export_msg.setText('')
-
-    def clear(self):
-        self._drop_canvas()
-        self.figure = None
-        self.export_btn.setEnabled(False)
-        self.export_msg.setText('')
-
-    def _drop_canvas(self):
-        if self.canvas is not None:
-            self.holder.removeWidget(self.canvas)
-            self.canvas.setParent(None)
-            self.canvas.deleteLater()
-            self.canvas = None
-
-    def export(self):
-        if self.figure is None:
-            return
-        folder = Path(self.plugin.controller.experiment_dir) / OUTPUT_SUBDIR
-        path = folder / f'{self.name}.{hc_settings.graphics_export_format_retrieved}'
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-            self.figure.savefig(path, bbox_inches='tight', facecolor=self.figure.get_facecolor())
-        except (OSError, ValueError) as exc:
-            self.export_msg.setText(f'Could not export: {exc}')
-            return
-        self.export_msg.setText(f'Saved {path}')
-
 
 def _table_value(value):
     """Fit-table cell: numbers to 4 significant digits, NaN blank."""
@@ -2451,7 +2838,7 @@ class CharacterisePage(_Page):
     SECTION_FREQUENCY, SECTION_HEATMAP, SECTION_EXPRESSION, SECTION_ASSESS, SECTION_FIT, SECTION_ADVANCED = range(6)
 
     def __init__(self, plugin, parent=None):
-        super().__init__(plugin, 4, parent, concertina=True)
+        super().__init__(plugin, 4, parent, tabbed=True)
         _ensure_qt_imports()
         self._shown_key = None
         self._heat_key = None
@@ -2473,11 +2860,12 @@ class CharacterisePage(_Page):
         lay.addWidget(self.summary)
         self.body.addWidget(grp)
 
-        lay = self.add_section('Combo frequencies')
-        self.frequency = FigurePanel('FlowCode combo frequencies', plugin)
-        lay.addWidget(self.frequency)
+        folder = lambda: Path(plugin.controller.experiment_dir) / OUTPUT_SUBDIR  # noqa: E731
+        lay = self.add_section('Combo frequencies', scroll=False)
+        self.frequency = fcfp.FigurePanel('FlowCode combo frequencies', folder)
+        lay.addWidget(self.frequency, stretch=1)
 
-        lay = self.add_section('FRET and spillover error')
+        lay = self.add_section('FRET and spillover error', scroll=False)
         row = QHBoxLayout()
         row.addWidget(QLabel('Show:'))
         self.heat_space = QComboBox()
@@ -2488,12 +2876,12 @@ class CharacterisePage(_Page):
         row.addWidget(self.heat_space)
         row.addStretch()
         lay.addLayout(row)
-        self.heatmap = FigurePanel('FlowCode spillover', plugin)
-        lay.addWidget(self.heatmap)
+        self.heatmap = fcfp.FigurePanel('FlowCode spillover', folder)
+        lay.addWidget(self.heatmap, stretch=1)
 
-        lay = self.add_section('Panel expression before and after correction')
-        self.expression = FigurePanel('FlowCode panel expression', plugin)
-        lay.addWidget(self.expression)
+        lay = self.add_section('Panel expression before and after correction', scroll=False)
+        self.expression = fcfp.FigurePanel('FlowCode panel expression', folder)
+        lay.addWidget(self.expression, stretch=1)
 
         lay = self.add_section('Assess correction')
         self.biplot_msg = QLabel('')
@@ -2507,11 +2895,11 @@ class CharacterisePage(_Page):
         self.highlight_size = _int_spin(1, 12)
         self.highlight_size.setSuffix(' px')
         settings = plugin.qsettings
-        self.highlight_check.setChecked(str(settings.value('highlight_barcoded', 'true')).lower() == 'true')
+        self.highlight_check.setChecked(str(settings.value('highlight_barcoded', 'false')).lower() == 'true')
         try:
-            self.highlight_size.setValue(int(settings.value('highlight_size', 4)))
+            self.highlight_size.setValue(int(settings.value('highlight_size', 3)))
         except (TypeError, ValueError):
-            self.highlight_size.setValue(4)
+            self.highlight_size.setValue(3)
         self.highlight_check.toggled.connect(self._on_highlight_changed)
         self.highlight_size.valueChanged.connect(self._on_highlight_changed)
         row.addWidget(self.highlight_check)
@@ -2623,6 +3011,8 @@ class CharacterisePage(_Page):
             box.blockSignals(False)
         ready = plugin.section_ready(4)
         busy = plugin.characterise_busy()
+        self.run_btn.setText('Debarcode (no FRET correction)' if plugin.state.no_fret
+                             else 'Debarcode and identify FRET spillover')
         self.run_btn.setEnabled(ready and not busy)
         if not ready and not busy:
             self.run_status.setText('Confirm the gates and thresholds in section 3 first.')
@@ -2673,32 +3063,46 @@ class CharacterisePage(_Page):
             names = list(fc.design.combo_names)
             per_key = summary.get('per_combo') or {}
             counts = [per_key.get(fcc.combo_key(tags), 0) for tags in fc.design.combo_tags]
-            self.frequency.set_figure(fcp.combo_frequency_figure(names, counts, summary, is_dark))
+            make = lambda: fcp.combo_frequency_figure(names, counts, summary, is_dark)  # noqa: E731
+            self.frequency.set_figure(make(), make=make)
             self._set_table(fcc.fit_table_rows(fc))
-            self._show_biplots(output)
+            self._show_biplots(output, fc.fret_corrected)
 
         space = self.heat_space.currentData()
-        if (key, space) != self._heat_key:
+        if (key, space) != self._heat_key and not fc.fret_corrected:
+            self._heat_key = (key, space)
+            self.heatmap.set_figure(fcp.message_figure(NO_FRET_NOT_PERFORMED, is_dark), exportable=False)
+        elif (key, space) != self._heat_key:
             self._heat_key = (key, space)
             try:
                 matrix = fcc.spillover_matrix(fc, space)
-                fig = fcp.spillover_heatmap_figure(matrix, self.plugin.channel_labels(), space, is_dark)
-                self.heatmap.set_figure(fig)
+                labels = self.plugin.channel_labels()
+                make = lambda: fcp.spillover_heatmap_figure(matrix, labels, space, is_dark)  # noqa: E731
+                self.heatmap.set_figure(make(), make=make)
             except ValueError as exc:
                 self.heatmap.set_figure(fcp.message_figure(str(exc), is_dark), exportable=False)
 
         busy = output is None and self.plugin.characterise_busy()
         if (key, busy) != self._expression_key:
             self._expression_key = (key, busy)
-            if output is None:
+            if not fc.fret_corrected:
+                self.expression.set_figure(fcp.message_figure(NO_FRET_NOT_PERFORMED, is_dark), exportable=False)
+            elif output is None:
                 text = ('Reloading the backbone to show the panel expression…' if busy
                         else 'Run the characterisation to show the panel expression.')
                 self.expression.set_figure(fcp.message_figure(text, is_dark), exportable=False)
             else:
-                self.expression.set_figure(fcp.panel_expression_figure(output.expression, is_dark))
+                expression = output.expression
+                make = lambda: fcp.panel_expression_figure(expression, is_dark)  # noqa: E731
+                self.expression.set_figure(make(), make=make)
 
-    def _show_biplots(self, output):
+    def _show_biplots(self, output, fret_corrected: bool = True):
         plots = (self.biplot_before, self.biplot_after)
+        if not fret_corrected:
+            for plot in plots:
+                plot.clear()
+            self.biplot_msg.setText(NO_FRET_NOT_PERFORMED.replace('\n', ' '))
+            return
         if output is None:
             for plot in plots:
                 plot.clear()
@@ -2742,16 +3146,40 @@ class ExportPage(_Page):
     SECTION_SAMPLES, SECTION_OUTPUT, SECTION_ADVANCED = range(3)
 
     def __init__(self, plugin, parent=None):
-        super().__init__(plugin, 5, parent, concertina=True)
+        super().__init__(plugin, 5, parent, tabbed=True)
         self._filling = False
         self._status_is_problem = False
-        self.setup_banner = QLabel(SETUP_BANNER)
-        self.setup_banner.setWordWrap(True)
-        self.setup_banner.setStyleSheet(_BANNER_STYLE)
-        self.body.addWidget(self.setup_banner)
+
+        grp = QGroupBox('Spectral corrections (optional)')
+        lay = QVBoxLayout(grp)
+        self.fix_note = QLabel('')
+        self.fix_note.setWordWrap(True)
+        self.fix_note.setTextFormat(Qt.RichText)
+        lay.addWidget(self.fix_note)
+        row = QHBoxLayout()
+        self.fix_btn = QPushButton('Fix Unmix (FRET-corrected)')
+        self.fix_btn.setToolTip('Fix My Unmix on the FlowCode samples after the FRET/error and tandem '
+                                'corrections, with the tag fluorophores fixed and their channels left out. '
+                                'Samples, gate, events and Advanced Settings are those of the Spectral '
+                                'Correction page.')
+        self.fix_btn.clicked.connect(lambda: self.plugin.start_fret_fix_unmix())
+        settings_btn = QPushButton('Settings…')
+        settings_btn.setToolTip('AutoSpectral tab, Spectral Correction page: samples, gate, events, results')
+        settings_btn.clicked.connect(lambda: self.plugin.open_prerequisite('corrections'))
+        self.fix_status = QLabel('')
+        self.fix_status.setWordWrap(True)
+        row.addWidget(self.fix_btn)
+        row.addWidget(settings_btn)
+        row.addWidget(self.fix_status, stretch=1)
+        lay.addLayout(row)
+        self.body.addWidget(grp)
 
         grp = QGroupBox('Unmix and export')
         lay = QVBoxLayout(grp)
+        self.method_line = QLabel('')
+        self.method_line.setWordWrap(True)
+        self.method_line.setTextFormat(Qt.RichText)
+        lay.addWidget(self.method_line)
         row = QHBoxLayout()
         self.run_btn = QPushButton('Unmix and export')
         self.run_btn.clicked.connect(lambda: self.plugin.start_export())
@@ -2807,13 +3235,6 @@ class ExportPage(_Page):
         naming.setWordWrap(True)
         naming.setStyleSheet(_HINT_STYLE)
         lay.addWidget(naming)
-        self.variants_check = QCheckBox('Use per-cell spectral variants in the final unmix')
-        self.variants_check.toggled.connect(lambda c: self._on_value('use_variants', bool(c)))
-        lay.addWidget(self.variants_check)
-        self.variants_note = QLabel('')
-        self.variants_note.setWordWrap(True)
-        self.variants_note.setStyleSheet(_HINT_STYLE)
-        lay.addWidget(self.variants_note)
 
         self._build_advanced(self.add_section('Advanced settings'))
         self.restore_open_section(self.SECTION_SAMPLES)
@@ -2834,35 +3255,12 @@ class ExportPage(_Page):
             lambda _i: self._on_choice('regressor', self.regressor))
         form.addRow('Correction (correction):', self.correction)
         form.addRow('Correction regressors (regressor):', self.regressor)
-        cpu = os.cpu_count() or 2
-        self.adv = {
-            'tag_shift_min_n': _int_spin(0, 10_000_000, 10),
-            'n_passes': _int_spin(1, 20),
-            'n_af_passes': _int_spin(1, 20),
-            'refine_af_quantile': _float_spin(0.0, 1.0, 2, 0.05),
-            'noise_floor': _float_spin(0.0, 1_000_000.0, 1, 5.0),
-            'alpha': _float_spin(0.0, 1.0, 2, 0.05),
-            'collinear_threshold': _float_spin(0.0, 1.0, 2, 0.05),
-            'threads': _int_spin(1, cpu),
-        }
-        labels = {
-            'tag_shift_min_n': 'Events per tag for the rescue shift (tag.shift.min.n):',
-            'n_passes': 'n.passes:',
-            'n_af_passes': 'n.af.passes:',
-            'refine_af_quantile': 'refine.af.quantile:',
-            'noise_floor': 'noise.floor:',
-            'alpha': 'alpha:',
-            'collinear_threshold': 'collinear.threshold:',
-            'threads': 'threads:',
-        }
+        self.adv = {'tag_shift_min_n': _int_spin(0, 10_000_000, 10)}
+        labels = {'tag_shift_min_n': 'Events per tag for the rescue shift (tag.shift.min.n):'}
         for key, widget in self.adv.items():
             form.addRow(labels[key], widget)
             widget.valueChanged.connect(lambda value, k=key: self._on_value(k, value))
-        self.joint_pair = QCheckBox('joint.pair.resolution')
-        self.joint_pair.toggled.connect(lambda c: self._on_value('joint_pair_resolution', bool(c)))
-        form.addRow(self.joint_pair)
-        note = QLabel('The kernel settings (n.passes to joint.pair.resolution) apply to the final unmix with the '
-                      'compiled AutoSpectral Optimization kernel; cell.weight is set in section 3.')
+        note = QLabel('The final unmix uses the experiment\'s unmixing method and its settings (AutoSpectral tab).')
         note.setWordWrap(True)
         note.setStyleSheet(_HINT_STYLE)
         form.addRow(note)
@@ -2907,25 +3305,20 @@ class ExportPage(_Page):
     def refresh(self):
         plugin = self.plugin
         state = plugin.state
-        self.setup_banner.setVisible(not _optimization_setup_done(plugin.controller))
         self._filling = True
         try:
+            self.method_line.setText(plugin.method_line())
             self.controls_check.setChecked(bool(state.settings.get('export_include_controls')))
             self._fill_samples()
             _set_message(self.af_warn, [plugin.export_af_note()])
             self.folder_label.setText(str(plugin.export_folder()))
             self.default_btn.setEnabled(bool(state.output_folder))
-            available = plugin.variants_available()
-            self.variants_check.setEnabled(available)
-            self.variants_check.setChecked(plugin.use_variants())
-            self.variants_note.setText(plugin.variants_note())
             for widget, key in ((self.correction, 'correction'), (self.regressor, 'regressor')):
                 widget.setCurrentIndex(max(widget.findData(state.settings[key]), 0))
             for key, widget in self.adv.items():
                 widget.blockSignals(True)
-                widget.setValue(plugin.kernel_threads() if key == 'threads' else state.settings[key])
+                widget.setValue(state.settings[key])
                 widget.blockSignals(False)
-            self.joint_pair.setChecked(bool(state.settings['joint_pair_resolution']))
             for key, widget in self.tandem_adv.items():
                 widget.blockSignals(True)
                 widget.setValue(state.settings[key])
@@ -2935,6 +3328,15 @@ class ExportPage(_Page):
             self._filling = False
         running = plugin.export_running()
         ready = plugin.section_ready(5)
+        _kind, fix_text = plugin.correction_state()
+        no_fret = bool(state.no_fret)
+        if no_fret:
+            fix_text = ('Fix Unmix (FRET-corrected) is not available without FRET correction ("No FRET '
+                        'backbone" in section 1).')
+        self.fix_note.setText(fix_text)
+        self.fix_btn.setEnabled(ready and not plugin.fix_running() and not no_fret)
+        self.correction.setEnabled(not no_fret)
+        self.correction.setToolTip('No correction: "No FRET backbone" is ticked in section 1.' if no_fret else '')
         problem = plugin.export_problem() if ready else None
         self.run_btn.setEnabled(ready and not running and problem is None)
         if not running:
@@ -2949,11 +3351,15 @@ class ExportPage(_Page):
         self.run_status.setText(text)
         self._status_is_problem = problem
 
+    def set_fix_status(self, text: str):
+        self.fix_status.setText(text)
+
     def _fill_tandems(self):
         plugin = self.plugin
         candidates = plugin.tandem_candidates()
         ticked = set(plugin.tandem_selection(candidates))
-        keys = [(c['fluor'], c['parent'], c['problem']) for c in candidates]
+        no_fret = bool(plugin.state.no_fret)
+        keys = [(c['fluor'], c['parent'], c['problem']) for c in candidates] + [no_fret]
         if keys != self._tandem_keys:
             while self.tandem_checks_lay.count():
                 widget = self.tandem_checks_lay.takeAt(0).widget()
@@ -2964,7 +3370,7 @@ class ExportPage(_Page):
                 text = f'{c["tag"]} ({c["fluor"]} \u2192 {c["parent"]})' if c['parent'] \
                     else f'{c["tag"]} ({c["fluor"]})'
                 box = QCheckBox(text + (f': {c["problem"]}' if c['problem'] else ''))
-                box.setEnabled(c['tandem'] is not None)
+                box.setEnabled(c['tandem'] is not None and not no_fret)
                 box.toggled.connect(lambda checked, f=c['fluor']: self._on_tandem_toggled(f, checked))
                 self.tandem_checks_lay.addWidget(box)
                 self.tandem_checks[c['fluor']] = box
@@ -2992,7 +3398,7 @@ class ExportPage(_Page):
             else:
                 item.setFlags(Qt.ItemIsUserCheckable)
                 item.setCheckState(Qt.Unchecked)
-                item.setToolTip('Assign AF profiles in the AutoSpectral AF tab.')
+                item.setToolTip('Assign AF profiles on the Autofluorescence page of the AutoSpectral tab.')
             self.sample_list.addItem(item)
         n_eligible = sum(1 for _k, _n, ok in candidates if ok)
         self.sample_count.setText(f'{len(selected)} of {n_eligible} sample(s) selected'
@@ -3069,7 +3475,11 @@ class PluginWidget(QWidget):
         self._after_space = None
         self._saved_cache = None
         self._export_run = None
+        self._fix_job = None
+        self._fix_token = None
         self._export_job = None
+        self._method_summary = None
+        self._method_state = None
         self._reset_session()
 
         outer = QVBoxLayout(self)
@@ -3083,12 +3493,6 @@ class PluginWidget(QWidget):
         self.content = QWidget()
         content = QVBoxLayout(self.content)
         content.setContentsMargins(0, 0, 0, 0)
-        self.kernel_banner = QLabel(KERNEL_BANNER)
-        self.kernel_banner.setWordWrap(True)
-        self.kernel_banner.setTextFormat(Qt.RichText)
-        self.kernel_banner.setStyleSheet(_BANNER_STYLE)
-        self.kernel_banner.setVisible(not fcc.kernel_available())
-        content.addWidget(self.kernel_banner)
 
         self.pages = {
             1: InputsPage(self),
@@ -3096,9 +3500,10 @@ class PluginWidget(QWidget):
             3: GatesPage(self),
             4: CharacterisePage(self),
             5: ExportPage(self),
+            6: fap.AnalysisPage(self),
         }
         self.tabs = _SideTabWidget()
-        icons = {1: 'file-import', 2: 'table', 3: 'polygon', 4: 'sparkles', 5: 'file-export'}
+        icons = {1: 'file-import', 2: 'table', 3: 'polygon', 4: 'sparkles', 5: 'file-export', 6: 'test-pipe-2'}
         for n, page in self.pages.items():
             self.tabs.addTab(page, f'{n}. {fcs.SECTION_TITLES[n]}', icons[n])
         self.tabs.currentChanged.connect(self._on_page_changed)
@@ -3106,10 +3511,16 @@ class PluginWidget(QWidget):
         outer.addWidget(self.content, stretch=1)
         self.content.setVisible(False)
 
+        gate = getattr(controller, 'job_gate', None)
+        if gate is not None:
+            gate.guard(self.pages[5].run_btn, self.pages[5].fix_btn, self.pages[6].count_btn)
+
         if self.bus is not None:
             self.bus.modeChangeRequested.connect(self._on_mode_change)
             self.bus.spectralProcessRefreshed.connect(self._on_process_refreshed)
             self.bus.sampleTreeUpdated.connect(self._on_sample_tree_updated)
+            if hasattr(self.bus, 'unmixingMethodChanged'):
+                self.bus.unmixingMethodChanged.connect(self._on_unmixing_method_changed)
 
     # -- experiment and state ------------------------------------------------
 
@@ -3125,7 +3536,7 @@ class PluginWidget(QWidget):
 
     def _available(self) -> bool:
         c = self.controller
-        return bool(c is not None and c.experiment is not None
+        return bool(fcm.method_api_available() and c is not None and c.experiment is not None
                     and _process(c).get('unmixing_matrix') is not None)
 
     def _sync_experiment(self):
@@ -3140,6 +3551,7 @@ class PluginWidget(QWidget):
         self.pages[3].panel.clear()
         self.pages[3].thresholds.clear()
         self.pages[4].clear()
+        self.pages[6].reset_session()
 
     def save_state(self):
         """Write the state into the experiment (saved with the .kit file)."""
@@ -3176,10 +3588,17 @@ class PluginWidget(QWidget):
             return
         self._active = True
         available = self._available()
+        if not fcm.method_api_available():
+            self.label_disabled.setText(METHOD_API_MESSAGE)
         self.label_disabled.setVisible(not available)
         self.content.setVisible(available)
         if not available:
             return
+        # No page uses the sample browser: hide it (the main window shows it
+        # again on the next tab change).
+        signal = getattr(self.bus, 'sampleBrowserVisibilityRequested', None)
+        if signal is not None:
+            signal.emit(False)
         self._sync_experiment()
         self.state_changed(save=False)
         QTimer.singleShot(0, self._on_page_shown)
@@ -3210,25 +3629,30 @@ class PluginWidget(QWidget):
     def refresh(self):
         if not self._available():
             return
+        self._sync_unmixing_inputs()
         if self.backbone_data is not None and self._load_signature != self.load_signature():
             self._reset_session()
             self.pages[3].panel.clear()
             self.pages[3].thresholds.clear()
         for n, page in self.pages.items():
             kind, text = self.section_status(n)
+            if kind == 'done' and n in (4, 5) and self.state.no_fret:
+                kind, text = 'invalid', f'Done without FRET correction. {fcs.NO_FRET_WARNING}'
             page.set_status(kind, text)
         page = self.tabs.currentWidget()
         if page is not None:
             page.refresh()
 
     def section_status(self, n: int) -> tuple:
+        if n == 6:
+            return self.pages[6].status_summary()
         if n == 1:
             problems = self.section1_problems()
             return ('error', problems[0]) if problems else ('done', 'Done')
         if n == 2:
             if self.section1_problems():
                 return 'waiting', 'Waiting for section 1'
-            errors = self.tag_problems()[0] + self.combo_problems()
+            errors = self.tag_problems()[0] + self.combo_problems() + self.library_problems()
             return ('error', errors[0]) if errors else ('done', 'Done')
         if not self.section_ready(n):
             return 'waiting', f'Waiting for section {n - 1}'
@@ -3261,7 +3685,8 @@ class PluginWidget(QWidget):
         state = self.state
         problems = []
         if not state.backbones():
-            problems.append('Choose at least one backbone sample.')
+            problems.append('Choose at least one sample for the gates and thresholds.' if state.no_fret
+                            else 'Choose at least one backbone sample.')
         if not state.unstained_key or state.unstained_key not in fcs.unstained_candidates(c.experiment.samples):
             problems.append('Choose the matched unstained sample.')
         else:
@@ -3272,6 +3697,42 @@ class PluginWidget(QWidget):
         if layout.scatter_x is None or layout.scatter_y is None:
             problems.append('No FSC/SSC area channels found for this cytometer.')
         return problems
+
+    def confirm_no_fret(self, action: str) -> bool:
+        """Ask the user to acknowledge that results without FRET correction
+        are invalid before *action*. True when they tick the acknowledgement
+        and proceed."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle('No FRET correction')
+        box.setTextFormat(Qt.RichText)
+        box.setText(f'<b style="color: #d62728;">{fcs.NO_FRET_WARNING}</b>')
+        box.setInformativeText(f'{NO_FRET_EXPLANATION}<br><br><b>{action}</b>')
+        check = QCheckBox('I understand that the downstream results are untrustworthy.')
+        box.setCheckBox(check)
+        proceed = box.addButton('Proceed', QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(QMessageBox.Cancel)
+        proceed.setEnabled(False)
+        check.toggled.connect(proceed.setEnabled)
+        box.exec()
+        return box.clickedButton() is proceed and check.isChecked()
+
+    def set_no_fret(self, on: bool) -> bool:
+        """Debarcode without FRET correction (no FRET backbone) or not.
+        Switching on needs the user's acknowledgement, saved with its time;
+        returns False when declined. Sections 4 and 5 then need a re-run."""
+        state = self.state
+        on = bool(on)
+        if on == bool(state.no_fret):
+            return True
+        if on and not self.confirm_no_fret('Debarcode without FRET correction? Sections 4 and 5 will need to '
+                                           'be run again.'):
+            return False
+        state.no_fret = on
+        state.no_fret_acknowledged = datetime.now().isoformat(timespec='seconds') if on else None
+        self.state_changed_later()
+        return True
 
     def af_library_problem(self) -> str | None:
         state = self.state
@@ -3362,17 +3823,19 @@ class PluginWidget(QWidget):
         channels = _tag_channel_options(c)
         antigens = _antigens(c)
         recognise = fcc.recognise_tag
+        source = state.csv_source()
         csv_picked, csv_map = [], {}
-        if state.csv_combos:
-            csv_picked, csv_map, _unmatched = fcs.csv_tag_channels(state.csv_combos, channels, antigens, recognise)
+        if source:
+            csv_picked, csv_map, _unmatched = fcs.csv_tag_channels(source, channels, antigens, recognise)
         if state.tag_selection is None:
-            state.tag_selection = csv_picked if state.csv_combos else fcs.auto_tag_channels(channels, antigens,
-                                                                                            recognise)
+            state.tag_selection = csv_picked if source else fcs.auto_tag_channels(channels, antigens, recognise)
         state.tag_selection = [ch for ch in channels if ch in set(state.tag_selection)]
         state.tag_names = {ch: fcs.tag_name_for_channel(ch, antigens.get(ch, ''), recognise)
                            for ch in state.tag_selection}
-        if state.csv_combos:
-            tag_for_csv = {k: state.tag_names.get(ch, ch) for k, ch in csv_map.items()}
+        tag_for_csv = {k: state.tag_names.get(ch, ch) for k, ch in csv_map.items()}
+        if state.multi_library:
+            state.combos = fcs.library_combo_rows(state.libraries, tag_for_csv, previous=state.combos)
+        elif state.csv_combos:
             state.combos = fcs.csv_combo_rows(state.csv_combos, tag_for_csv, previous=state.combos)
         else:
             state.combos = fcs.generate_combo_rows(list(state.tag_map()), previous=state.combos)
@@ -3381,9 +3844,10 @@ class PluginWidget(QWidget):
         state = self.state
         errors, warnings = fcs.tag_problems(state.tag_map(), _fluor_names(self.controller))
         errors = fcs.duplicate_tag_problems(state.tag_names) + errors
-        if state.csv_combos:
+        source = state.csv_source()
+        if source:
             channels = _tag_channel_options(self.controller)
-            _p, _m, unmatched = fcs.csv_tag_channels(state.csv_combos, channels, _antigens(self.controller),
+            _p, _m, unmatched = fcs.csv_tag_channels(source, channels, _antigens(self.controller),
                                                      fcc.recognise_tag)
             if unmatched:
                 errors.append('Tags in the combinations CSV that match no channel: ' + ', '.join(unmatched))
@@ -3392,6 +3856,64 @@ class PluginWidget(QWidget):
     def combo_problems(self) -> list:
         unmixed = self.controller.experiment.settings.get('unmixed', {}).get('event_channels_pnn') or []
         return fcs.combo_problems(self.state.combos, list(self.state.tag_map()), unmixed)
+
+    def library_problems(self) -> list:
+        """Problems with the libraries; none unless several libraries are used."""
+        return fcs.library_problems(self.state.libraries) if self.state.multi_library else []
+
+    def library_samples(self) -> list:
+        """Samples that need a library (every sample except controls, beads and backbones)."""
+        return fcs.library_sample_keys(self.controller.experiment.samples, self.state.backbones())
+
+    def assign_libraries(self, only_unassigned: bool = False, refresh: bool = True) -> dict:
+        """Assign libraries by the libraries' sample-name patterns
+        (``flowcode_state.assign_libraries``); returns {library: n matched}."""
+        state = self.state
+        keys = self.library_samples()
+        names = {key: _sample_name(self.controller, key) for key in keys}
+        state.sample_libraries, matched = fcs.assign_libraries(keys, names, state.libraries,
+                                                               state.sample_libraries, only_unassigned)
+        if refresh:
+            self.state_changed()
+        return matched
+
+    def set_multi_library(self, on: bool):
+        """Switch several libraries on or off. Switching on assigns the
+        samples without a library by pattern; switching off rebuilds the
+        combination rows from the section 1 CSV or the tags, keeping Include."""
+        state = self.state
+        if on:
+            state.enable_libraries()
+            try:
+                self.assign_libraries(only_unassigned=True, refresh=False)
+            except ValueError:
+                pass
+        else:
+            state.multi_library = False
+            include = {tuple(sorted(str(t).upper() for t in row['tags'])): bool(row.get('include', True))
+                       for row in state.combos}
+            state.combos = []
+            self.sync_derived_state()
+            for row in state.combos:
+                row['include'] = include.get(tuple(sorted(str(t).upper() for t in row['tags'])), row['include'])
+        self.state_changed()
+
+    def load_library_csv(self, index: int, path) -> list:
+        """Load the combinations CSV of library *index*; returns its problems
+        (empty when loaded)."""
+        try:
+            combos = fcc.read_combinations_csv(path)
+            problems = _csv_structure_problems(combos)
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            problems = [str(exc)]
+        if problems:
+            return problems
+        lib = self.state.libraries[index]
+        lib['combos'] = [[name, list(tags)] for name, tags in combos]
+        lib['csv_path'] = str(path)
+        self.state.tag_selection = None
+        self.state_changed()
+        return []
 
     def design(self):
         return fcs.design_from_state(self.state)
@@ -3440,10 +3962,6 @@ class PluginWidget(QWidget):
             return None
         return fcs.model_fingerprint(spectra, _fluor_names(self.controller), self.state.tag_channels(),
                                      _detectors(self.controller))
-
-    def cell_weight(self) -> bool:
-        value = self.state.settings.get('cell_weight')
-        return _cytometer_db_col(self.controller) == 'ID7000' if value is None else bool(value)
 
     def on_setting_changed(self, key, value):
         self.state.settings[key] = value
@@ -3656,9 +4174,15 @@ class PluginWidget(QWidget):
         names = _fluor_names(c)
         tag_fluors = [ch for ch in state.tag_channels() if ch in names]
         af = fcs.af_library_spectra(_process(c).get('af_profiles') or {}, state.af_profile_names)
+        self._sync_unmixing_inputs()
+        plan = self.unmix_plan()
+        af_state = plan.af_for(state.af_profile_names)
+        if af_state is None:
+            self.pages[3].confirm_status.setText('The debarcoding AF profiles could not be read.')
+            return
+        engine = ('per-cell AF' if plan.debarcode_method == fcm.DEBARCODE_R1 else plan.label)
         pos = getattr(c, 'autospectral_unmixed_pos_thresholds', None)
         pos = None if pos is None else np.asarray(pos, dtype=float).copy()
-        cell_weight = self.cell_weight()
         ceiling = float(c.experiment.settings['raw'].get('magnitude_ceiling') or hc_settings.magnitude_ceiling)
         settings = dict(state.settings)
         if self.task_running('space'):
@@ -3666,10 +4190,10 @@ class PluginWidget(QWidget):
         self._pending_space = {'confirm': confirm, 'inputs': state.section_inputs(3, self.fingerprint()),
                                'tags': list(zip([state.tag_names[ch] for ch in tag_fluors], tag_fluors)),
                                'ceiling': ceiling}
-        self.pages[3].confirm_status.setText('Unmixing the gated events with per-cell AF…')
+        self.pages[3].confirm_status.setText(f'Unmixing the gated events ({engine})…')
         if self._start_task('space', lambda progress: compute_debarcode_space(
-                backbone_fl, unstained_fl, spectra, names, tag_fluors, af, pos, cell_weight, ceiling, settings,
-                progress)):
+                backbone_fl, unstained_fl, spectra, names, tag_fluors, af, pos, ceiling, settings,
+                progress, lambda raw: plan.debarcode(raw, af_state), engine)):
             self.refresh()
 
     def _on_space_finished(self, result):
@@ -3704,7 +4228,7 @@ class PluginWidget(QWidget):
         n_un = len(space.unstained)
         self.pages[3].confirm_status.setText(
             f'Debarcoding space: {len(space.backbone):,} backbone and {n_un:,} unstained events '
-            f'({space.engine} per-cell AF).')
+            f'({space.engine}).')
         self._show_thresholds()
         if pending['confirm']:
             self.pages[3].open_section(GatesPage.SECTION_THRESHOLDS)
@@ -3718,7 +4242,7 @@ class PluginWidget(QWidget):
 
     def space_summary(self) -> str:
         space = self.debarcode_space
-        source = {'optimization': 'AutoSpectral Optimization thresholds',
+        source = {'optimization': "the Spectral Variants page's positivity thresholds",
                   'unstained': '99.5th percentile of the matched unstained'}[space.rescue_floor_source]
         return f'Rescue noise floor: {source}.'
 
@@ -3870,26 +4394,34 @@ class PluginWidget(QWidget):
         spectra = _reference_spectra(c)
         names = _fluor_names(c)
         thresholds = np.array([state.thresholds[tag]['raw'] for tag in design.tags], dtype=float)
-        af = fcs.af_library_spectra(_process(c).get('af_profiles') or {}, state.af_profile_names)
+        self._sync_unmixing_inputs()
+        plan = self.unmix_plan()
+        af_state = plan.af_for(state.af_profile_names)
+        if af_state is None:
+            page.run_status.setText('The debarcoding AF profiles could not be read.')
+            return
         transforms = c.unmixed_transformations or {}
         transforms = {f: deepcopy(transforms[f]) for f in names if f in transforms}
         labels = self.channel_labels()
         settings = dict(state.settings)
         ceiling = float(self._space_ceiling)
-        final, engine = self.final_unmix(spectra, names)
+        engine = plan.label
         detectors = _detectors(c)
         fingerprint = self.fingerprint()
         self._pending_char = {'restore': restore, 'inputs': state.section_inputs(4, fingerprint),
                               'design': design, 'ceiling': ceiling}
-        page.run_status.setText('Characterising the backbone…' if not restore
-                                else 'Rebuilding the figures of the saved characterisation…')
-        tandems = [cand['tandem'] for cand in self.tandem_candidates() if cand['tandem'] is not None]
+        fit_error = not state.no_fret
+        page.run_status.setText('Rebuilding the figures of the saved characterisation…' if restore
+                                else 'Characterising the backbone…' if fit_error
+                                else 'Debarcoding without FRET correction…')
+        tandems = [] if not fit_error else [cand['tandem'] for cand in self.tandem_candidates()
+                                            if cand['tandem'] is not None]
         args = (backbone_fl, space.backbone, unstained_fl, design, thresholds, spectra, names, detectors,
-                space.af_mean, space.rescue_floor, ceiling, settings, lambda raw: final(raw, af), engine,
+                space.af_mean, space.rescue_floor, ceiling, settings, lambda raw: plan.final(raw, af_state), engine,
                 transforms, labels)
         af_scale = space.af_scale
         if self._start_task('characterise', lambda progress: run_characterisation(
-                *args, progress, tandems, debarcode_af_scale=af_scale)):
+                *args, progress, tandems, debarcode_af_scale=af_scale, fit_error=fit_error)):
             self.refresh()
 
     def _on_characterise_finished(self, output: CharacteriseOutput):
@@ -3911,7 +4443,8 @@ class PluginWidget(QWidget):
             state.mark_completed(4, fingerprint)
         fc = output.result.spectra
         n_char = sum(e is not None for e in fc.combo_error)
-        page.run_status.setText(f'Done: {n_char} of {fc.design.n_combos} combinations characterised.')
+        page.run_status.setText(f'Done: {n_char} of {fc.design.n_combos} combinations characterised.'
+                                if fc.fret_corrected else 'Done: debarcoded without FRET correction.')
         self.state_changed(save=not pending['restore'])
 
     def _save_characterisation(self, output: CharacteriseOutput, design, ceiling: float):
@@ -3972,7 +4505,9 @@ class PluginWidget(QWidget):
         rescued = int(summary.get('rescued') or 0)
         rescued_toofew = int(summary.get('rescued_toofew') or 0)
         pct = f' ({100.0 * valid / total:.1f}%)' if total else ''
-        lines = [f'{n_char} of {design.n_combos} combinations characterised'
+        lines = [f'<span style="{_INVALID_STYLE}">Debarcoded without FRET correction (no FRET backbone). '
+                 f'{fcs.NO_FRET_WARNING}</span>' if not fc.fret_corrected else
+                 f'{n_char} of {design.n_combos} combinations characterised'
                  + (f'; {design.n_combos - n_char} use the pairwise model.' if n_char < design.n_combos else '.'),
                  f'{valid:,} of {total:,} gated backbone events barcoded{pct}; {rescued:,} rescued from more '
                  f'than three positive tags and {rescued_toofew:,} from one or two.']
@@ -4019,9 +4554,16 @@ class PluginWidget(QWidget):
         return before, after, channels, labels, barcoded
 
     def _restore_characterisation(self):
-        """Rebuild the event figures of a completed run when page 4 is shown."""
-        if self.characterisation is not None or self.characterise_busy():
+        """Rebuild the event figures of a completed run when page 4 is shown,
+        or when they were drawn with another final unmix."""
+        if self.characterise_busy():
             return
+        output = self.characterisation
+        if output is not None:
+            if output.engine == self.method_summary().get('label') or self.section_status(4)[0] != 'done':
+                return
+            self.characterisation = None
+            self.pages[4].clear()
         if self.section_status(4)[0] == 'done':
             self.characterise(restore=True)
 
@@ -4061,7 +4603,7 @@ class PluginWidget(QWidget):
         shown = ', '.join(names[:5]) + (f' and {len(names) - 5} more' if len(names) > 5 else '')
         return (f'{len(gaps)} selected sample(s) are not assigned the AF profile(s) the thresholds were set with '
                 f'({", ".join(self.state.af_profile_names)}): {shown}. They are added to these samples\' AF '
-                f'library for the export; check the assignments in the AutoSpectral AF tab.')
+                f'library for the export; check the assignments on the Autofluorescence page of the AutoSpectral tab.')
 
     def export_selection(self) -> list:
         """Selected samples that can be exported (all of them by default)."""
@@ -4083,33 +4625,33 @@ class PluginWidget(QWidget):
             state.export_samples = list(dict.fromkeys(list(state.export_samples) + eligible))
         self.state_changed()
 
+    def export_name_suffix(self) -> str:
+        return EXPORT_NAME_SUFFIX
+
+    def analysis_sample_keys(self, include: dict | None = None) -> list:
+        """Experiment samples the Analysis page can link: unstained, single-stain
+        and bead samples only when *include* ticks one of their types."""
+        from honeychrome.controller_components.spectral_correction import offered_samples
+        return offered_samples(self.controller.experiment.samples, include)
+
+    def analysis_marker_channels(self) -> list:
+        """Fluorophores of the spectral model other than the FlowCode tags:
+        the markers whose intensities the Analysis page compares."""
+        try:
+            tags = set(self.design().fluors)
+        except Exception:
+            tags = set()
+        return [f for f in _fluor_names(self.controller) if f not in tags]
+
+    def is_dark(self) -> bool:
+        return _is_dark()
+
+    def _ensure_bundled_on_path(self):
+        fcc._ensure_bundled_plugins_on_path()
+
     def export_folder(self) -> Path:
         folder = self.state.output_folder
         return Path(folder) if folder else Path(self.controller.experiment_dir) / EXPORT_SUBDIR
-
-    def variants_available(self) -> bool:
-        """Kernel built and at least one Active fluorophore with variants."""
-        if not fcc.kernel_available():
-            return False
-        fcc._ensure_bundled_plugins_on_path()
-        from autospectral_optimization_functions import active_variant_labels, has_active_variants
-        variants = getattr(self.controller, 'autospectral_variants', None) or {}
-        return has_active_variants(variants, active_variant_labels(_process(self.controller)))
-
-    def use_variants(self) -> bool:
-        value = self.state.settings.get('use_variants')
-        available = self.variants_available()
-        return available if value is None else bool(value) and available
-
-    def variants_note(self) -> str:
-        if not fcc.kernel_available():
-            return ('The compiled kernel is not built: the final unmix uses per-cell AF only '
-                    "(Honeychrome's Python implementation).")
-        if not self.variants_available():
-            return ('No Active fluorophore has spectral variants: run Setup in the AutoSpectral Optimization '
-                    'tab to use them. The final unmix uses per-cell AF only.')
-        return ('Variants of the Active fluorophores in the AutoSpectral Optimization tab, with its positivity '
-                'thresholds. The run time is estimated before the export starts.')
 
     def tandem_candidates(self) -> list:
         """``fcc.tandem_candidates`` of the current tags and spectral model
@@ -4148,16 +4690,19 @@ class PluginWidget(QWidget):
         self.on_setting_changed('tandem_tags', [c['fluor'] for c in candidates if c['fluor'] in ticked])
 
     def export_tandems(self, candidates=None) -> tuple:
-        """(ticked ``TandemTag`` list, every usable ``TandemTag``)."""
+        """(ticked ``TandemTag`` list, every usable ``TandemTag``); none
+        ticked without FRET correction."""
         candidates = self.tandem_candidates() if candidates is None else candidates
         pool = [c['tandem'] for c in candidates if c['tandem'] is not None]
-        ticked = set(self.tandem_selection(candidates))
+        ticked = set() if self.state.no_fret else set(self.tandem_selection(candidates))
         return [t for t in pool if t.fluor in ticked], pool
 
     def tandem_reference_text(self, candidates=None) -> str:
         """The backbone statistic of each ticked tandem tag, from the saved
         characterisation."""
         candidates = self.tandem_candidates() if candidates is None else candidates
+        if self.state.no_fret and candidates:
+            return '<i>Not checked without FRET correction ("No FRET backbone" in section 1).</i>'
         ticked, _pool = self.export_tandems(candidates)
         if not ticked:
             return ''
@@ -4176,47 +4721,416 @@ class PluginWidget(QWidget):
                          f'against the reference spectra.')
         return '<br>'.join(lines)
 
-    def kernel_threads(self) -> int:
-        value = self.state.settings.get('threads')
-        return int(value) if value else max(1, (os.cpu_count() or 2) - 1)
+    # -- unmixing method ---------------------------------------------------------
 
-    def kernel_kwargs(self) -> dict:
-        """Settings of the final kernel unmix (unmix_autospectral_optimization())."""
-        s = self.state.settings
-        return dict(n_passes=int(s['n_passes']), n_threads=self.kernel_threads(), cell_weight=self.cell_weight(),
-                    noise_floor=float(s['noise_floor']), alpha=float(s['alpha']),
-                    collinear_thresh=float(s['collinear_threshold']),
-                    joint_pair_resolution=bool(s['joint_pair_resolution']), n_af_passes=int(s['n_af_passes']),
-                    refine_af_quantile=float(s['refine_af_quantile']))
+    def debarcode_method(self) -> str:
+        value = self.state.settings.get('debarcode_method')
+        return value if value in fcm.DEBARCODE_METHODS else fcm.DEBARCODE_R1
 
-    def final_unmix(self, spectra: np.ndarray, names) -> tuple:
-        """The export's final unmix as ``fn(raw fluorescence, AF spectra)`` and
-        a short description of it: the compiled kernel, with the Active
-        fluorophores' variants when used and cell.weight when ticked; without
-        the kernel, Honeychrome's Python per-cell AF. Reads the controller,
-        so call it on the main thread."""
-        names = list(names)
-        cell_weight = self.cell_weight()
-        if not fcc.kernel_available():
-            def python_fn(raw_fl, af_spectra):
-                return fcc.af_only_unmix(raw_fl, spectra, names, af_spectra, cell_weight=cell_weight)
-            return python_fn, 'per-cell AF, Python'
-
-        fcc._ensure_bundled_plugins_on_path()
-        from autospectral_optimization_functions import (
-            active_variant_labels, cached_unmixed_thresholds, make_optimization_unmix_fn,
-        )
+    def export_af_lists(self, keys=None) -> dict:
+        """{sample key: AF profile names it is exported with} for *keys* (default: the export selection)."""
         c = self.controller
-        use_variants = self.use_variants()
-        variants = dict(getattr(c, 'autospectral_variants', None) or {}) if use_variants else {}
-        active = active_variant_labels(_process(c)) if use_variants else set()
-        positivity = cached_unmixed_thresholds(c, spectra) if use_variants else np.zeros(len(names))
-        kernel_fn = make_optimization_unmix_fn(spectra, names, variants, active, positivity, self.kernel_kwargs())
+        assigned = c.experiment.samples.get('sample_af_profiles') or {}
+        keys = self.export_selection() if keys is None else keys
+        return {key: fcs.export_af_profile_names(assigned.get(key), self.state.af_profile_names) for key in keys}
 
-        def kernel_final_fn(raw_fl, af_spectra):
-            return kernel_fn(raw_fl, None, SimpleNamespace(spectra=af_spectra))
-        engine = 'kernel, ' + ('per-cell variants' if use_variants else 'no variants')
-        return kernel_final_fn, engine + (', cell.weight' if cell_weight else '')
+    def unmix_plan(self, sample_keys=()):
+        """``flowcode_method.UnmixPlan`` with the debarcoding library and the
+        export libraries of *sample_keys*. Main thread."""
+        lists = [list(self.state.af_profile_names)] + list(self.export_af_lists(list(sample_keys)).values())
+        return fcm.build_plan(self.controller, self.debarcode_method(), lists)
+
+    def _sync_unmixing_inputs(self):
+        """Record in the state what the section run records compare: the
+        debarcoding unmix (None for per-cell AF) and the final unmix of the
+        export samples."""
+        state = self.state
+        try:
+            from honeychrome.controller_components import unmix_method as um
+            plan_state = um.method_state(self.controller)
+            summary = fcm.method_summary(self.controller, plan_state)
+            keys = self.export_selection() if self.state.characterisation else []
+            sets = {key: ('' if plan_state is None else plan_state.set_for(key)) for key in keys}
+        except Exception as exc:
+            logger.warning(f'FlowCode: the unmixing method could not be read: {exc}')
+            summary, sets, plan_state = {'token': None, 'label': ''}, {}, None
+        self._method_summary = summary
+        self._method_state = plan_state
+        state.unmixing_inputs = {'token': summary['token'], 'final': {'token': summary['token'], 'sets': sets}}
+
+    def method_summary(self) -> dict:
+        summary = getattr(self, '_method_summary', None)
+        if summary is None:
+            self._sync_unmixing_inputs()
+            summary = self._method_summary
+        return summary
+
+    def tag_corrections(self) -> dict:
+        """{group: [tag fluorophores]} whose spectra Fix My Unmix corrects for the experiment."""
+        tags = set(self.state.tag_channels())
+        out = {}
+        for group, changed in (self.method_summary().get('corrections') or {}).items():
+            hit = [f for f in changed if f in tags]
+            if hit:
+                out[group] = hit
+        return out
+
+    def method_line(self) -> str:
+        summary = self.method_summary()
+        text = f'Final unmix: <b>{summary.get("label") or "per-cell AF"}</b>'
+        groups = summary.get('corrections') or {}
+        if groups:
+            text += f', with the spectral corrections of {len(groups)} sample group(s)'
+        text += ' (set on the AutoSpectral tab).'
+        if self.debarcode_method() == fcm.DEBARCODE_EXPERIMENT:
+            text += ' Debarcoding uses the same method (section 3 setting).'
+        hits = self.tag_corrections()
+        if hits:
+            text += (f'<br><span style="{_ERROR_STYLE}">Fix My Unmix corrects the tag fluorophore(s) '
+                     f'{", ".join(sorted({f for v in hits.values() for f in v}))}: the FlowCode correction '
+                     'would remove the same error a second time. Run Fix Unmix again with the tags kept '
+                     'fixed.</span>')
+        return text
+
+    def _autospectral_page_signal(self):
+        return getattr(self.bus, 'showAutoSpectralPage', None) if self.bus is not None else None
+
+    def prerequisites(self) -> list:
+        """Rows of the prerequisites panel: ``key``, ``title``, ``state``
+        ('ok', 'warn', 'todo', 'info'), ``text`` and ``button`` (label,
+        enabled, tooltip)."""
+        can_open = self._autospectral_page_signal() is not None
+        tip = '' if can_open else 'Open the AutoSpectral tab.'
+
+        def button(label, page):
+            return (label, can_open, tip or f'AutoSpectral tab, {page} page')
+
+        rows = []
+        af_problem = self.af_library_problem() if self.state.unstained_key else 'Choose the matched unstained below.'
+        candidates = self.export_candidates()
+        n_ok = sum(1 for _k, _n, ok in candidates if ok)
+        if af_problem:
+            rows.append({'key': 'af', 'title': '1. AF profiles', 'state': 'todo', 'text': af_problem,
+                         'button': button('Open Autofluorescence', 'Autofluorescence')})
+        else:
+            missing = len(candidates) - n_ok
+            text = (f'Debarcoding library: {", ".join(self.state.af_profile_names)}. {n_ok} of '
+                    f'{len(candidates)} sample(s) have an AF library for the export.')
+            rows.append({'key': 'af', 'title': '1. AF profiles', 'state': 'warn' if missing else 'ok',
+                         'text': text + (' Assign profiles to the others.' if missing else ''),
+                         'button': button('Open Autofluorescence', 'Autofluorescence')})
+        summary = self.method_summary()
+        noise = summary.get('noise')
+        label = summary.get('label') or 'per-cell AF'
+        if noise == 'in use':
+            rows.append({'key': 'noise', 'title': '2. Noise model', 'state': 'ok',
+                         'text': f'In use: the final unmix is the {label}.',
+                         'button': button('Open Noise', 'Noise')})
+        else:
+            what = 'Fitted but not in use' if noise == 'fitted' else 'Not fitted (recommended)'
+            rows.append({'key': 'noise', 'title': '2. Noise model', 'state': 'warn',
+                         'text': f'{what}: the final unmix is the {label}. Model the noise before section 3 '
+                                 'if debarcoding is to use it.',
+                         'button': button('Open Noise', 'Noise')})
+        done4 = self.section_status(4)[0] == 'done'
+        first = next((n for n in (1, 2, 3, 4) if self.section_status(n)[0] != 'done'), None)
+        rows.append({'key': 'flowcode', 'title': '3. FlowCode sections 1\u20134', 'state': 'ok' if done4 else 'todo',
+                     'text': 'Done.' if done4 else f'Section {first}: {self.section_status(first)[1]}',
+                     'button': None})
+        state, text = self.correction_state()
+        rows.append({'key': 'corrections', 'title': '4. Spectral corrections', 'state': state, 'text': text,
+                     'button': button('Open Spectral Correction', 'Spectral Correction')})
+        kind, status = self.section_status(5)
+        rows.append({'key': 'export', 'title': '5. Export or analyse', 'state': 'ok' if kind == 'done' else 'todo',
+                     'text': ('Section 5: ' + (status if kind != 'done' else 'exported.')
+                              + ' Section 6 can count live without exporting.'),
+                     'button': None})
+        return rows
+
+    def open_prerequisite(self, key: str):
+        """Open the AutoSpectral page a prerequisite row refers to."""
+        page = {'af': 'autofluorescence', 'noise': 'noise', 'corrections': 'correction'}.get(key)
+        signal = self._autospectral_page_signal()
+        if page is None or signal is None:
+            return
+        if key == 'corrections':
+            self.keep_tags_fixed()
+        signal.emit(page)
+
+    def keep_tags_fixed(self) -> bool:
+        """Add the tag fluorophores to the Spectral Correction page's
+        Keep fixed list (saved with the experiment). False when this
+        Honeychrome has no such list."""
+        try:
+            from honeychrome.controller_components import spectral_correction as sc
+        except ImportError:
+            return False
+        if not hasattr(sc.CorrectionSetup, 'fixed'):
+            return False
+        process = _process(self.controller)
+        setup = sc.load_setup(process)
+        fixed = list(setup.fixed or [])
+        added = [f for f in self.state.tag_channels() if f not in fixed]
+        if added:
+            setup.fixed = fixed + added
+            sc.save_setup(process, setup)
+            if self.bus is not None:
+                self.bus.autoSaveRequested.emit()
+        return True
+
+    # -- Fix My Unmix on FlowCode-corrected data (flowcode_fix_unmix.py) ----------
+
+    def correction_state(self) -> tuple:
+        """('ok' | 'warn' | 'info', text): the experiment's spectral corrections as FlowCode sees them."""
+        groups = self.method_summary().get('corrections') or {}
+        hits = self.tag_corrections()
+        record = None
+        try:
+            from honeychrome.controller_components import spectral_correction as sc
+            record = fcfu.correction_record(_process(self.controller), sc.STORE_KEY)
+        except ImportError:
+            pass
+        if hits:
+            return 'warn', ('Tag fluorophores corrected in ' + ', '.join(f'{g} ({", ".join(v)})'
+                                                                  for g, v in hits.items())
+                            + ': run Fix Unmix (FRET-corrected) in section 5.')
+        if groups and record is None:
+            return 'warn', (f'In use for {len(groups)} sample group(s), but fitted on data without the FlowCode '
+                            'correction (the Spectral Correction page\'s Fix Unmix): run Fix Unmix '
+                            '(FRET-corrected) in section 5.')
+        if groups:
+            fc = self.saved_spectra()
+            if fc is None or record.get('characterisation') != fc.characterisation_id():
+                return 'warn', (f'In use for {len(groups)} sample group(s), fitted with another '
+                                'characterisation: run Fix Unmix (FRET-corrected) again.')
+            return 'ok', (f'In use for {len(groups)} sample group(s): fitted on FRET-corrected data '
+                          f'({record.get("fitted", "")}), tag fluorophores fixed and their channels left out.')
+        return 'info', ('Optional, after section 4: Fix Unmix (FRET-corrected) in section 5, with the tag '
+                        'fluorophores fixed and their channels left out of the fit.')
+
+    def fix_running(self) -> bool:
+        return self._fix_job is not None
+
+    def _fix_fail(self, text: str):
+        """End a Fix Unmix run that could not start or finish."""
+        self._release_fix()
+        self.pages[5].set_fix_status(text)
+        self.pages[5].refresh()
+
+    def _release_fix(self):
+        token, self._fix_token = self._fix_token, None
+        self._fix_job = None
+        if token is not None:
+            token.release()
+
+    def start_fret_fix_unmix(self):
+        """Fix My Unmix with the Spectral Correction page's setup on the
+        FlowCode-corrected raw events: match the unstained samples left on
+        Auto by scatter first (as the page does), then run."""
+        from honeychrome.controller_components import spectral_correction as sc
+        from honeychrome.controller_components.particle_type import scatter_ceilings, scatter_channel_pair
+
+        page = self.pages[5]
+        if self.fix_running():
+            page.set_fix_status('Already running.')
+            return
+        if self.state.no_fret:
+            page.set_fix_status('Not available without FRET correction ("No FRET backbone" in section 1).')
+            return
+        if self.section_status(4)[0] != 'done':
+            page.set_fix_status('Characterise the backbone in section 4 first.')
+            return
+        gate = getattr(self.controller, 'job_gate', None)
+        token = None
+        if gate is not None:
+            token = gate.try_acquire(fcfu.JOB_LABEL)
+            if token is None:
+                busy = getattr(gate, 'busy_text', None)
+                page.set_fix_status(busy() if callable(busy) else 'Another job is running.')
+                return
+        self._fix_token = token
+        self._fix_job = {}
+        self.keep_tags_fixed()
+        c = self.controller
+        setup = sc.load_setup(_process(c))
+        samples = c.experiment.samples
+        paths = sc.default_samples(samples) if setup.samples is None else list(setup.samples)
+        groups = sc.sample_groups(paths, setup.per_group)
+        if not groups:
+            self._fix_fail('Choose the fully stained samples on the Spectral Correction page (Settings…).')
+            return
+        stored = setup.unstained or {}
+        unstained = {g: stored[g] for g in groups if stored.get(g) not in (None, sc.AUTO)}
+        self._fix_job = {'setup': setup, 'unstained': unstained, 'groups': groups}
+        todo = {g: m for g, m in groups.items() if g not in unstained}
+        if not todo:
+            self._start_fix_run()
+            return
+        raw_settings = c.experiment.settings['raw']
+        pair = scatter_channel_pair(raw_settings, c.experiment.cytometry.get('raw_plots'))
+        references = [p for p, _n, _af in sc.unstained_choices(c)]
+        if pair is None or not references:
+            self._fix_fail('No unstained cell sample or scatter channels to match by: choose each group\'s '
+                           'unstained sample on the Spectral Correction page.')
+            return
+        job = (str(c.experiment_dir), todo, references, pair, scatter_ceilings(raw_settings, pair))
+
+        def work(progress):
+            return sc.match_unstained(*job, progress=lambda text: progress(0, 0, text))
+
+        if self._start_task('fix_match', work):
+            page.set_fix_status('Matching unstained samples by scatter…')
+            page.refresh()
+        else:
+            self._fix_fail('Already running.')
+
+    def _on_fix_match_finished(self, found: dict):
+        job = self._fix_job
+        missing = []
+        for group in job['groups']:
+            if group in job['unstained']:
+                continue
+            path = (found.get(group) or {}).get('unstained')
+            if path:
+                job['unstained'][group] = path
+            else:
+                missing.append(group)
+        if missing:
+            self._fix_fail(f'No scatter match for {", ".join(missing)}: choose the unstained sample on the '
+                           'Spectral Correction page.')
+            return
+        self._start_fix_run()
+
+    def _start_fix_run(self):
+        """Snapshot (main thread) and start the run with the FlowCode loader."""
+        from honeychrome.controller_components import spectral_correction as sc
+
+        c = self.controller
+        job = self._fix_job
+        tags = list(self.state.tag_channels())
+        try:
+            fc = self.export_spectra()
+            snap = sc.correction_snapshot(c, job['setup'], job['unstained'])
+            fcfu.keep_tags_out(snap['settings'], tags)
+            members = list(dict.fromkeys(p for g in snap['groups'].values() for p in g['samples']))
+            layout = fce.build_export_layout(c)
+            self._sync_unmixing_inputs()
+            export = self.export_job(fc, layout, members)
+            if export is None:
+                raise ValueError('The AF libraries could not be read.')
+            _plan, af_by_sample, unmix_fn, _extra, _keywords, _tandems = export
+            no_af = [_sample_name(c, k) for k in members if af_by_sample.get(k) is None]
+            if no_af:
+                raise ValueError('No AF library for ' + ', '.join(no_af) + ': assign AF profiles in '
+                                 'AutoSpectral > Autofluorescence.')
+            detectors = [layout.pnn_raw_export[i] for i in layout.fl_ids_raw]
+            if list(snap['layout']['detectors']) != detectors:
+                raise ValueError('The spectral correction and FlowCode read different fluorescence channels.')
+            raw = c.experiment.settings['raw']
+            scatter = [raw['event_channels_pnn'][i] for i in raw['scatter_channel_ids']]
+            loader = fcfu.corrected_loader(unmix_fn, {k: af_by_sample[k] for k in members}, detectors, scatter)
+        except ValueError as exc:
+            self._fix_fail(str(exc))
+            return
+        job.update(characterisation=fc.characterisation_id(), tags=tags)
+
+        def work(progress):
+            return sc.run_corrections(snap, lambda text: progress(0, 0, text), loader)
+
+        if self._start_task('fix_run', work):
+            self.pages[5].set_fix_status('Running Fix My Unmix on FRET-corrected data…')
+            self.pages[5].refresh()
+        else:
+            self._fix_fail('Already running.')
+
+    def _on_fix_run_finished(self, run: dict):
+        from honeychrome.controller_components import spectral_correction as sc
+        from honeychrome.controller_components.gls_unmix import fluor_names_and_spectra, spectra_fingerprint
+
+        c = self.controller
+        job = self._fix_job
+        process = _process(c)
+        names, spectra = fluor_names_and_spectra(c)
+        if spectra is None or run['base_fingerprint'] != spectra_fingerprint(names, spectra):
+            self._fix_fail('The spectra changed while Fix Unmix ran; the result was discarded. Run it again.')
+            return
+        sc.store_corrections(process, run)
+        fcfu.mark_corrections(process, sc.STORE_KEY, job.get('characterisation'), job.get('tags') or [])
+        n_changed = sum(len(g['fluorophores']) for g in process[sc.STORE_KEY]['groups'].values())
+        self._release_fix()
+        if self.bus is not None:
+            self.bus.autoSaveRequested.emit()
+        if hasattr(c, 'refresh_unmixing'):
+            c.refresh_unmixing()
+        if self.bus is not None and hasattr(self.bus, 'unmixingMethodChanged'):
+            self.bus.unmixingMethodChanged.emit()
+        where = f' in {len(run["groups"])} groups' if len(run['groups']) > 1 else ''
+        self.pages[5].set_fix_status(f'Done. {n_changed} spectra corrected{where}; the experiment is now '
+                                     'unmixed with them.' if n_changed else
+                                     'Done. No spectrum needed a correction.')
+
+    # -- live unmix (Analysis page) ------------------------------------------------
+
+    def live_af_ok(self, keys) -> dict:
+        """{sample key: has an export AF library of at least 2 spectra}."""
+        af_profiles = _process(self.controller).get('af_profiles') or {}
+        return {key: sum(len(af_profiles[n].get('spectra') or []) for n in names if n in af_profiles) >= 2
+                for key, names in self.export_af_lists(list(keys)).items()}
+
+    def live_unmixing_signature(self, keys) -> dict | None:
+        """Everything that decides the FlowCode-unmixed values of *keys* apart
+        from the raw files: the characterisation, the spectral model, the
+        experiment's method and each sample's spectra set, the AF libraries,
+        the FlowCode gates and the section 5 settings. None without a saved
+        characterisation."""
+        fc = self.saved_spectra()
+        if fc is None:
+            return None
+        summary = self.method_summary()
+        state = self._method_state
+        af_profiles = _process(self.controller).get('af_profiles') or {}
+        af_lists = self.export_af_lists(list(keys))
+        used = sorted({n for names in af_lists.values() for n in names})
+        settings = {k: self.state.settings.get(k) for k in fcs.SECTION5_SETTINGS}
+        return {
+            'plugin': fcs.PLUGIN_VERSION,
+            'characterisation': fc.characterisation_id(),
+            'model': self.fingerprint(),
+            'method': summary.get('token'),
+            'sets': {k: ('' if state is None else state.set_for(k)) for k in keys},
+            'debarcode': self.debarcode_method(),
+            'af_lists': af_lists,
+            'af_spectra': {n: fcs._digest(af_profiles[n].get('spectra')) for n in used if n in af_profiles},
+            'gates': {name: (self.state.gates.get(name) or {}).get('vertices_raw') for name in fcs.GATE_NAMES},
+            'settings': settings,
+            'tandems': self.tandem_selection(),
+        }
+
+    def live_unmix_inputs(self, keys) -> dict:
+        """What a worker needs to FlowCode-unmix *keys* as section 5 would
+        export them (``flowcode_export.live_sample_events``). Raises
+        ValueError when it cannot. Main thread."""
+        if self.section_status(4)[0] != 'done':
+            raise ValueError('Characterise the backbone in section 4 first.')
+        fc = self.export_spectra()
+        layout = fce.build_export_layout(self.controller)
+        self._sync_unmixing_inputs()
+        job = self.export_job(fc, layout, list(keys))
+        if job is None:
+            raise ValueError('The AF libraries could not be read.')
+        plan, af_by_sample, unmix_fn, extra_channels, _keywords, _tandems = job
+        signature = self.live_unmixing_signature(keys)
+        from honeychrome import settings as app_settings
+        max_bytes = int(getattr(app_settings, 'unmixing_cache_gb_retrieved', 8)) * 1024 ** 3
+        return {'layout': layout, 'plan': plan, 'af_by_sample': af_by_sample, 'unmix_fn': unmix_fn,
+                'pnn': fce.export_pnn(layout, extra_channels), 'n_extra': len(extra_channels),
+                'signature': signature, 'max_cache_bytes': max_bytes}
+
+    def _on_unmixing_method_changed(self):
+        if self._active and self._available():
+            self.refresh()
+            if self.tabs.currentWidget() is self.pages[4]:
+                self._restore_characterisation()
 
     def export_spectra(self):
         """The saved characterisation with the current combo names, checked
@@ -4250,14 +5164,17 @@ class PluginWidget(QWidget):
                 f'{last.get("barcoded", 0):,} of {last.get("events", 0):,} events barcoded, to '
                 f'<tt>{last.get("folder", "")}</tt>. Event counts per sample and combination are in '
                 f'<tt>{SUMMARY_FILE}</tt>.')
+        if last.get('no_fret'):
+            text += (f' <span style="{_INVALID_STYLE}">Exported without FRET correction. '
+                     f'{fcs.NO_FRET_WARNING}</span>')
         if last.get('tandem_tags'):
             text += (f' Tandem breakdown ({", ".join(last["tandem_tags"])}) was corrected in '
                      f'{last.get("tandem_corrected", 0)} sample(s); the estimates are in the same file.')
         return text
 
     def start_export(self):
-        """Estimate, confirm and run the FlowCode export of the selected
-        samples (JointUnmixExporter), writing the summary files when done."""
+        """Estimate (slow methods only), confirm and run the FlowCode export
+        of the selected samples, writing the summary files when done."""
         if self.export_running() or not self.section_ready(5):
             return
         page = self.pages[5]
@@ -4265,36 +5182,23 @@ class PluginWidget(QWidget):
         if problem:
             page.set_run_status(problem, problem=True)
             return
-        fcc._ensure_bundled_plugins_on_path()
-        import joint_unmix_export as jue
-
         c = self.controller
         state = self.state
         try:
             fc = self.export_spectra()
-            layout = jue.build_export_layout(c)
+            layout = fce.build_export_layout(c)
         except (ValueError, KeyError) as exc:
             page.set_run_status(f'Could not prepare the export: {exc}', problem=True)
             return
-        sample_paths = self.export_selection()
-        layout = replace(layout, sample_af_profiles=fcs.export_af_assignments(
-            layout.sample_af_profiles, sample_paths, state.af_profile_names))
+        sample_keys = self.export_selection()
+        if not fc.fret_corrected and not self.confirm_no_fret(
+                f'Unmix and export {len(sample_keys)} sample(s) without FRET correction?'):
+            page.set_run_status('Export cancelled.')
+            return
+        self._sync_unmixing_inputs()
         design = fc.design
-        names = list(layout.fluor_names)
-        spectra = np.asarray(layout.reference_spectra, dtype=np.float64)
-        cell_weight = self.cell_weight()
-        use_variants = self.use_variants()
-        kernel = fcc.kernel_available()
-        final, _engine = self.final_unmix(spectra, names)
-
-        def final_fn(raw_fl, af):
-            return final(raw_fl, af.spectra)
-
-        tandems, tandem_pool = self.export_tandems()
         job = {'design': design, 'folder': self.export_folder(), 'current': None, 'samples': [],
-               'inputs': state.section_inputs(5, self.fingerprint()), 'use_variants': use_variants,
-               'engine': 'kernel' if kernel else 'python', 'fc': fc, 'tandems': tandems, 'tandem': None,
-               'af_profiles': {p: list(layout.sample_af_profiles.get(p) or []) for p in sample_paths}}
+               'inputs': state.section_inputs(5, self.fingerprint()), 'fc': fc, 'tandems': [], 'tandem': None}
 
         def on_block(summary):
             job['current'] = fcc.add_summaries(job['current'], summary)
@@ -4302,33 +5206,37 @@ class PluginWidget(QWidget):
         def on_tandem(records):
             job['tandem'] = records
 
-        def sample_done(sample_path, n_events):
+        def sample_done(sample_key, n_events):
             empty = fcc.debarcode_summary(np.zeros(0, dtype=np.int64), design)
             summary = job['current'] or empty
-            if tandems:
+            if job['tandems']:
                 summary = dict(summary, tandem=job['tandem'] or [])
-            job['samples'].append((sample_path, summary))
+            job['samples'].append((sample_key, summary))
             job['current'] = None
             job['tandem'] = None
 
-        records = [state.gates[name] for name in fcs.GATE_NAMES if name in state.gates]
-        unmix_fn = fcc.staged_export_fn(fc, spectra, names, final_fn, records, layout.pnn_raw_export,
-                                        dict(state.settings), cell_weight=cell_weight, on_block=on_block,
-                                        tandems=tandems, tandem_pool=tandem_pool, on_tandem=on_tandem)
-        extra_channels = [fcc.FLOWCODE_CHANNEL] + [fcc.combo_channel_name(n) for n in design.combo_names]
-        keywords = {
-            'FLOWCODEUNMIX': fcs.PLUGIN_VERSION,
-            'FLOWCODECOMBOS': ';'.join(f'{fcc.combo_channel_name(n)}={fcc.combo_key(t)}'
-                                       for n, t in zip(design.combo_names, design.combo_tags)),
-        }
-        exporter = jue.JointUnmixExporter(
-            sample_paths, layout, unmix_fn, bus=self.bus, extra_channels=extra_channels,
-            output_root=job['folder'], name_suffix=EXPORT_NAME_SUFFIX, unmixing_method='FlowCode',
-            extra_keywords=keywords, sample_done=sample_done,
-            prepare_fn=unmix_fn.prepare if tandems else None,
+        job_inputs = self.export_job(fc, layout, sample_keys, on_block=on_block, on_tandem=on_tandem)
+        if job_inputs is None:
+            page.set_run_status('The AF libraries of the selected samples could not be read.', problem=True)
+            return
+        plan, af_by_sample, unmix_fn, extra_channels, keywords, tandems = job_inputs
+        job.update(plan=plan, tandems=tandems,
+                   af_profiles={key: list(af.profile_names) for key, af in af_by_sample.items() if af is not None},
+                   methods={key: plan.sample_label(af, key) for key, af in af_by_sample.items() if af is not None})
+        exporter = fce.FlowCodeExporter(
+            sample_keys, layout, unmix_fn, af_by_sample, bus=self.bus, extra_channels=extra_channels,
+            output_root=job['folder'], name_suffix=EXPORT_NAME_SUFFIX,
+            method_label=lambda key, af: f'FlowCode; {plan.sample_label(af, key)}',
+            spectra_for=plan.spectra_for, extra_keywords=keywords, sample_done=sample_done,
+            sample_keywords=lambda key: {'FLOWCODESOURCE': str(key)},
         )
-        probe_fn = final_fn if kernel and use_variants else None
-        run = jue.JointUnmixRun(exporter, parent_widget=self, probe_fn=probe_fn, bus=self.bus)
+
+        def probe(raw_fl, af, key):
+            plan.debarcode(raw_fl, af, key)
+            plan.final(raw_fl, af, key)
+
+        run = fce.FlowCodeExportRun(exporter, controller=c, parent_widget=self,
+                                    probe_fn=probe if plan.needs_time_probe() else None, method_label=plan.label)
         run.status.connect(page.set_run_status)
         run.progress.connect(self._on_export_progress)
         run.finished.connect(self._on_export_finished)
@@ -4336,9 +5244,45 @@ class PluginWidget(QWidget):
         run.done.connect(self._on_export_done)
         self._export_run = run
         self._export_job = job
-        page.set_run_status(f'Exporting {len(sample_paths)} sample(s)…')
+        page.set_run_status(f'Exporting {len(sample_keys)} sample(s)…')
+        if not run.start():
+            self._export_run = None
+            self._export_job = None
         self.refresh()
-        run.start()
+
+    def export_job(self, fc, layout, sample_keys, on_block=None, on_tandem=None):
+        """``(plan, {sample: AFState}, per-chunk function, extra channels,
+        keywords, ticked tandems)`` of a FlowCode unmix of *sample_keys*:
+        what the export writes and the Analysis page's live unmix counts.
+        None when an AF library cannot be read. Main thread."""
+        state = self.state
+        plan = self.unmix_plan(sample_keys)
+        af_lists = self.export_af_lists(sample_keys)
+        af_by_sample = {key: plan.af_for(names) for key, names in af_lists.items()}
+        if plan.af_for(state.af_profile_names) is None:
+            return None
+        design = fc.design
+        names = list(layout.fluor_names)
+        spectra = np.asarray(plan.spectra, dtype=np.float64)
+        tandems, tandem_pool = self.export_tandems()
+        records = [state.gates[name] for name in fcs.GATE_NAMES if name in state.gates]
+        unmix_fn = fcc.staged_export_fn(fc, spectra, names, plan.final, records, layout.pnn_raw_export,
+                                        dict(state.settings), on_block=on_block, tandems=tandems,
+                                        tandem_pool=tandem_pool, on_tandem=on_tandem,
+                                        debarcode_fn=plan.debarcode)
+        if not tandems:
+            unmix_fn.prepare = None
+        extra_channels = ([fcc.FLOWCODE_CHANNEL, fcc.FLOWCODE_ID_CHANNEL]
+                          + [fcc.combo_channel_name(n) for n in design.combo_names])
+        keywords = {
+            'FLOWCODEUNMIX': fcs.PLUGIN_VERSION,
+            'FLOWCODECOMBOS': fcc.combos_keyword(design),
+            'FLOWCODECHARACTERISATION': fc.characterisation_id(),
+        }
+        if not fc.fret_corrected:
+            keywords['FLOWCODECORRECTION'] = fa.NO_CORRECTION_KEYWORD
+            keywords['FLOWCODEWARNING'] = fcs.NO_FRET_WARNING
+        return plan, af_by_sample, unmix_fn, extra_channels, keywords, tandems
 
     def _on_export_progress(self, n, total):
         self.pages[5].set_run_status(f'Unmixing and exporting… ({n}/{total} samples)')
@@ -4356,7 +5300,8 @@ class PluginWidget(QWidget):
         folder = job['folder']
         try:
             folder.mkdir(parents=True, exist_ok=True)
-            fcc.write_debarcode_summary_csv(folder / SUMMARY_FILE, rows, job['design'])
+            fcc.write_debarcode_summary_csv(folder / SUMMARY_FILE, rows, job['design'],
+                                            warning=None if job['fc'].fret_corrected else fcs.NO_FRET_WARNING)
             with open(folder / RUN_FILE, 'w', encoding='utf-8') as fh:
                 json.dump(self._run_record(job), fh, indent=2,
                           default=lambda v: v.item() if hasattr(v, 'item') else str(v))
@@ -4369,7 +5314,8 @@ class PluginWidget(QWidget):
         state.last_export = {'time': datetime.now().strftime('%Y-%m-%d %H:%M'), 'folder': str(folder),
                              'n_samples': len(rows), 'events': int(events), 'barcoded': int(barcoded),
                              'tandem_tags': [t.fluor for t in job['tandems']],
-                             'tandem_corrected': int(tandem_corrected)}
+                             'tandem_corrected': int(tandem_corrected),
+                             'no_fret': not job['fc'].fret_corrected}
         if job['inputs'] == state.section_inputs(5, self.fingerprint()):
             state.mark_completed(5, self.fingerprint())
         page.set_run_status(f'Done: {len(rows)} sample(s) exported.')
@@ -4383,8 +5329,8 @@ class PluginWidget(QWidget):
         fc = job['fc']
         design = job['design']
         settings = {k: state.settings.get(k) for k in fcs.SECTION4_SETTINGS + fcs.SECTION5_SETTINGS}
-        settings['cell_weight'] = self.cell_weight()
-        settings['threads'] = self.kernel_threads()
+        settings['debarcode_method'] = self.debarcode_method()
+        plan = job['plan']
         return {
             'plugin_version': fcs.PLUGIN_VERSION,
             'honeychrome_version': hc_version,
@@ -4394,12 +5340,18 @@ class PluginWidget(QWidget):
             'thresholds': [{'Fluor': f, 'Tag': t, 'Threshold_Raw': float(r)}
                            for f, t, r in zip(design.fluors, design.tags, fc.thresholds)],
             'combinations': [{'Id': n, 'tags': list(t), 'channel': fcc.combo_channel_name(n),
-                              'error': 'combo' if fc.combo_error[g] is not None else 'pairwise'}
+                              'error': ('none' if not fc.fret_corrected else
+                                        'combo' if fc.combo_error[g] is not None else 'pairwise')}
                              for g, (n, t) in enumerate(zip(design.combo_names, design.combo_tags))],
+            'fret_correction': bool(fc.fret_corrected),
+            **({} if fc.fret_corrected else {'warning': fcs.NO_FRET_WARNING,
+                                             'no_fret_acknowledged': state.no_fret_acknowledged}),
             'settings': settings,
-            'use_variants': job['use_variants'],
-            'final_unmix': job['engine'],
+            'final_unmix': plan.label,
+            'unmixing_method_token': plan.token,
+            'sample_unmixing': job.get('methods') or {},
             'fingerprint': fc.fingerprint(),
+            'characterisation': fc.characterisation_id(),
             'tandem_tags': [{'tag': design.tags[t.tag], 'fluor': t.fluor, 'parent': t.parent, 'source': t.source,
                              'reference': {k: v for k, v in ((fc.diagnostics or {}).get('tandem') or {})
                                            .get(t.fluor, {}).items() if k not in ('combo_beta', 'combo_null')}}
@@ -4450,6 +5402,10 @@ class PluginWidget(QWidget):
     def _on_task_progress(self, key, n, total, text):
         if self.bus is not None and total:
             self.bus.progress.emit(n, total)
+        if key.startswith('analysis_'):
+            self.pages[6].on_task_progress(key, n, total, text)
+        if key.startswith('fix_') and text:
+            self.pages[5].set_fix_status(f'{text}…')
         if key == 'load' and text:
             self.pages[3].load_status.setText(f'Reading the {text}…')
         elif key == 'match' and text:
@@ -4460,7 +5416,16 @@ class PluginWidget(QWidget):
     def _on_task_finished(self, key, result):
         self._tasks.pop(key, None)
         if self._task_experiment.pop(key, None) != self._experiment_key:
+            if key.startswith('fix_'):
+                self._release_fix()
             return
+        if key.startswith('analysis_'):
+            self.pages[6].on_task_finished(key, result)
+            return
+        if key == 'fix_match':
+            self._on_fix_match_finished(result)
+        elif key == 'fix_run':
+            self._on_fix_run_finished(result)
         if key == 'match':
             self.apply_matching_scores(*result)
         elif key == 'load':
@@ -4476,7 +5441,14 @@ class PluginWidget(QWidget):
     def _on_task_error(self, key, message):
         self._tasks.pop(key, None)
         if self._task_experiment.pop(key, None) != self._experiment_key:
+            if key.startswith('fix_'):
+                self._release_fix()
             return
+        if key.startswith('analysis_'):
+            self.pages[6].on_task_error(key, message)
+            return
+        if key.startswith('fix_'):
+            self._fix_fail(f'Fix Unmix failed: {message}')
         if key == 'match':
             self.pages[1].match_status.setText(f'Matching failed: {message}')
         elif key == 'load':

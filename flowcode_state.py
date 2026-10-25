@@ -13,6 +13,14 @@ Sections that run a computation (3: gates and thresholds, 4: debarcode and
 FRET, 5: unmix and export) record a signature of their inputs when they
 finish. A section is done while its recorded signature matches the current
 inputs; otherwise it needs a re-run, and the differing inputs say why.
+
+Several libraries: when one experiment holds samples transduced with
+different guide libraries on the same tags, each library has its own
+combinations CSV and each sample is assigned to one library (or to Other,
+e.g. an FMO). Debarcoding works on tag triplets, so the design is the union
+of every library's triplets, each combination named by its triplet
+(``AU1_C_FLAG``); a library only names the guide a triplet carries. Guide
+names in the combination table are read-only and come from the CSVs.
 """
 
 from __future__ import annotations
@@ -39,10 +47,14 @@ SECTION_TITLES = {
     3: 'Gates & Thresholds',
     4: 'Debarcode & FRET',
     5: 'Unmix & Export',
+    6: 'Analysis',
 }
 
 MIN_TAGS = 3
 RECOMMENDED_TAGS = 4
+
+# Shown wherever results come from samples debarcoded without FRET correction.
+NO_FRET_WARNING = 'WARNING: no spillover performed! Results invalid!'
 
 DEFAULT_SETTINGS = {
     # section 1
@@ -59,7 +71,8 @@ DEFAULT_SETTINGS = {
     'threshold_max_events': 50_000,
     'threshold_min_delta_bic': 10.0,
     'threshold_display_max_events': 200_000,
-    'cell_weight': None,
+    'cell_weight': None,                # in the section 3 run record only
+    'debarcode_method': 'r1',           # 'r1' (per-cell AF) or 'experiment' (the experiment's method)
     # section 4
     'rescue_toomany': True,
     'rescue_flat_threshold': 0.9,
@@ -80,15 +93,6 @@ DEFAULT_SETTINGS = {
     'tag_shift_min_n': 100,
     'correction': 'combo',
     'regressor': 'fixed',
-    'use_variants': None,
-    'n_passes': 1,
-    'n_af_passes': 1,
-    'refine_af_quantile': 0.5,
-    'noise_floor': 125.0,
-    'alpha': 0.5,
-    'collinear_threshold': 0.5,
-    'joint_pair_resolution': True,
-    'threads': None,
     'export_include_controls': False,
     'tandem_tags': None,
     'tandem_z_min': 3.0,
@@ -101,9 +105,12 @@ SECTION4_SETTINGS = ('rescue_toomany', 'rescue_flat_threshold', 'rescue_gate_fra
                      'rescue_toofew_flat_threshold', 'rescue_toofew_gate_frac', 'rescue_toofew_min_z',
                      'rescue_toofew_min_frac', 'rescue_toofew_af_ratio', 'rescue_toofew_n0', 'fit_min_fold',
                      'min_cells_per_combo', 'spill_ridge')
-SECTION5_SETTINGS = ('tag_shift_min_n', 'correction', 'regressor', 'use_variants', 'n_passes', 'n_af_passes',
-                     'refine_af_quantile', 'noise_floor', 'alpha', 'collinear_threshold', 'joint_pair_resolution',
-                     'tandem_tags', 'tandem_z_min', 'tandem_min_combos', 'tandem_max_events')
+SECTION5_SETTINGS = ('tag_shift_min_n', 'correction', 'regressor', 'tandem_tags', 'tandem_z_min',
+                     'tandem_min_combos', 'tandem_max_events')
+
+# Final-unmix settings of earlier versions; the experiment's method (AutoSpectral tab) replaces them.
+RETIRED_SETTINGS = ('use_variants', 'n_passes', 'n_af_passes', 'refine_af_quantile', 'noise_floor', 'alpha',
+                    'collinear_threshold', 'joint_pair_resolution', 'threads')
 
 _REASONS = {
     'backbone': 'backbone sample changed',
@@ -120,7 +127,15 @@ _REASONS = {
     'settings5': 'section 5 settings changed',
     'samples': 'sample selection changed',
     'output': 'output folder changed',
+    'debarcode': 'debarcoding unmix changed',
+    'method': 'unmixing method changed',
+    'no_fret': 'FRET correction switched on or off',
+    'libraries': 'libraries or library assignments changed',
 }
+
+# Library of a sample that belongs to none (e.g. an FMO).
+OTHER_LIBRARY = 'Other'
+LIBRARY_PREFIX = 'Library'
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +195,12 @@ class FlowCodeState:
     tag_selection: list | None = None
     tag_names: dict = field(default_factory=dict)
     combos: list = field(default_factory=list)
+    # Several libraries: [{'name', 'label', 'pattern', 'csv_path', 'combos'}]
+    # and {sample key: library name or OTHER_LIBRARY}.
+    multi_library: bool = False
+    libraries: list = field(default_factory=list)
+    sample_libraries: dict = field(default_factory=dict)
+    merge_same_names: bool = True
     gates: dict = field(default_factory=dict)
     thresholds: dict = field(default_factory=dict)
     y_channels: dict = field(default_factory=dict)
@@ -191,12 +212,21 @@ class FlowCodeState:
     backbone_summary: dict | None = None
     fingerprint: str | None = None
     completed: dict = field(default_factory=dict)
+    analysis: dict = field(default_factory=dict)
+    # Debarcode without FRET correction (no FRET backbone), and when the user
+    # acknowledged that its results are invalid.
+    no_fret: bool = False
+    no_fret_acknowledged: str | None = None
     plugin_version: str = PLUGIN_VERSION
+    # Set by the plugin from the experiment's unmixing method, not saved:
+    # 'token' (the method) and 'final' (the method and the export samples' spectra sets).
+    unmixing_inputs: dict = field(default_factory=dict, repr=False)
 
     # -- persistence ---------------------------------------------------------
 
     def to_json(self) -> dict:
         data = deepcopy(vars(self))
+        data.pop('unmixing_inputs', None)
         data['plugin_version'] = PLUGIN_VERSION
         return json.loads(json.dumps(data, default=_json_default))
 
@@ -206,7 +236,7 @@ class FlowCodeState:
         if not data:
             return state
         for key in vars(state):
-            if key in data:
+            if key in data and key != 'unmixing_inputs':
                 setattr(state, key, deepcopy(data[key]))
         # states written with a single backbone
         for old, new in (('backbone_key', 'backbone_keys'), ('match_backbone_key', 'match_backbone_keys')):
@@ -216,6 +246,8 @@ class FlowCodeState:
         merged.update(state.settings or {})
         # settings of the earlier error model
         merged.pop('af_fret_term', None)
+        for key in RETIRED_SETTINGS:
+            merged.pop(key, None)
         if merged.get('correction') == 'global':
             merged['correction'] = 'pairwise'
         state.settings = merged
@@ -245,6 +277,38 @@ class FlowCodeState:
         """Sorted tag triplets of the included combos (names excluded)."""
         return sorted(tuple(sorted(str(t).upper() for t in row['tags'])) for row in self.included_combos())
 
+    # -- libraries -------------------------------------------------------------
+
+    def enable_libraries(self):
+        """Switch to several libraries. The first time, Library 1 takes the
+        section 1 combinations CSV and an empty Library 2 is added."""
+        self.multi_library = True
+        if not self.libraries:
+            first = new_library([], self.combos_csv_path, self.csv_combos)
+            self.libraries = [first, new_library([first])]
+
+    def library_names(self) -> list:
+        return [str(lib.get('name', '')) for lib in self.libraries]
+
+    def library_csv_combos(self) -> list:
+        """Every library's combos ([guide, tags]), in library order."""
+        return [combo for lib in self.libraries for combo in lib.get('combos') or []]
+
+    def csv_source(self) -> list | None:
+        """The CSV combos that set the tags and the combination rows: every
+        library's with several libraries, else the section 1 CSV's."""
+        if self.multi_library:
+            return self.library_csv_combos() or None
+        return self.csv_combos
+
+    def library_of(self, sample_key: str) -> str | None:
+        """The sample's library name, OTHER_LIBRARY, or None when unassigned
+        or assigned to a library that no longer exists."""
+        name = self.sample_libraries.get(sample_key)
+        if name == OTHER_LIBRARY or name in set(self.library_names()):
+            return name
+        return None
+
     # -- run records ---------------------------------------------------------
 
     def section_inputs(self, section: int, fingerprint: str | None) -> dict:
@@ -258,6 +322,8 @@ class FlowCodeState:
             'combos': _digest(self.combo_triplets()),
             'fingerprint': _digest(fingerprint),
             'settings3': _digest({k: self.settings.get(k) for k in SECTION3_SETTINGS}),
+            'debarcode': (None if self.settings.get('debarcode_method', 'r1') == 'r1'
+                          else _digest(['experiment', self.unmixing_inputs.get('token')])),
         }
         if section == 3:
             inputs['gates'] = _digest({name: self.gates.get(name, {}).get('vertices_raw')
@@ -267,6 +333,7 @@ class FlowCodeState:
             inputs.update(self.section_inputs(3, fingerprint))
             inputs['thresholds'] = _digest({t: v.get('raw') for t, v in sorted(self.thresholds.items())})
             inputs['settings4'] = _digest({k: self.settings.get(k) for k in SECTION4_SETTINGS})
+            inputs['no_fret'] = _digest('no FRET correction') if self.no_fret else None
         if section >= 5:
             inputs['combo_names'] = _digest([[row['name'], sorted(row['tags'])]
                                              for row in self.included_combos()])
@@ -274,6 +341,10 @@ class FlowCodeState:
             inputs['samples'] = _digest(self.export_samples) if not self.settings.get('export_include_controls') \
                 else _digest([self.export_samples, 'controls'])
             inputs['output'] = _digest(self.output_folder)
+            inputs['method'] = _digest(self.unmixing_inputs.get('final'))
+            inputs['libraries'] = (_digest([[lib.get('name'), lib.get('label'), lib.get('combos')]
+                                            for lib in self.libraries] + [self.sample_libraries])
+                                   if self.multi_library else None)
         return inputs
 
     def combo_backbone_counts(self) -> dict:
@@ -309,7 +380,11 @@ class FlowCodeState:
 # Section 1: inputs
 # ---------------------------------------------------------------------------
 
-def _is_bead(key: str, name: str) -> bool:
+def _is_bead(samples: dict, key: str, name: str) -> bool:
+    """In the experiment's bead_samples list; by name in Honeychrome versions without it."""
+    beads = samples.get('bead_samples')
+    if beads is not None:
+        return key in beads
     return bool(re.search(r'bead', name, re.IGNORECASE) or re.search(r'bead', key, re.IGNORECASE))
 
 
@@ -330,7 +405,7 @@ def unstained_candidates(samples: dict) -> list:
     all_samples = samples.get('all_samples') or {}
     tagged = set(samples.get('unstained_samples') or [])
     return [key for key, name in all_samples.items()
-            if _is_unstained(key, name, tagged) and not _is_bead(key, str(name))]
+            if _is_unstained(key, name, tagged) and not _is_bead(samples, key, str(name))]
 
 
 def control_sample_keys(samples: dict) -> set:
@@ -399,8 +474,8 @@ def af_library_problem(af_profiles: dict, names, detectors, unstained_name: str 
     Returns (number of spectra, problem message or None).
     """
     names = [n for n in (names or []) if n in (af_profiles or {})]
-    hint = (f"No AF profile extracted from '{unstained_name}'. Open the AutoSpectral AF tab, select "
-            f"this sample in 'Extract AF profile', and run extraction.")
+    hint = (f"No AF profile extracted from '{unstained_name}'. Open the Autofluorescence page of the AutoSpectral tab, select "
+            f"this sample in Step 1 (Extract AF Profile), and run extraction.")
     if not names:
         return 0, hint
     n_spectra = 0
@@ -409,7 +484,7 @@ def af_library_problem(af_profiles: dict, names, detectors, unstained_name: str 
         channels = entry.get('channel_names')
         if channels is not None and list(channels) != list(detectors):
             return 0, (f"AF profile '{name}' was extracted with different detectors. "
-                       f"Re-extract it in the AutoSpectral AF tab.")
+                       f"Re-extract it on the Autofluorescence page of the AutoSpectral tab.")
         n_spectra += len(entry.get('spectra') or [])
     if n_spectra < 2:
         return n_spectra, hint
@@ -526,6 +601,138 @@ def csv_combo_rows(csv_combos, tag_for_csv: dict, previous=None) -> list:
             'tags': tags,
         })
     return rows
+
+
+def default_library_pattern(name: str) -> str:
+    """
+    Sample-name pattern of a library: 'Librar' (Library, Libraries), then
+    nothing, a space or an underscore, then the library's number, letter or
+    name, not followed by another letter or digit. That token is what
+    follows 'Library' at the end of *name* ('Library 2' gives '2'), else the
+    whole name. 'Library 1' matches 'SILPL_Library1_LSRB' but not
+    'Library10'.
+    """
+    text = str(name).strip()
+    m = re.search(r'librar(?:y|ies)?[ _]?([A-Za-z0-9]+)$', text, re.IGNORECASE)
+    token = m.group(1) if m else text
+    return rf'librar(?:y|ies)?[ _]?{re.escape(token)}(?![A-Za-z0-9])'
+
+
+def new_library(libraries, csv_path=None, combos=None) -> dict:
+    """A library named 'Library <n>' with the first free n, its default
+    pattern, and the given combinations CSV."""
+    taken = {str(lib.get('name', '')).upper() for lib in libraries or []}
+    n = 1
+    while f'{LIBRARY_PREFIX} {n}'.upper() in taken:
+        n += 1
+    name = f'{LIBRARY_PREFIX} {n}'
+    return {'name': name, 'label': '', 'pattern': default_library_pattern(name),
+            'csv_path': csv_path, 'combos': [[str(g), [str(t) for t in tags]] for g, tags in combos or []]}
+
+
+def library_label(library: dict) -> str:
+    """The name a library is shown by in results: its label, else its name."""
+    return str(library.get('label') or '').strip() or str(library.get('name', ''))
+
+
+def library_sample_keys(samples: dict, backbone_keys) -> list:
+    """Samples that need a library, in experiment order: every sample
+    except single-stain controls, unstained samples, beads and the
+    backbones."""
+    all_samples = samples.get('all_samples') or {}
+    backbones = set(backbone_keys or [])
+    return [key for key in backbone_candidates(samples)
+            if key not in backbones and not _is_bead(samples, key, str(all_samples.get(key, '')))]
+
+
+def assign_libraries(keys, names: dict, libraries, current: dict, only_unassigned: bool = False) -> tuple:
+    """
+    Library assignments from the libraries' sample-name patterns, by
+    ``flowcode_analysis.assign_by_pattern`` (case-insensitive on the
+    displayed name, first matching library wins).
+
+    With *only_unassigned*, only samples without a library are filled.
+    Otherwise every sample in *keys* is reassigned: one matching no pattern
+    loses its library, except that a sample assigned to Other keeps it.
+    Returns ({sample: library}, {library: n matched}); raises ValueError
+    naming a library whose pattern is not valid.
+    """
+    from flowcode_analysis import assign_by_pattern
+
+    lib_names = [str(lib.get('name', '')) for lib in libraries]
+    patterns = {str(lib.get('name', '')): lib.get('pattern') or '' for lib in libraries}
+    found, matched = assign_by_pattern(list(keys), names, lib_names, patterns)
+    known = set(lib_names) | {OTHER_LIBRARY}
+    out = {k: v for k, v in (current or {}).items() if v in known}
+    for key in keys:
+        if only_unassigned and out.get(key):
+            continue
+        if key in found:
+            out[key] = found[key]
+        elif out.get(key) != OTHER_LIBRARY:
+            out.pop(key, None)
+    return out, matched
+
+
+def library_combo_rows(libraries, tag_for_csv: dict, previous=None) -> list:
+    """
+    Combination rows of several libraries: one row per tag triplet used by
+    any library, in order of first use, named by its triplet
+    (``combo_key``), with the guide each library gives it in ``names``
+    ({library: guide}). Tags are renamed to the tag names of their channels;
+    Include is kept from *previous* rows with the same tag set.
+    """
+    from flowcode_core import combo_key
+
+    kept = {tuple(sorted(str(t).upper() for t in row['tags'])): row for row in previous or []}
+    rows, index = [], {}
+    for lib in libraries or []:
+        for guide, tags in lib.get('combos') or []:
+            tags = [tag_for_csv.get(str(t).strip().upper(), str(t).strip()) for t in tags]
+            key = tuple(sorted(t.upper() for t in tags))
+            if key not in index:
+                old = kept.get(key)
+                index[key] = len(rows)
+                rows.append({'include': bool(old['include']) if old else True,
+                             'name': combo_key(tags), 'tags': tags, 'names': {}})
+            rows[index[key]]['names'][str(lib.get('name', ''))] = str(guide)
+    return rows
+
+
+def shared_guide_names(libraries) -> dict:
+    """{guide name: [library names]} for names used by more than one library."""
+    seen: dict = {}
+    for lib in libraries or []:
+        for guide, _tags in lib.get('combos') or []:
+            owners = seen.setdefault(str(guide), [])
+            if lib.get('name') not in owners:
+                owners.append(lib.get('name'))
+    return {g: libs for g, libs in seen.items() if len(libs) > 1}
+
+
+def library_problems(libraries) -> list:
+    """Problems with the libraries (empty if none): names, patterns and
+    combinations files."""
+    problems, seen = [], set()
+    if len(libraries or []) < 1:
+        problems.append('Add at least one library.')
+    for lib in libraries or []:
+        name = str(lib.get('name', '')).strip()
+        if not name:
+            problems.append('A library has no name.')
+            continue
+        if name.upper() == OTHER_LIBRARY.upper():
+            problems.append(f'"{OTHER_LIBRARY}" is reserved for samples that belong to no library.')
+        if name.upper() in seen:
+            problems.append(f'Library name "{name}" is used twice.')
+        seen.add(name.upper())
+        try:
+            re.compile(lib.get('pattern') or '')
+        except re.error as exc:
+            problems.append(f'{name}: the sample-name pattern is not valid ({exc}).')
+        if not lib.get('combos'):
+            problems.append(f'{name}: load its combinations file.')
+    return problems
 
 
 def tag_problems(tag_map: dict, fluor_profiles) -> tuple:

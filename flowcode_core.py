@@ -9,8 +9,9 @@ Pipeline
        (``singlet_ratio_cutoff``, ``singlet_polygon``) and a landmark
        FSC/SSC gate around events clearly positive for three tags
        (``landmark_indices``, ``landmark_gate``).
-    2. Per-cell AF unmixing of the gated backbone (``af_only_unmix``): the
-       debarcoding space in which positivity thresholds are set
+    2. Per-cell AF unmixing of the gated backbone (``af_only_unmix``), scored
+       with the AF profiles' negative envelopes as in the AutoSpectral AF
+       tab: the debarcoding space in which positivity thresholds are set
        (``initial_threshold``).
     3. ``characterise_backbone``: debarcode with too-many and too-few-tag
        rescue, then model each combo's raw-space unmixing error (FRET plus
@@ -72,6 +73,9 @@ FLOWCODE_TAGS = ('HA', 'V5', 'AU1', 'AU5', 'S', 'C', 'Flag', 'NWS', 'VSVg', 'Oll
 UNTRANSDUCED = 0
 COMBO_CHANNEL_PREFIX = 'FC '
 FLOWCODE_CHANNEL = 'FlowCode'
+# Exported per-event barcode: 0 untransduced, 1..n combination (design order),
+# n + 1 unresolved.
+FLOWCODE_ID_CHANNEL = 'FlowCode ID'
 
 _EPS = np.finfo(float).eps
 
@@ -183,6 +187,13 @@ def combo_key(tags) -> str:
 def combo_channel_name(name: str) -> str:
     """Exported channel name for a combo."""
     return f'{COMBO_CHANNEL_PREFIX}{name}'
+
+
+def combos_keyword(design) -> str:
+    """The ``FLOWCODECOMBOS`` keyword of an export: ``FC <name>=<tag key>``
+    for each combination, joined by ';'."""
+    return ';'.join(f'{combo_channel_name(n)}={combo_key(t)}'
+                    for n, t in zip(design.combo_names, design.combo_tags))
 
 
 def all_triplets(tags) -> list:
@@ -300,17 +311,19 @@ def af_mean_spectrum(unstained_raw: np.ndarray) -> np.ndarray:
 
 def af_only_unmix(raw_fl: np.ndarray, spectra: np.ndarray, fluor_names, af_spectra: np.ndarray,
                   cell_weight: bool = False, n_threads: int | None = None,
-                  use_kernel: bool = False) -> dict:
+                  use_kernel: bool = False, envelope: dict | None = None) -> dict:
     """
     Per-cell AF unmixing without fluorophore variants.
 
-    By default Honeychrome's Python per-cell AF (joint L2 assignment,
-    batched matrix products), which ignores ``cell_weight``. With
-    ``use_kernel`` and the kernel built, the joint kernel in AF-only mode
-    instead, as ``unmix.autospectral.rcpp(pipeline = "joint",
-    spectra.variants = NULL)`` does in R. The two assign the same AF
-    spectrum to at least 98% of events and give identical values where they
-    agree; the Python path was about twice as fast in the benchmark.
+    By default Honeychrome's Python per-cell AF (batched matrix products),
+    which ignores ``cell_weight``. With ``use_kernel`` and the kernel built,
+    the joint kernel in AF-only mode instead, as
+    ``unmix.autospectral.rcpp(pipeline = "joint", spectra.variants = NULL)``
+    does in R. ``envelope`` is the AF library's negative envelope
+    (``af_envelope_for_profiles``): with it both score the AF candidates by
+    the positivity-weighted term and the Python path re-fits events with a
+    saturated detector on the remaining detectors; without it they use the
+    joint L2 score. The Python path was about twice as fast in the benchmark.
 
     Returns ``unmixed`` (n x F), ``af_scale``, ``af_idx`` (1-based into
     ``af_spectra``) and ``engine`` ('kernel' or 'python').
@@ -324,16 +337,15 @@ def af_only_unmix(raw_fl: np.ndarray, spectra: np.ndarray, fluor_names, af_spect
         result = unmix_autospectral_joint(
             raw_data_in=raw_fl, spectra=spectra, af_spectra=af_spectra,
             fluor_names=list(fluor_names), pos_thresholds=np.zeros(n_fluor), variants=[],
-            n_threads=threads, cell_weight=cell_weight,
+            n_threads=threads, cell_weight=cell_weight, envelope=envelope,
         )
         return {'unmixed': result[:, :n_fluor], 'af_scale': result[:, n_fluor],
                 'af_idx': result[:, n_fluor + 1].astype(np.int64), 'engine': 'kernel'}
 
     from honeychrome.controller_components.autospectral_functions import (
-        apply_af_unmixing, precompute_af_matrices, precompute_joint_cov_extras,
+        apply_af_unmixing, build_af_precomputed,
     )
-    precomputed = precompute_af_matrices(spectra, af_spectra)
-    precomputed.update(precompute_joint_cov_extras(precomputed, af_spectra))
+    precomputed = build_af_precomputed(spectra, af_spectra, envelope)
     result = apply_af_unmixing(np.ascontiguousarray(raw_fl, dtype=np.float64), precomputed, af_spectra)
     return {'unmixed': result['unmixed'], 'af_scale': result['af_scale'],
             'af_idx': np.asarray(result['af_idx'], dtype=np.int64), 'engine': 'python'}
@@ -1410,6 +1422,10 @@ class FlowCodeSpectra:
     ``tag_background`` is the untransduced median per tag in debarcoding
     space, the background of ``combo_raw_median`` for the too-few rescue
     (None: each sample's own).
+    ``fret_corrected`` False marks a debarcoding-only characterisation
+    (no FRET backbone): it has no error model, and samples unmixed with it
+    get no FRET, spillover or tandem correction, so their results are not
+    valid.
     """
     design: FlowCodeDesign
     thresholds: np.ndarray
@@ -1426,6 +1442,7 @@ class FlowCodeSpectra:
     tag_background: np.ndarray | None = None
     settings: dict = field(default_factory=dict)
     diagnostics: dict = field(default_factory=dict)
+    fret_corrected: bool = True
 
     def tag_columns(self) -> np.ndarray:
         """Indices of the tag fluorophores in ``fluor_names``."""
@@ -1443,6 +1460,18 @@ class FlowCodeSpectra:
 
     def fingerprint(self) -> str:
         return spectra_fingerprint(self.spectra[self.tag_columns()], self.detectors)
+
+    def characterisation_id(self) -> str:
+        """Short identifier of this characterisation: the tag spectra, the
+        thresholds and the combination table. Written to each exported file
+        so later analyses can tell which characterisation produced it."""
+        h = hashlib.sha1(self.fingerprint().encode('utf-8'))
+        h.update(np.round(np.asarray(self.thresholds, dtype=np.float64), 6).tobytes())
+        for name, tags in zip(self.design.combo_names, self.design.combo_tags):
+            h.update(f'{name}={combo_key(tags)};'.encode('utf-8'))
+        if not self.fret_corrected:
+            h.update(b'no FRET correction')
+        return h.hexdigest()[:12]
 
 
 @dataclass(eq=False)
@@ -1487,7 +1516,8 @@ def characterise_backbone(raw: np.ndarray, debarcode_unmixed: np.ndarray, design
                           rescue_floor: np.ndarray | None = None,
                           unstained_raw: np.ndarray | None = None,
                           settings: CharacteriseSettings | None = None,
-                          tandems=None, debarcode_af_scale: np.ndarray | None = None) -> CharacterisationResult:
+                          tandems=None, debarcode_af_scale: np.ndarray | None = None,
+                          fit_error: bool = True) -> CharacterisationResult:
     """
     Measure the FlowCode unmixing error on the gated backbone.
 
@@ -1507,6 +1537,11 @@ def characterise_backbone(raw: np.ndarray, debarcode_unmixed: np.ndarray, design
                         reference for samples) and before it (the backbone's
                         breakdown against the reference spectra), in
                         ``diagnostics['tandem']``.
+    fit_error         : False debarcodes only, for samples acquired without
+                        a FRET backbone: no error model, no tandem reference
+                        and no correction (``fret_corrected`` False). The
+                        combo medians and untransduced baseline that the
+                        rescues use are kept.
 
     The error of an event is its raw data minus the untransduced baseline
     (the per-detector median raw spectrum of the untransduced events) and
@@ -1521,9 +1556,11 @@ def characterise_backbone(raw: np.ndarray, debarcode_unmixed: np.ndarray, design
     fit events of every combo, serves the other combos and events without a
     valid barcode.
 
-    Raises ValueError if no combo has enough fit events.
+    Raises ValueError if no combo has enough fit events (with *fit_error*).
     """
     settings = settings or CharacteriseSettings()
+    if not fit_error:
+        tandems = None
     fluor_names = tuple(fluor_names)
     thresholds = np.asarray(thresholds, dtype=float)
     tag_cols = np.array([fluor_names.index(f) for f in design.fluors])
@@ -1591,7 +1628,7 @@ def characterise_backbone(raw: np.ndarray, debarcode_unmixed: np.ndarray, design
     combo_error = [None] * n_combo
     for g in range(n_combo):
         idx = fit_by[g]
-        if idx.size < min_cells:
+        if idx.size < min_cells or not fit_error:
             continue
         on = design.on_tags(g)
         tag_on = np.zeros((idx.size, design.n_tags))
@@ -1600,13 +1637,16 @@ def characterise_backbone(raw: np.ndarray, debarcode_unmixed: np.ndarray, design
                                          ridge=settings.spill_ridge)
 
     fitted = np.flatnonzero([e is not None for e in combo_error])
-    if fitted.size == 0:
-        raise ValueError(f'No combo had {min_cells} fit events. Check the thresholds, or lower the fit '
-                         f'fold or minimum events per combo.')
-    logger.info(f'{fitted.size}/{n_combo} combos characterised; the rest use the pairwise model')
-
-    tag_on_all = shifted_tags[fit_idx] * design.logical[ids[fit_idx] - 1]
-    pair_model = pair_model_fit(tag_on_all, error_of(fit_idx, tag_on_all), thresholds, min_cells)
+    pair_model = None
+    if fit_error:
+        if fitted.size == 0:
+            raise ValueError(f'No combo had {min_cells} fit events. Check the thresholds, or lower the fit '
+                             f'fold or minimum events per combo.')
+        logger.info(f'{fitted.size}/{n_combo} combos characterised; the rest use the pairwise model')
+        tag_on_all = shifted_tags[fit_idx] * design.logical[ids[fit_idx] - 1]
+        pair_model = pair_model_fit(tag_on_all, error_of(fit_idx, tag_on_all), thresholds, min_cells)
+    else:
+        logger.info('Debarcoding only: no FRET error model fitted')
 
     af_unit = af_mean / max(np.linalg.norm(af_mean), _EPS)
     shape_slope = None
@@ -1645,8 +1685,8 @@ def characterise_backbone(raw: np.ndarray, debarcode_unmixed: np.ndarray, design
                 / max(np.linalg.norm(slope.mean(axis=0)), _EPS)
 
     corrected = apply_error_correction(raw, fixed_tags, ids, design, combo_error, pair_model, thresholds,
-                                       tag_baseline=tag_baseline)
-    fixed_corrected = ols_unmix(corrected['raw'], basis)
+                                       'combo' if fit_error else 'none', tag_baseline=tag_baseline)
+    fixed_corrected = ols_unmix(corrected['raw'], basis) if fit_error else fixed
 
     tandem_reference = {}
     for tandem in tandems or ():
@@ -1672,7 +1712,7 @@ def characterise_backbone(raw: np.ndarray, debarcode_unmixed: np.ndarray, design
         return float(np.abs(fit['slope'][:, fit['converged']]).max())
 
     validation = []
-    for set_name, set_idx in (('fit', fit_idx), ('held.out', dc.rescued)):
+    for set_name, set_idx in ((('fit', fit_idx), ('held.out', dc.rescued)) if fit_error else ()):
         for g in range(n_combo):
             idx = set_idx[ids[set_idx] == g + 1]
             if idx.size == 0:
@@ -1708,6 +1748,7 @@ def characterise_backbone(raw: np.ndarray, debarcode_unmixed: np.ndarray, design
                      'af_baseline': float(baseline_fixed[af_col]), 'tag_baseline': tag_baseline,
                      'baseline_events': int(base_pool.size), 'validation': validation, 'rescue': dc.rescue,
                      'rescue_toofew': dc.rescue_toofew, 'tandem': tandem_reference},
+        fret_corrected=bool(fit_error),
     )
     return CharacterisationResult(spectra=fc, ids=ids, confident=confident, rescued=dc.rescued,
                                   fit_idx=fit_idx, fixed=fixed, corrected_raw=corrected['raw'],
@@ -1778,7 +1819,8 @@ def estimate_tandem_shifts(raw: np.ndarray, fc: FlowCodeSpectra, spectra: np.nda
     then ``tandem_statistic`` on the corrected data and ``tandem_shift``
     against the backbone's statistic (``fc.diagnostics['tandem']``).
     Without a backbone statistic for a tag (a characterisation made before
-    its parent was known) nothing is applied.
+    its parent was known) nothing is applied, and a characterisation without
+    FRET correction estimates nothing.
 
     tandems : ``TandemTag`` list to estimate.
     pool    : every ``TandemTag`` the backbone reference was computed with
@@ -1791,7 +1833,7 @@ def estimate_tandem_shifts(raw: np.ndarray, fc: FlowCodeSpectra, spectra: np.nda
     ``tandem_shift`` fields (``beta`` is applied) and ``at_median`` (the
     parent abundance removed at the median tag abundance).
     """
-    if not tandems:
+    if not tandems or not fc.fret_corrected:
         return []
     fluor_names = list(fluor_names)
     design = fc.design
@@ -1826,6 +1868,39 @@ def estimate_tandem_shifts(raw: np.ndarray, fc: FlowCodeSpectra, spectra: np.nda
     return out
 
 
+def staged_corrected_raw(raw: np.ndarray, fc: FlowCodeSpectra, spectra: np.ndarray, fluor_names,
+                         af_only_fn, transform, ref_mask: np.ndarray | None = None,
+                         thresholds: np.ndarray | None = None, rescue: bool = True, flat_threshold: float = 0.9,
+                         gate_frac: float = 0.5, tag_shift_min_n: int = 100, correction: str = 'combo',
+                         regressor: str = 'fixed', tandem_shifts=(),
+                         too_few: TooFewSettings | None = None) -> tuple[dict, np.ndarray]:
+    """
+    The FlowCode-corrected raw fluorescence of one block of events, the
+    input of ``unmix_staged``'s final unmix: debarcode with rescue, subtract
+    the characterised FRET/error model, then the tandem breakdown. Returns
+    the ``_debarcode_and_correct`` record and the corrected raw. Arguments
+    as ``unmix_staged``. A characterisation without FRET correction
+    (``fc.fret_corrected`` False) leaves the raw data unchanged whatever
+    *correction* and *tandem_shifts* say.
+    """
+    if not fc.fret_corrected:
+        correction, tandem_shifts = 'none', ()
+    thr = fc.thresholds if thresholds is None else np.asarray(thresholds, dtype=float)
+    ref_idx = None if ref_mask is None else np.flatnonzero(ref_mask)
+    stage = _debarcode_and_correct(raw, fc, spectra, list(fluor_names), af_only_fn, transform, ref_idx, thr,
+                                   rescue, flat_threshold, gate_frac, tag_shift_min_n, correction, regressor,
+                                   too_few)
+    stage['ref_idx'] = ref_idx
+    stage['correction'] = correction
+    corrected_raw = stage['corrected']['raw']
+    tandem_shifts = [(tandem, float(beta)) for tandem, beta in tandem_shifts]
+    if any(beta for _t, beta in tandem_shifts):
+        corrected_raw = apply_tandem_correction(corrected_raw, stage['tag_abundances'], stage['dc'].ids,
+                                                fc.design, thr, stage['tag_baseline'], tandem_shifts)
+    stage['tandem_shifts'] = tandem_shifts
+    return stage, corrected_raw
+
+
 def unmix_staged(raw: np.ndarray, fc: FlowCodeSpectra, spectra: np.ndarray, fluor_names,
                  af_only_fn, final_fn, transform, ref_mask: np.ndarray | None = None, thresholds: np.ndarray | None = None,
                  rescue: bool = True, flat_threshold: float = 0.9, gate_frac: float = 0.5,
@@ -1858,20 +1933,17 @@ def unmix_staged(raw: np.ndarray, fc: FlowCodeSpectra, spectra: np.ndarray, fluo
     value for that combo's events, else 0), combo codes and diagnostics.
     """
     design = fc.design
-    thr = fc.thresholds if thresholds is None else np.asarray(thresholds, dtype=float)
     fluor_names = list(fluor_names)
     tag_cols = np.array([fluor_names.index(f) for f in design.fluors])
 
-    ref_idx = None if ref_mask is None else np.flatnonzero(ref_mask)
-    stage = _debarcode_and_correct(raw, fc, spectra, fluor_names, af_only_fn, transform, ref_idx, thr, rescue,
-                                   flat_threshold, gate_frac, tag_shift_min_n, correction, regressor, too_few)
+    stage, corrected_raw = staged_corrected_raw(
+        raw, fc, spectra, fluor_names, af_only_fn, transform, ref_mask=ref_mask, thresholds=thresholds,
+        rescue=rescue, flat_threshold=flat_threshold, gate_frac=gate_frac, tag_shift_min_n=tag_shift_min_n,
+        correction=correction, regressor=regressor, tandem_shifts=tandem_shifts, too_few=too_few)
     dc, corrected = stage['dc'], stage['corrected']
     ids = dc.ids
-    corrected_raw = corrected['raw']
-    tandem_shifts = [(tandem, float(beta)) for tandem, beta in tandem_shifts]
-    if any(beta for _t, beta in tandem_shifts):
-        corrected_raw = apply_tandem_correction(corrected_raw, stage['tag_abundances'], ids, design, thr,
-                                                stage['tag_baseline'], tandem_shifts)
+    ref_idx = stage['ref_idx']
+    tandem_shifts = stage['tandem_shifts']
     final = final_fn(corrected_raw)
     unmixed = final['unmixed']
 
@@ -1895,7 +1967,7 @@ def unmix_staged(raw: np.ndarray, fc: FlowCodeSpectra, spectra: np.ndarray, fluo
             'applied_combo': corrected['applied_combo'],
             'pairwise_cells': corrected['pairwise_cells'],
             'gate_events': None if ref_idx is None else int(ref_idx.size),
-            'correction': correction,
+            'correction': stage['correction'],
             'regressor': regressor,
             'tandem': {tandem.fluor: beta for tandem, beta in tandem_shifts},
         },
@@ -1932,18 +2004,27 @@ def gate_records_mask(raw: np.ndarray, pnn, records) -> np.ndarray | None:
 
 def staged_export_fn(fc: FlowCodeSpectra, spectra: np.ndarray, fluor_names, final_fn, gate_records,
                      pnn_raw, settings: dict, cell_weight: bool = False, on_block=None, tandems=(),
-                     tandem_pool=None, on_tandem=None):
+                     tandem_pool=None, on_tandem=None, debarcode_fn=None):
     """
-    Per-chunk unmixing function for Honeychrome's JointUnmixExporter:
-    ``unmix_fn(raw_fl_chunk, raw_chunk, af)`` runs ``unmix_staged`` with the
-    sample's AF library and returns ``unmixed``, ``af_scale``, ``af_idx``
-    and ``extra`` (the FlowCode channel, then one channel per combo).
-    ``unmix_fn.prepare(raw_fl, raw, af)``, the exporter's per-sample step,
-    estimates the sample's tandem breakdown from its gated events
-    (``estimate_tandem_shifts``); the chunks that follow remove it.
+    Per-chunk unmixing function for the FlowCode export
+    (``flowcode_export``): ``unmix_fn(raw_fl_chunk, raw_chunk, af,
+    sample_key=None)`` runs ``unmix_staged`` with the sample's AF library
+    and returns ``unmixed``, ``af_scale``, ``af_idx`` and ``extra`` (the
+    FlowCode channel, the FlowCode ID channel, then one channel per combo).
+    ``unmix_fn.prepare(raw_fl, raw, af, sample_key=None)``, the exporter's
+    per-sample step, estimates the sample's tandem breakdown from its gated
+    events (``estimate_tandem_shifts``); the chunks that follow remove it.
+    ``unmix_fn.corrected_raw(raw_fl, raw, af, sample_key=None, pnn=None)``
+    returns what ``unmix_fn`` hands its final unmix: the FlowCode-corrected
+    raw fluorescence (``staged_corrected_raw``), for consumers that unmix it
+    themselves (Fix My Unmix). ``pnn`` names the columns of ``raw`` when
+    they are not *pnn_raw* (``prepare`` takes it too).
 
-    final_fn     : (corrected raw fluorescence, af) -> dict(unmixed,
-                   af_scale, af_idx); the final unmix.
+    final_fn     : (corrected raw fluorescence, af, sample key) ->
+                   dict(unmixed, af_scale, af_idx); the final unmix.
+    debarcode_fn : (raw fluorescence, af, sample key) -> the same dict; the
+                   debarcoding space. Default: per-cell AF on *spectra*
+                   (``af_only_unmix``).
     gate_records : FlowCode scatter gates in raw units; events inside all of
                    them set the rescue's per-tag shift and the tandem
                    estimate.
@@ -1964,7 +2045,7 @@ def staged_export_fn(fc: FlowCodeSpectra, spectra: np.ndarray, fluor_names, fina
                                   m=float(fc.transform_params.get('m', 4.5)),
                                   a=float(fc.transform_params.get('a', 0.0)))
     records = list(gate_records or [])
-    tandems = list(tandems or [])
+    tandems = list(tandems or []) if fc.fret_corrected else []
     staged = dict(
         rescue=bool(fc.settings.get('rescue_toomany', True)),
         flat_threshold=float(fc.settings.get('rescue_flat_threshold', 0.9)),
@@ -1976,21 +2057,24 @@ def staged_export_fn(fc: FlowCodeSpectra, spectra: np.ndarray, fluor_names, fina
     )
     sample = {'shifts': []}
 
-    def af_only_fn(af):
-        return lambda raw: af_only_unmix(raw, spectra, fluor_names, af.spectra, cell_weight=cell_weight)
+    def af_only_fn(af, sample_key=None):
+        if debarcode_fn is not None:
+            return lambda raw: debarcode_fn(raw, af, sample_key)
+        return lambda raw: af_only_unmix(raw, spectra, fluor_names, af.spectra, cell_weight=cell_weight,
+                                         envelope=getattr(af, 'envelope', None))
 
-    def prepare(raw_fl, raw, af):
+    def prepare(raw_fl, raw, af, sample_key=None, pnn=None):
         sample['shifts'] = []
         if not tandems:
             return
         raw_fl = np.ascontiguousarray(raw_fl, dtype=np.float64)
-        mask = gate_records_mask(raw, pnn_raw, records) if records else None
+        mask = gate_records_mask(raw, pnn_raw if pnn is None else pnn, records) if records else None
         idx = np.flatnonzero(mask) if mask is not None else np.arange(len(raw_fl))
         max_events = int(settings.get('tandem_max_events', 2_000_000))
         if idx.size > max_events:
             idx = np.sort(np.random.default_rng(42).choice(idx, max_events, replace=False))
         estimates = estimate_tandem_shifts(
-            raw_fl[idx], fc, spectra, fluor_names, af_only_fn(af), transform, tandems, pool=tandem_pool,
+            raw_fl[idx], fc, spectra, fluor_names, af_only_fn(af, sample_key), transform, tandems, pool=tandem_pool,
             z_min=float(settings.get('tandem_z_min', 3.0)),
             min_combos=int(settings.get('tandem_min_combos', 5)), **staged,
         )
@@ -1998,21 +2082,30 @@ def staged_export_fn(fc: FlowCodeSpectra, spectra: np.ndarray, fluor_names, fina
         if on_tandem is not None:
             on_tandem([{k: v for k, v in e.items() if k != 'tandem'} for e in estimates])
 
-    def unmix_fn(raw_fl_chunk, raw_chunk, af):
+    def unmix_fn(raw_fl_chunk, raw_chunk, af, sample_key=None):
         raw_fl = np.ascontiguousarray(raw_fl_chunk, dtype=np.float64)
         ref_mask = gate_records_mask(raw_chunk, pnn_raw, records) if records else None
         result = unmix_staged(
             raw_fl, fc, spectra, fluor_names,
-            af_only_fn=af_only_fn(af),
-            final_fn=lambda raw: final_fn(raw, af),
+            af_only_fn=af_only_fn(af, sample_key),
+            final_fn=lambda raw: final_fn(raw, af, sample_key),
             transform=transform, ref_mask=ref_mask, tandem_shifts=sample['shifts'], **staged,
         )
         if on_block is not None:
             on_block(staged_summary(result, fc.design))
         return {'unmixed': result.unmixed, 'af_scale': result.af_scale, 'af_idx': result.af_idx,
-                'extra': np.column_stack([result.flowcode, result.combo_channels])}
+                'extra': np.column_stack([result.flowcode, result.ids.astype(np.float64),
+                                          result.combo_channels])}
+
+    def corrected_raw(raw_fl, raw, af, sample_key=None, pnn=None):
+        raw_fl = np.ascontiguousarray(raw_fl, dtype=np.float64)
+        ref_mask = gate_records_mask(raw, pnn_raw if pnn is None else pnn, records) if records else None
+        _stage, out = staged_corrected_raw(raw_fl, fc, spectra, fluor_names, af_only_fn(af, sample_key), transform,
+                                           ref_mask=ref_mask, tandem_shifts=sample['shifts'], **staged)
+        return out
 
     unmix_fn.prepare = prepare
+    unmix_fn.corrected_raw = corrected_raw
     return unmix_fn
 
 
@@ -2038,11 +2131,13 @@ SUMMARY_COLUMNS = ('Sample', 'Total events', 'Untransduced', 'Unresolved', 'Resc
                    'Rescued (too few)', 'Pairwise corrected')
 
 
-def write_debarcode_summary_csv(path, samples: list, design: FlowCodeDesign):
+def write_debarcode_summary_csv(path, samples: list, design: FlowCodeDesign, warning: str | None = None):
     """One row per sample, (name, ``debarcode_summary`` record) pairs: event
     totals, then one count column per combo, then, for each tandem tag in
     any record's ``tandem`` list, the parent abundance removed per unit of
-    tag, its z and the amount removed at the median tag abundance."""
+    tag, its z and the amount removed at the median tag abundance. A
+    *warning* (samples unmixed without FRET correction) is a last column,
+    repeated on every row."""
     tandem_keys = []
     for _name, s in samples:
         for rec in s.get('tandem') or ():
@@ -2055,7 +2150,8 @@ def write_debarcode_summary_csv(path, samples: list, design: FlowCodeDesign):
                           f'{fluor} -> {parent} at median {tag}']
     with open(path, 'w', newline='', encoding='utf-8') as fh:
         writer = csv.writer(fh)
-        writer.writerow(list(SUMMARY_COLUMNS) + list(design.combo_names) + tandem_header)
+        writer.writerow(list(SUMMARY_COLUMNS) + list(design.combo_names) + tandem_header
+                        + (['Warning'] if warning else []))
         for name, s in samples:
             recs = {(r['fluor'], r['parent'], r['tag']): r for r in s.get('tandem') or ()}
             tandem_cells = []
@@ -2066,7 +2162,7 @@ def write_debarcode_summary_csv(path, samples: list, design: FlowCodeDesign):
             writer.writerow([name, s['total_events'], s['untransduced'], s['unresolved'], s['rescued'],
                              s.get('rescued_toofew', 0), s['pairwise_corrected']]
                             + [s['per_combo'].get(c, 0) for c in design.combo_names]
-                            + tandem_cells)
+                            + tandem_cells + ([warning] if warning else []))
 
 
 def _csv_number(value) -> str:
@@ -2103,6 +2199,7 @@ def rename_combos(fc: FlowCodeSpectra, design: FlowCodeDesign) -> FlowCodeSpectr
         tag_background=fc.tag_background,
         settings=fc.settings,
         diagnostics=fc.diagnostics,
+        fret_corrected=fc.fret_corrected,
     )
 
 
@@ -2137,10 +2234,7 @@ def spillover_matrix(fc: FlowCodeSpectra, space: str = 'unmixed') -> dict:
     tag_cols = fc.tag_columns()
     fitted = [g for g in range(design.n_combos) if fc.combo_error[g] is not None]
     if space == 'unmixed':
-        basis = np.vstack([fc.spectra, fc.af_mean])
-        coef_map = _solve(basis @ basis.T, basis)
-        if coef_map is None:
-            raise ValueError('The fluorophore spectra plus the mean AF spectrum are collinear.')
+        coef_map = _unmixing_map(fc)
         columns = list(fc.fluor_names) + ['AF']
     else:
         columns = list(fc.detectors)
@@ -2168,6 +2262,52 @@ def spillover_matrix(fc: FlowCodeSpectra, space: str = 'unmixed') -> dict:
         'on': on,
         'pairwise_combos': [design.combo_names[g] for g in range(design.n_combos) if fc.combo_error[g] is None],
     }
+
+
+def _unmixing_map(fc: FlowCodeSpectra) -> np.ndarray:
+    """Least-squares unmixing map of the fluorophore spectra plus the mean
+    AF spectrum ((fluorophores + 1) x detectors)."""
+    basis = np.vstack([fc.spectra, fc.af_mean])
+    coef_map = _solve(basis @ basis.T, basis)
+    if coef_map is None:
+        raise ValueError('The fluorophore spectra plus the mean AF spectrum are collinear.')
+    return coef_map
+
+
+def spillover_spread(fc: FlowCodeSpectra, gains: np.ndarray) -> dict:
+    """
+    Spillover spread of each combo's tags into every fluorophore: the
+    standard deviation an unmixed channel f gains from the combo's on-tags k
+    at their median abundances a_k (``combo_raw_median`` above the
+    untransduced baseline),
+
+        sqrt( sum_k a_k sum_d U[f, d]^2 g_d S_k[d] ),
+
+    with U the least-squares unmixing map of the fluorophore spectra plus
+    the mean AF spectrum (as in ``spillover_matrix``), S_k the tag spectra
+    and g the photon gain of each detector (the noise model's variance per
+    unit signal). A combo whose tags spread far into a channel is also the
+    one in which an error in their spectra moves that channel most.
+
+    Returns ``rows`` (combo names), ``columns`` (``fluor_names``) and
+    ``values`` (combos x fluorophores, raw abundance units).
+    """
+    gains = np.asarray(gains, dtype=float)
+    if gains.shape != (len(fc.detectors),):
+        raise ValueError('The detector gains do not match the characterisation\'s detectors.')
+    design = fc.design
+    coef_map = _unmixing_map(fc)[:len(fc.fluor_names)]
+    tag_spectra = fc.spectra[fc.tag_columns()]
+    per_unit = (coef_map[:, None, :] ** 2 * gains[None, None, :] * np.maximum(tag_spectra, 0.0)[None]).sum(axis=2)
+    medians = np.asarray(fc.combo_raw_median, dtype=float)
+    tag_baseline = fc.tag_baseline()
+    values = np.zeros((design.n_combos, len(fc.fluor_names)))
+    for g in range(design.n_combos):
+        tags = design.on_tags(g)
+        a = (np.maximum(np.nan_to_num(medians[g, tags]) - tag_baseline[tags], 0.0) if medians.ndim == 2
+             else np.zeros(len(tags)))
+        values[g] = np.sqrt(np.maximum(per_unit[:, tags] @ a, 0.0))
+    return {'rows': list(design.combo_names), 'columns': list(fc.fluor_names), 'values': values}
 
 
 def expression_event_indices(ids: np.ndarray, design: FlowCodeDesign, max_events: int = 20_000,
@@ -2281,7 +2421,8 @@ def fit_table_rows(fc: FlowCodeSpectra) -> list:
         rows.append({
             'Combo': name,
             'Tags': ' '.join(design.combo_tags[g]),
-            'Error': 'combo' if fc.combo_error[g] is not None else 'pairwise',
+            'Error': ('none' if not fc.fret_corrected else
+                      'combo' if fc.combo_error[g] is not None else 'pairwise'),
             'Confident': int(_list_value(fit.get('n_confident'), g)) if fit else 0,
             'Fit': int(_list_value(fit.get('n_fit'), g)) if fit else 0,
             'Kappa': _list_value(fit.get('kappa'), g),
@@ -2723,7 +2864,8 @@ class DebarcodeSpace:
 def debarcoding_space(backbone_fl: np.ndarray, unstained_fl: np.ndarray, spectra: np.ndarray,
                       fluor_names, tag_fluors, af_spectra: np.ndarray, pos_thresholds=None,
                       cell_weight: bool = False, use_kernel: bool = False,
-                      n_threads: int | None = None) -> DebarcodeSpace:
+                      n_threads: int | None = None, envelope: dict | None = None,
+                      unmix_fn=None, engine: str | None = None) -> DebarcodeSpace:
     """
     Per-cell AF unmixing of the gated backbone and gated matched unstained
     with the matched AF library (unmix.backbone()'s debarcoding unmix), the
@@ -2732,14 +2874,21 @@ def debarcoding_space(backbone_fl: np.ndarray, unstained_fl: np.ndarray, spectra
 
     backbone_fl, unstained_fl : events x detectors, raw.
     spectra                   : fluorophores x detectors, no AF.
+    envelope                  : the AF library's negative envelope, or None
+                                (``af_only_unmix``).
+    unmix_fn                  : raw -> dict(unmixed, af_scale, af_idx), the
+                                debarcoding unmix in place of
+                                ``af_only_unmix``; *engine* names it.
     """
     fluor_names = list(fluor_names)
     tag_cols = [fluor_names.index(f) for f in tag_fluors]
-    bb = af_only_unmix(backbone_fl, spectra, fluor_names, af_spectra, cell_weight=cell_weight,
-                       n_threads=n_threads, use_kernel=use_kernel)
+    if unmix_fn is None:
+        def unmix_fn(raw):
+            return af_only_unmix(raw, spectra, fluor_names, af_spectra, cell_weight=cell_weight,
+                                 n_threads=n_threads, use_kernel=use_kernel, envelope=envelope)
+    bb = unmix_fn(backbone_fl)
     if len(unstained_fl):
-        un = af_only_unmix(unstained_fl, spectra, fluor_names, af_spectra, cell_weight=cell_weight,
-                           n_threads=n_threads, use_kernel=use_kernel)['unmixed']
+        un = unmix_fn(unstained_fl)['unmixed']
         af_mean = af_mean_spectrum(unstained_fl)
     else:
         un = np.zeros((0, len(fluor_names)))
@@ -2748,7 +2897,7 @@ def debarcoding_space(backbone_fl: np.ndarray, unstained_fl: np.ndarray, spectra
     rfloor, source = rescue_floor(pos_thresholds, fluor_names, tag_fluors, un[:, tag_cols])
     return DebarcodeSpace(backbone=bb['unmixed'], af_scale=bb['af_scale'], af_idx=bb['af_idx'],
                           unstained=un, af_mean=af_mean, floor=floor, rescue_floor=rfloor,
-                          rescue_floor_source=source, engine=bb['engine'])
+                          rescue_floor_source=source, engine=engine or bb.get('engine', ''))
 
 
 # ---------------------------------------------------------------------------
@@ -2811,6 +2960,7 @@ def save_flowcode_spectra(fc: FlowCodeSpectra, npz_path) -> dict:
         'settings': fc.settings,
         'diagnostics': diagnostics,
         'fingerprint': fc.fingerprint(),
+        'fret_corrected': bool(fc.fret_corrected),
     })
 
 
@@ -2845,4 +2995,5 @@ def load_flowcode_spectra(meta: dict, npz_path) -> FlowCodeSpectra:
         tag_background=arrays.get('tag_background'),
         settings=dict(meta.get('settings') or {}),
         diagnostics=dict(meta.get('diagnostics') or {}),
+        fret_corrected=bool(meta.get('fret_corrected', True)),
     )
