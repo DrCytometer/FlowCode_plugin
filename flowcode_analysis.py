@@ -36,6 +36,15 @@ inclusion rules and ``qc_table`` summarises each sample. ``count_populations``
 counts several populations in one pass; ``units_table`` assembles them with
 one row per population of each sample (``unit_id``), and the marker sums are
 kept in the experiment's cache (``save_marker_sums``, ``load_marker_sums``).
+
+Several libraries: the files' combinations are tag triplets, the same in
+every file, and the counts are kept per triplet. Each sample's triplets are
+named by its own library (``library_feature_map``, from the current library
+setup) when the tables are made (``library_features``): a guide outside the
+sample's library is NaN, not 0, and events on a triplet the library does
+not use are counted as ``out_of_library``, outside ``barcoded``. Samples
+assigned to Other, or to no library, have no guides and are left out of
+the tables.
 """
 
 from __future__ import annotations
@@ -72,9 +81,10 @@ SOURCES = (SOURCE_LIVE, SOURCE_EXPORTED)
 DEFAULT_MIN_SAMPLE_EVENTS = 20
 DEFAULT_MIN_COMBO_EVENTS = 20
 
-# Pairing and split choices of population comparisons that are not covariates.
+# Pairing and split choices that are not covariates.
 PAIR_BY_SAMPLE = '\x1fsample'
 SPLIT_BY_GROUP = '\x1fgroup'
+SPLIT_BY_LIBRARY = '\x1flibrary'
 
 COUNT_COLUMNS = ('events', 'in_population', 'barcoded', 'untransduced', 'unresolved', 'not_barcoded')
 
@@ -272,7 +282,8 @@ def expected_export_path(folder, sample_key: str, raw_subdir: str, display_name:
 
 
 def link_exports(folder, sample_keys: list, raw_subdir: str, display_names: dict, suffix: str,
-                 combos_keyword: str | None, characterisation: str | None) -> dict:
+                 combos_keyword: str | None, characterisation: str | None,
+                 sample_libraries: dict | None = None) -> dict:
     """
     Match the FCS files in *folder* (searched recursively) to experiment
     samples: first by the ``FLOWCODESOURCE`` keyword the export writes, then
@@ -287,7 +298,10 @@ def link_exports(folder, sample_keys: list, raw_subdir: str, display_names: dict
 
     Files written before the characterisation keyword existed are ``ok`` with
     a note. ``uncorrected`` is True for a file exported without FRET
-    correction (``FLOWCODECORRECTION`` = ``NONE``). Returns
+    correction (``FLOWCODECORRECTION`` = ``NONE``). With several libraries
+    (*sample_libraries*, {sample: library}), a file whose ``FLOWCODELIBRARY``
+    differs from its sample's library gets a note and keeps its status: the
+    counts are named by the current assignment. Returns
     ``{'files': {key: {'path', 'status', 'note', 'uncorrected'}},
     'unlinked': [paths of files that match no sample]}``.
     """
@@ -331,6 +345,9 @@ def link_exports(folder, sample_keys: list, raw_subdir: str, display_names: dict
                 note = 'Exported before characterisation records were kept.'
             elif cid != characterisation:
                 status, note = LINK_OTHER_CHARACTERISATION, 'Exported with an earlier characterisation.'
+        if sample_libraries is not None and kw.get('flowcodelibrary') not in (None, sample_libraries.get(key)):
+            current = sample_libraries.get(key) or 'no library'
+            note = ' '.join(filter(None, [note, f"Exported as {kw['flowcodelibrary']}; counted as {current}."]))
         files[key] = {'path': str(path), 'status': status, 'note': note,
                       'uncorrected': str(kw.get('flowcodecorrection', '')).strip().upper() == NO_CORRECTION_KEYWORD}
     unlinked = [str(p) for p in found if p not in used]
@@ -563,6 +580,72 @@ def units_table(records_by_pop: dict, populations: list, combo_order: list | Non
     return counts, meta
 
 
+# ---------------------------------------------------------------------------
+# Several libraries
+# ---------------------------------------------------------------------------
+
+def library_feature_map(state) -> dict:
+    """
+    {library: {triplet key: feature}} from the current library setup
+    (*state*, a ``FlowCodeState`` with several libraries): every included
+    combination row, named by its triplet, gives each library that uses it
+    that library's guide. With ``merge_same_names`` a guide name used by
+    several libraries is one feature; otherwise each of those libraries'
+    guides is ``<guide> (<library label>)``.
+    """
+    from flowcode_state import library_label, shared_guide_names
+
+    shared = set() if state.merge_same_names else set(shared_guide_names(state.libraries))
+    labels = {str(lib.get('name', '')): library_label(lib) for lib in state.libraries}
+    out = {name: {} for name in labels}
+    for row in state.included_combos():
+        for lib, guide in (row.get('names') or {}).items():
+            if lib in out:
+                out[lib][row['name']] = f'{guide} ({labels[lib]})' if guide in shared else str(guide)
+    return out
+
+
+def library_features(counts: pd.DataFrame, meta: pd.DataFrame, sample_library: dict, feature_map: dict) -> tuple:
+    """
+    Name the triplet counts by each sample's library.
+
+    *counts* is units × triplets and *meta* its ``units_table`` meta;
+    *sample_library* is {sample: library}; *feature_map* is
+    ``library_feature_map``. Returns (counts, meta, left_out): counts is
+    units × features (every library's, library by library), NaN where the
+    feature is not in the unit's library; meta adds 'library' and
+    'out_of_library' (events on triplets the library does not use), and its
+    'barcoded' counts the library's triplets only; left_out is {sample:
+    library or ''} of the samples without a library in *feature_map* (Other,
+    unassigned, or a library since removed), which are left out.
+    """
+    features = list(dict.fromkeys(f for fmap in feature_map.values() for f in fmap.values()))
+    keep, left_out = [], {}
+    for unit in counts.index:
+        sample = meta.loc[unit, 'sample']
+        lib = sample_library.get(sample)
+        if lib in feature_map:
+            keep.append(unit)
+        else:
+            left_out[sample] = lib or ''
+    out = pd.DataFrame(np.nan, index=pd.Index(keep, name=counts.index.name), columns=features)
+    new_meta = meta.loc[keep].copy()
+    new_meta['library'] = ''
+    new_meta['out_of_library'] = 0
+    for unit in keep:
+        lib = sample_library[meta.loc[unit, 'sample']]
+        row = counts.loc[unit]
+        values = {}
+        for triplet, feature in feature_map[lib].items():
+            values[feature] = values.get(feature, 0.0) + (float(row[triplet]) if triplet in row.index else 0.0)
+        out.loc[unit, list(values)] = list(values.values())
+        inside = int(sum(values.values()))
+        new_meta.loc[unit, 'library'] = lib
+        new_meta.loc[unit, 'out_of_library'] = int(row.sum()) - inside
+        new_meta.loc[unit, 'barcoded'] = inside
+    return out, new_meta, left_out
+
+
 def marker_cache_path(experiment_dir) -> Path:
     return Path(experiment_dir) / 'cache' / 'flowcode_analysis' / MARKERS_FILE
 
@@ -709,15 +792,19 @@ def qc_table(counts: pd.DataFrame, meta: pd.DataFrame, display_names: dict | Non
     events and their share of the population, untransduced and unresolved
     events (new exports only), the Gini coefficient of the barcode
     distribution and the most frequent combination with its share.
-    High Gini or a dominant combination points to clonal expansion.
+    High Gini or a dominant combination points to clonal expansion. With
+    several libraries (``library_features``) the library and the events
+    outside it follow, and combinations outside the sample's library (NaN)
+    take no part.
     """
     rows = []
+    several = 'library' in meta.columns
     for key in counts.index:
-        row = counts.loc[key].astype(float)
+        row = counts.loc[key].astype(float).dropna()
         barcoded = float(row.sum())
         top = row.idxmax() if barcoded > 0 else ''
         pop = meta.loc[key, 'in_population']
-        rows.append({
+        out = {
             'sample': key,
             'name': (display_names or {}).get(key, Path(str(key)).stem),
             'events': meta.loc[key, 'events'],
@@ -729,5 +816,8 @@ def qc_table(counts: pd.DataFrame, meta: pd.DataFrame, display_names: dict | Non
             'gini': gini(row.values),
             'top_combination': top,
             'top_share_pct': 100.0 * float(row.max()) / barcoded if barcoded > 0 else float('nan'),
-        })
+        }
+        if several:
+            out.update(library=meta.loc[key, 'library'], out_of_library=meta.loc[key, 'out_of_library'])
+        rows.append(out)
     return pd.DataFrame(rows).set_index('sample')

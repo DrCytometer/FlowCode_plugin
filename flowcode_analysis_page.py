@@ -25,6 +25,16 @@ With several populations each row of the counts is one population of one
 sample (``flowcode_analysis.unit_id``); groups, pairing and covariates stay
 per sample and are carried to each of its populations.
 
+With several libraries (section 2) the counts kept per triplet are named by
+each sample's library from the current setup, NaN where a guide is not in
+the sample's library (``flowcode_analysis.library_features``). Samples
+assigned to Other, and samples that need no library (backbones), are
+unticked by default and have no guides; samples without a library are left
+out of the tables and statistics are refused until they are assigned or
+unticked. Pairing levels are qualified by library, Library is offered
+under Split by, and the statistics work out library sizes, clones and group
+sizes within each library (flowcode_stats.py).
+
 With *Live unmix* the page FlowCode-unmixes each sample's raw file as
 section 5 would export it (flowcode_export.live_sample_events, cached in
 ``cache/flowcode_unmixed``); with *Exported files* it reads the files
@@ -62,7 +72,7 @@ from honeychrome.view_components.help_toggle_widget import WheelBlocker
 import flowcode_analysis as fa
 import flowcode_figure_panel as fcfp
 import flowcode_stats as fst
-from flowcode_state import NO_FRET_WARNING
+from flowcode_state import NO_FRET_WARNING, OTHER_LIBRARY, library_label
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +104,7 @@ MARKER_FIGURES = ('marker_table', 'marker_heatmap', 'marker_volcano', 'marker_co
 
 
 def _figure_set(key: str) -> str:
-    if key in SUMMARY_FIGURES:
+    if key in SUMMARY_FIGURES or str(key).startswith('sample_pca '):
         return 'summary'
     if key in MARKER_FIGURES:
         return 'markers'
@@ -267,6 +277,10 @@ class AnalysisPage(QWidget):
         self._markers_key = ()
         self._markers = None
         self._marker_feature = None
+        self._library_key = None
+        self._left_out = {}
+        self._needing = None
+        self._cov_start = 2
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -316,6 +330,9 @@ class AnalysisPage(QWidget):
         self._markers_key = ()
         self._markers = None
         self._marker_feature = None
+        self._library_key = None
+        self._left_out = {}
+        self._needing = None
         self._clear_figure_tabs()
         self._show_auto_note(None)
 
@@ -446,6 +463,70 @@ class AnalysisPage(QWidget):
             return self.plugin.design()
         except Exception:
             return None
+
+    # -- several libraries --------------------------------------------------------
+
+    def multi_library(self) -> bool:
+        return bool(self.plugin.state.multi_library)
+
+    def library_of(self, sample: str) -> str | None:
+        """The sample's library, Other, or None when it needs one and has
+        none. A sample that needs no library (a backbone) is Other unless
+        assigned. Always None with one library."""
+        if not self.multi_library():
+            return None
+        lib = self.plugin.state.library_of(sample)
+        if lib is None and sample not in self._library_samples():
+            return OTHER_LIBRARY
+        return lib
+
+    def _library_samples(self) -> set:
+        """Samples that need a library (section 2), kept until the next refresh."""
+        if self._needing is None:
+            self._needing = set(self.plugin.library_samples())
+        return self._needing
+
+    def library_labels(self) -> dict:
+        """{library: the name shown in results (its label, else its name)}."""
+        return {str(lib.get('name', '')): library_label(lib) for lib in self.plugin.state.libraries}
+
+    def feature_map(self) -> dict | None:
+        """``flowcode_analysis.library_feature_map`` with several libraries, else None."""
+        return fa.library_feature_map(self.plugin.state) if self.multi_library() else None
+
+    def feature_libraries(self) -> dict:
+        """{feature: [libraries carrying it]}."""
+        out = {}
+        for lib, fmap in (self.feature_map() or {}).items():
+            for feature in fmap.values():
+                owners = out.setdefault(feature, [])
+                if lib not in owners:
+                    owners.append(lib)
+        return out
+
+    def _library_setup_key(self):
+        """What the counts tables depend on in the library setup (None with one library)."""
+        if not self.multi_library():
+            return None
+        return repr((self.feature_map(), sorted(self.plugin.state.sample_libraries.items()),
+                     sorted(self._library_samples())))
+
+    def _default_use(self, key: str, info: dict) -> bool:
+        """A linked sample is used by default when its file is ok and, with
+        several libraries, it is not assigned to Other."""
+        return info['status'] in fa.USABLE_BY_DEFAULT and self.library_of(key) != OTHER_LIBRARY
+
+    def _left_out_note(self) -> str:
+        """The samples left out of the counts for having no library."""
+        other = [self._name(s) for s, lib in self._left_out.items() if lib == OTHER_LIBRARY]
+        none = [self._name(s) for s, lib in self._left_out.items() if lib != OTHER_LIBRARY]
+        parts = []
+        if other:
+            parts.append('Samples assigned to Other have no guides and were left out: ' + ', '.join(other) + '.')
+        if none:
+            parts.append('Samples without a library were left out (assign them in section 2, Tags & Combos): '
+                         + ', '.join(none) + '.')
+        return ' '.join(parts)
 
     def status_summary(self) -> tuple:
         """(kind, text) for the page's status line."""
@@ -708,15 +789,21 @@ class AnalysisPage(QWidget):
         if design is not None:
             import flowcode_core as fcc
             combos_kw = fcc.combos_keyword(design)
-        spectra = self.plugin.saved_spectra()
-        characterisation = spectra.characterisation_id() if spectra is not None else None
-        key = ('exported', str(folder), tuple(keys), combos_kw, characterisation)
+        # The characterisation as an export writes it now: named and ordered
+        # by the current combination table (with several libraries, by triplet).
+        try:
+            characterisation = self.plugin.export_spectra().characterisation_id()
+        except ValueError:
+            characterisation = None
+        libraries = {k: self.library_of(k) for k in keys} if self.multi_library() else None
+        key = ('exported', str(folder), tuple(keys), combos_kw, characterisation,
+               tuple(sorted((libraries or {}).items(), key=lambda kv: kv[0])))
         if key == self._links_key and self.links is not None:
             return
         self._links_key = key
         raw_subdir = c.experiment.settings['raw']['raw_samples_subdirectory']
         self.links = fa.link_exports(folder, keys, raw_subdir, self._display_names(),
-                                     self.plugin.export_name_suffix(), combos_kw, characterisation)
+                                     self.plugin.export_name_suffix(), combos_kw, characterisation, libraries)
 
     def used_files(self) -> dict:
         """{sample: path} of the linked files ticked for use, in experiment order."""
@@ -727,8 +814,7 @@ class AnalysisPage(QWidget):
         for key, info in self.links['files'].items():
             if info['path'] is None:
                 continue
-            default = info['status'] in fa.USABLE_BY_DEFAULT
-            if use.get(key, default):
+            if use.get(key, self._default_use(key, info)):
                 out[key] = info['path']
         return out
 
@@ -867,18 +953,31 @@ class AnalysisPage(QWidget):
         design = self._current_design()
         order = list(design.combo_names) if design is not None else None
         self.counts, self.meta = fa.units_table(records, populations, combo_order=order)
+        self._left_out = {}
+        self._library_key = self._library_setup_key()
+        if self.multi_library():
+            samples = dict.fromkeys(self.meta['sample'])
+            self.counts, self.meta, self._left_out = fa.library_features(
+                self.counts, self.meta, {k: self.library_of(k) for k in samples}, self.feature_map())
+            if self.counts.empty:
+                self.counts = self.meta = self.qc = None
+                self._apply_filters()
+                return
         self.qc = fa.qc_table(self.counts, self.meta, self.unit_labels())
         self._apply_filters()
 
     def _apply_filters(self):
+        left_out = self._left_out_note()
         if self.counts is None:
             self.filtered = None
-            self.filter_note.setText('')
+            self.filter_note.setText(left_out)
             return
         s = self.settings
         self.filtered = fa.filter_counts(self.counts, s.get('exclude_combos') or [],
                                          int(s.get('min_combo_events', fa.DEFAULT_MIN_COMBO_EVENTS)),
                                          int(s.get('min_sample_events', fa.DEFAULT_MIN_SAMPLE_EVENTS)))
+        if left_out:
+            self.filtered.notes.insert(0, left_out)
         self.filter_note.setText(' '.join(self.filtered.notes) or
                                  f'{self.filtered.counts.shape[0]} sample(s) and '
                                  f'{self.filtered.counts.shape[1]} combination(s) analysed.')
@@ -940,6 +1039,8 @@ class AnalysisPage(QWidget):
             names = []
             if self.counts is not None:
                 names = list(self.counts.columns)
+            elif self.multi_library():
+                names = list(dict.fromkeys(f for fmap in self.feature_map().values() for f in fmap.values()))
             else:
                 design = self._current_design()
                 names = list(design.combo_names) if design is not None else []
@@ -967,6 +1068,13 @@ class AnalysisPage(QWidget):
             shown_pop = self.qc_pop_combo.currentData() or (pops[0] if pops else '')
             self.qc_pop_label.setVisible(several)
             self.qc_pop_combo.setVisible(several)
+            multi = self.multi_library()
+            lib_labels = self.library_labels()
+            headers = (['Use', 'Sample'] + (['Library'] if multi else [])
+                       + ['File status', 'Events', 'In population', 'Barcoded', '% barcoded', 'Untransduced',
+                          'Unresolved'] + (['Out of library'] if multi else []) + ['Gini', 'Top combination (%)'])
+            self.sample_table.setColumnCount(len(headers))
+            self.sample_table.setHorizontalHeaderLabels(headers)
             self.sample_table.setRowCount(len(files))
             for r, (key, info) in enumerate(files.items()):
                 chk = _item('', data=key)
@@ -974,26 +1082,29 @@ class AnalysisPage(QWidget):
                 usable = info['path'] is not None and info['status'] != fa.LINK_UNREADABLE
                 if not usable:
                     chk.setFlags(Qt.ItemIsUserCheckable)
-                ticked = usable and use.get(key, info['status'] in fa.USABLE_BY_DEFAULT)
+                ticked = usable and use.get(key, self._default_use(key, info))
                 chk.setCheckState(Qt.Checked if ticked else Qt.Unchecked)
                 self.sample_table.setItem(r, 0, chk)
                 name = _item(self._name(key))
                 name.setToolTip(info['path'] or key)
                 self.sample_table.setItem(r, 1, name)
+                lib = self.library_of(key)
                 status = _item(info['status'] + (f" — {info['note']}" if info['note'] else ''))
-                self.sample_table.setItem(r, 2, status)
                 unit = fa.unit_id(key, shown_pop, several)
                 qc = self.qc.loc[unit] if self.qc is not None and unit in self.qc.index else None
-                cells = ['', '', '', '', '', '', '', '']
+                cells = [''] * (9 if multi else 8)
                 if qc is not None:
                     top = (f"{qc['top_combination']} ({_number(qc['top_share_pct'])})"
                            if qc['top_combination'] else '')
-                    cells = [_number(qc['events'], 0), _number(qc['in_population'], 0),
-                             _number(qc['barcoded'], 0), _number(qc['pct_barcoded']),
-                             _number(qc['untransduced'], 0), _number(qc['unresolved'], 0),
-                             _number(qc['gini'], 2), top]
-                for j, text in enumerate(cells, start=3):
-                    self.sample_table.setItem(r, j, _item(text))
+                    cells = ([_number(qc['events'], 0), _number(qc['in_population'], 0),
+                              _number(qc['barcoded'], 0), _number(qc['pct_barcoded']),
+                              _number(qc['untransduced'], 0), _number(qc['unresolved'], 0)]
+                             + ([_number(qc['out_of_library'], 0)] if multi else [])
+                             + [_number(qc['gini'], 2), top])
+                row = ([_item(lib_labels.get(lib, lib) if lib else '—')] if multi else []) + [status]
+                row += [_item(text) for text in cells]
+                for j, item in enumerate(row, start=2):
+                    self.sample_table.setItem(r, j, item)
             # Sized once after filling; the sample name is capped (and elided
             # in the middle) so the QC columns stay in view.
             self.sample_table.resizeColumnsToContents()
@@ -1166,14 +1277,18 @@ class AnalysisPage(QWidget):
         names = s.get('group_names') or []
         icons = {g: _swatch_icon(c) for g, c in self.group_colours().items()}
         table = self.samples_table
+        multi = self.multi_library()
+        fixed = ['Sample', 'Group'] + (['Library (section 2)'] if multi else [])
+        self._cov_start = len(fixed)
+        lib_labels = self.library_labels()
         self._filling = True
         table.setUpdatesEnabled(False)
         try:
             header = table.horizontalHeader()
             header.setSectionResizeMode(QHeaderView.Interactive)
             header.setStretchLastSection(False)
-            table.setColumnCount(2 + len(covs))
-            table.setHorizontalHeaderLabels(['Sample', 'Group'] + covs)
+            table.setColumnCount(len(fixed) + len(covs))
+            table.setHorizontalHeaderLabels(fixed + covs)
             table.setRowCount(len(keys))
             for r, key in enumerate(keys):
                 item = _item(self._name(key), data=key)
@@ -1187,7 +1302,12 @@ class AnalysisPage(QWidget):
                 combo.currentIndexChanged.connect(lambda _i, k=key, c=combo: self._set_group(k, c.currentData()))
                 _no_wheel(combo)
                 table.setCellWidget(r, 1, combo)
-                for j, cov in enumerate(covs, start=2):
+                if multi:
+                    lib = self.library_of(key)
+                    item = _item(lib_labels.get(lib, lib) if lib else '—', data=key)
+                    item.setToolTip('Assigned in section 2 (Tags & Combos).')
+                    table.setItem(r, 2, item)
+                for j, cov in enumerate(covs, start=self._cov_start):
                     table.setItem(r, j, _item((s['covariates'].get(cov) or {}).get(key, ''),
                                               editable=True, data=key))
             # Widths from font metrics: the sample column is capped (names are
@@ -1197,7 +1317,9 @@ class AnalysisPage(QWidget):
             table.setColumnWidth(0, max(120, min(longest + 24, SAMPLE_COLUMN_MAX_WIDTH)))
             group_w = max([fm.horizontalAdvance(g) for g in names] + [fm.horizontalAdvance('Group')]) + 64
             table.setColumnWidth(1, max(group_w, 110))
-            for j, cov in enumerate(covs, start=2):
+            if multi:
+                table.setColumnWidth(2, max(fm.horizontalAdvance(fixed[2]) + 32, COVARIATE_COLUMN_MIN_WIDTH))
+            for j, cov in enumerate(covs, start=self._cov_start):
                 values = (s['covariates'].get(cov) or {}).values()
                 widest = max([fm.horizontalAdvance(str(v)) for v in values] + [0]) + 24
                 table.setColumnWidth(j, max(COVARIATE_COLUMN_MIN_WIDTH, fm.horizontalAdvance(cov) + 32,
@@ -1235,7 +1357,7 @@ class AnalysisPage(QWidget):
         self._fill_stats_choices()
 
     def _on_group_cell_changed(self, item):
-        if self._filling or item.column() < 2:
+        if self._filling or item.column() < self._cov_start:
             return
         cov = self.samples_table.horizontalHeaderItem(item.column()).text()
         key = item.data(Qt.UserRole)
@@ -1402,6 +1524,9 @@ class AnalysisPage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, 'Import table', f'Could not read the table: {exc}')
             return
+        if self.multi_library():
+            # The libraries are assigned in section 2; an exported table's column is not a covariate.
+            table['covariates'].pop('library', None)
         s = self.settings
         for g in dict.fromkeys(table['groups'].values()):
             if g not in s['group_names']:
@@ -1424,12 +1549,16 @@ class AnalysisPage(QWidget):
             self.sample_table_frame().to_csv(path)
 
     def sample_table_frame(self) -> pd.DataFrame:
-        """One row per sample: name, group, then each covariate."""
+        """One row per sample: name, group, the library (with several
+        libraries), then each covariate."""
         s = self.settings
         keys = self.group_samples()
         df = pd.DataFrame(index=pd.Index(keys, name='sample'))
         df['name'] = [self._name(k) for k in keys]
         df['group'] = [(s.get('sample_groups') or {}).get(k, '') for k in keys]
+        if self.multi_library():
+            labels = self.library_labels()
+            df['library'] = [labels.get(self.library_of(k), self.library_of(k) or '') for k in keys]
         for cov, values in (s.get('covariates') or {}).items():
             df[cov] = [values.get(k, '') for k in keys]
         return df
@@ -1806,6 +1935,8 @@ class AnalysisPage(QWidget):
             if compare == 'populations':
                 extra = {'pairing': [('Sample (its populations)', fa.PAIR_BY_SAMPLE)],
                          'split_by': [('Sample group', fa.SPLIT_BY_GROUP)]}
+            if self.multi_library():
+                extra['split_by'].append(('Library (section 2)', fa.SPLIT_BY_LIBRARY))
             for combo, key, none_text in ((self.cb_pairing, 'pairing', 'Not paired'),
                                           (self.cb_split, 'split_by', 'Not split')):
                 combo.clear()
@@ -1970,7 +2101,11 @@ class AnalysisPage(QWidget):
     def _update_run_button(self):
         s = self.settings
         problem = None
-        if self.filtered is None or self.filtered.counts.empty:
+        unassigned = sum(lib != OTHER_LIBRARY for lib in self._left_out.values())
+        if unassigned:
+            problem = (f'{unassigned} counted sample(s) have no library: assign them in section 2 (Tags & Combos), '
+                       'or untick them (Data).')
+        elif self.filtered is None or self.filtered.counts.empty:
             problem = 'Count events first (Data).'
         elif not (s['run_counts'] or s['run_freq'] or s['run_markers']):
             problem = 'Tick at least one test.'
@@ -1998,9 +2133,12 @@ class AnalysisPage(QWidget):
         units = list(self.filtered.counts.index)
         return pd.DataFrame({n: [covs[n].get(self.unit_sample(u), '') for u in units] for n in names}, index=units)
 
-    def _unit_factor(self, key: str) -> dict | None:
+    def _unit_factor(self, key: str, pairing: bool = False) -> dict | None:
         """{counts row: value} of a pairing or split choice: a covariate (the
-        row's sample's value), the sample itself, or the sample's group."""
+        row's sample's value), the sample itself, the sample's group or its
+        library. With several libraries a covariate used for *pairing* is
+        qualified by library (``<library>·<mouse>``), so that mice of
+        different libraries never share a level."""
         if not key:
             return None
         units = list(self.filtered.counts.index)
@@ -2009,8 +2147,16 @@ class AnalysisPage(QWidget):
         if key == fa.SPLIT_BY_GROUP:
             groups = self.settings.get('sample_groups') or {}
             return {u: groups.get(self.unit_sample(u), '') for u in units}
+        if key == fa.SPLIT_BY_LIBRARY:
+            if not self.multi_library():
+                return None
+            labels = self.library_labels()
+            return {u: labels.get(self.library_of(self.unit_sample(u)), '') for u in units}
         values = (self.settings.get('covariates') or {}).get(key) or {}
-        return {u: values.get(self.unit_sample(u), '') for u in units}
+        out = {u: values.get(self.unit_sample(u), '') for u in units}
+        if pairing and self.multi_library():
+            out = {u: f'{self.library_of(self.unit_sample(u))}·{v}' if v else '' for u, v in out.items()}
+        return out
 
     def start_stats(self):
         if self.filtered is None:
@@ -2022,8 +2168,14 @@ class AnalysisPage(QWidget):
         population = {u: self.unit_population(u) for u in units}
         sample_groups = {u: (s.get('sample_groups') or {}).get(self.unit_sample(u), '') for u in units}
         pair_key, split_key = s.get(self._design_key('pairing')), s.get(self._design_key('split_by'))
-        pairing, split = self._unit_factor(pair_key), self._unit_factor(split_key)
+        pairing, split = self._unit_factor(pair_key, pairing=True), self._unit_factor(split_key)
         adjust = [c for c in s.get('adjust') or [] if c not in (pair_key, split_key)]
+        unit_library = {u: self.library_of(self.unit_sample(u)) for u in units} if self.multi_library() else None
+        if unit_library is not None:
+            design_libraries = dict(libraries=unit_library, feature_libraries=self.feature_libraries(),
+                                    library_labels=self.library_labels())
+        else:
+            design_libraries = {}
         if self.compare_mode() == 'populations':
             groups, order, reference = dict(population), pops, s.get('reference_population') or ''
             design = dict(strata=population, within_strata=False, clone_groups=sample_groups, clone_reference=None)
@@ -2058,7 +2210,7 @@ class AnalysisPage(QWidget):
                                      'min_pct': float(s['clone_min_pct']),
                                      'max_levels': int(s['clone_max_levels'])}
                                     if s['remove_clones'] else None),
-                      allow_no_comparisons=bool(s['run_markers']), **design)
+                      allow_no_comparisons=bool(s['run_markers']), **design, **design_libraries)
         marker_job = None
         if s['run_markers']:
             marker_split = split if split_key not in ('', None, fa.SPLIT_BY_GROUP) else None
@@ -2072,7 +2224,8 @@ class AnalysisPage(QWidget):
                               min_events=int(s['marker_min_events']), groups=sample_groups,
                               group_order=list(s.get('group_names') or []),
                               strata=population if several else None, split_by=marker_split,
-                              threshold=float(s['marker_threshold']), clones=bool(s['remove_clones']))
+                              threshold=float(s['marker_threshold']), clones=bool(s['remove_clones']),
+                              unit_library=unit_library, feature_map=self.feature_map())
 
         def work(_progress):
             if markers_only:
@@ -2131,13 +2284,24 @@ class AnalysisPage(QWidget):
         if data is None or not job['channels']:
             stats['notes'].append('Markers: no marker intensities with these counts; count again.')
             return None
-        sums = fa.marker_sums_for(data, list(counts.index), list(counts.columns), job['channels'])
-        deltas, meta, used, means, reference_means = fst.marker_deltas(
-            sums, counts, job['channels'], job['reference'], job['controls'], job['min_events'],
-            removed=stats['removed'] if job['clones'] else None, return_means=True, tag_matrix=job['tag_matrix'])
-        spillover = None
-        if job['spread'] is not None:
-            spillover = fst.marker_spillover(job['spread'], sums, counts, job['channels'], job['transforms'])
+        removed = stats['removed'] if job['clones'] else None
+        if job.get('feature_map') is not None:
+            try:
+                deltas, meta, used, means, reference_means, spillover = fst.marker_deltas_by_library(
+                    data, counts, job['channels'], job['unit_library'], job['feature_map'], job['reference'],
+                    job['controls'], job['min_events'], removed=removed, tag_matrix=job['tag_matrix'],
+                    spread=job['spread'], transforms=job['transforms'])
+            except RuntimeError as exc:
+                stats['notes'].append(f'Markers: {exc}')
+                return None
+        else:
+            sums = fa.marker_sums_for(data, list(counts.index), list(counts.columns), job['channels'])
+            deltas, meta, used, means, reference_means = fst.marker_deltas(
+                sums, counts, job['channels'], job['reference'], job['controls'], job['min_events'],
+                removed=removed, return_means=True, tag_matrix=job['tag_matrix'])
+            spillover = None
+            if job['spread'] is not None:
+                spillover = fst.marker_spillover(job['spread'], sums, counts, job['channels'], job['transforms'])
         if job['spill_note']:
             stats['notes'].append(f"Markers: {job['spill_note']}")
         try:
@@ -2382,7 +2546,7 @@ class AnalysisPage(QWidget):
         marker_label = self.cb_marker_comparison.currentText()
         marker_ref = fst.MARKER_REFERENCES.get((stats.get('markers') or {}).get('reference'), '')
         marker_feature = self._shown_marker_feature()
-        marker_pairing = self._unit_factor(s.get('pairing')) if marker_feature else None
+        marker_pairing = self._unit_factor(s.get('pairing'), pairing=True) if marker_feature else None
 
         def work(_progress):
             out = {}
@@ -2564,7 +2728,7 @@ class AnalysisPage(QWidget):
         markers, s = self.stats['markers'], self.settings
         comparison = self.cb_marker_comparison.currentText()
         reference = fst.MARKER_REFERENCES.get(markers.get('reference'), '')
-        pairing = self._unit_factor(s.get('pairing'))
+        pairing = self._unit_factor(s.get('pairing'), pairing=True)
         colours, order = self.group_colours(), list(s.get('group_names') or [])
         population, labels, is_dark = self.counted_population(), self.unit_labels(), self.plugin.is_dark()
         fdr_scope = s['fdr_scope']
@@ -2746,7 +2910,19 @@ class AnalysisPage(QWidget):
                 lines.append(f"  {self._name(key)}{f' [{pop}]' if several else ''}: {Path(path).name}; "
                              + ('; '.join(_number(qc[c], 0) for c in ('events', 'in_population', 'barcoded'))
                                 if qc is not None else 'not counted')
-                             + f"; {(s.get('sample_groups') or {}).get(key, '')}")
+                             + f"; {(s.get('sample_groups') or {}).get(key, '')}"
+                             + (f"; {self.library_of(key) or 'no library'}" if self.multi_library() else ''))
+        if self.multi_library():
+            state = self.plugin.state
+            lines += ['', 'Libraries (section 2; each sample\'s combinations named by its library):']
+            for lib in state.libraries:
+                name = str(lib.get('name', ''))
+                n = sum(1 for key in files if self.library_of(key) == name)
+                label = f" ({lib['label']})" if lib.get('label') else ''
+                lines.append(f"  {name}{label}: {len(lib.get('combos') or [])} guides, combinations file "
+                             f"{lib.get('csv_path') or '-'}; {n} sample(s) used")
+            lines.append('  Guides with the same name in several libraries: '
+                         + ('merged' if state.merge_same_names else 'kept apart, named with their library'))
         lines += ['', 'Statistics:']
         tests = [n for k, n in (
             ('run_counts', f"Counts (NB GLM, {fst.COUNT_TEST_NAMES[s['counts_method']]})"),
@@ -2754,7 +2930,7 @@ class AnalysisPage(QWidget):
             ('run_markers', 'Markers (moderated t of combination minus reference, cluster-first FDR)')) if s[k]]
         pair_key, split_key = s.get(self._design_key('pairing')), s.get(self._design_key('split_by'))
         adjust = [c for c in s.get('adjust') or [] if c not in (pair_key, split_key)]
-        factor_name = {fa.PAIR_BY_SAMPLE: 'sample', fa.SPLIT_BY_GROUP: 'sample group'}
+        factor_name = {fa.PAIR_BY_SAMPLE: 'sample', fa.SPLIT_BY_GROUP: 'sample group', fa.SPLIT_BY_LIBRARY: 'library'}
         if self.compare_mode() == 'populations':
             compare = (f"populations (within each sample); reference population: "
                        f"{s.get('reference_population') or '-'}")
@@ -2847,7 +3023,12 @@ class AnalysisPage(QWidget):
                                                               population, labels, group_colours=colours)
                 return drawn[which].get(key, {}).get('fig')
 
-            for key, name in (('comparison_heatmap', 'Comparison heatmap'), ('sample_pca', 'Sample PCA')):
+            unit_library = stats.get('libraries')
+            lib_labels = stats.get('library_labels') or {}
+            pca_figures = ([(f'sample_pca {lib}', f'Sample PCA ({lib_labels.get(lib, lib)})')
+                            for lib in dict.fromkeys(unit_library.values())] if unit_library
+                           else [('sample_pca', 'Sample PCA')])
+            for key, name in [('comparison_heatmap', 'Comparison heatmap')] + pca_figures:
                 figures.append((name, lambda key=key: figure_of('summary', key)))
             for pair in stats['pairs']:
                 label = fst.comparison_label(*pair)
@@ -2909,14 +3090,21 @@ class AnalysisPage(QWidget):
     def refresh(self):
         """Bring the page up to date with the experiment (cheap: reads file
         headers only when the folder, samples or combinations changed)."""
+        self._needing = None
         try:
             self._scan_links()
         except Exception as exc:
             logger.exception('FlowCode analysis: linking failed')
             self.links = {'files': {}, 'unlinked': []}
             self.link_note.setText(f'Could not read the export folder: {exc}')
-        if self.counts is None and (self.settings.get('counts') or {}).get('records'):
-            self._load_counts()
+        if (self.settings.get('counts') or {}).get('records'):
+            if self.counts is None and not self._left_out and self._library_key == self._library_setup_key():
+                self._load_counts()
+            elif self._library_key != self._library_setup_key():
+                # Library assignments, guide names or the merge toggle changed:
+                # name the saved counts again.
+                self._load_counts()
+                self._invalidate_stats()
         self._fill_gate_tree()
         self._fill_data()
         self._check_counts_current()

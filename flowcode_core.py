@@ -2135,8 +2135,10 @@ def write_debarcode_summary_csv(path, samples: list, design: FlowCodeDesign, war
     """One row per sample, (name, ``debarcode_summary`` record) pairs: event
     totals, then one count column per combo, then, for each tandem tag in
     any record's ``tandem`` list, the parent abundance removed per unit of
-    tag, its z and the amount removed at the median tag abundance. A
-    *warning* (samples unmixed without FRET correction) is a last column,
+    tag, its z and the amount removed at the median tag abundance. With
+    several libraries (records with 'library'), the sample's library and
+    its events on combinations the library does not use follow the totals.
+    A *warning* (samples unmixed without FRET correction) is a last column,
     repeated on every row."""
     tandem_keys = []
     for _name, s in samples:
@@ -2148,10 +2150,11 @@ def write_debarcode_summary_csv(path, samples: list, design: FlowCodeDesign, war
     for fluor, parent, tag in tandem_keys:
         tandem_header += [f'{fluor} -> {parent} per unit', f'{fluor} -> {parent} z',
                           f'{fluor} -> {parent} at median {tag}']
+    libraries = any('library' in s for _name, s in samples)
     with open(path, 'w', newline='', encoding='utf-8') as fh:
         writer = csv.writer(fh)
-        writer.writerow(list(SUMMARY_COLUMNS) + list(design.combo_names) + tandem_header
-                        + (['Warning'] if warning else []))
+        writer.writerow(list(SUMMARY_COLUMNS) + (['Library', 'Out of library'] if libraries else [])
+                        + list(design.combo_names) + tandem_header + (['Warning'] if warning else []))
         for name, s in samples:
             recs = {(r['fluor'], r['parent'], r['tag']): r for r in s.get('tandem') or ()}
             tandem_cells = []
@@ -2159,8 +2162,10 @@ def write_debarcode_summary_csv(path, samples: list, design: FlowCodeDesign, war
                 rec = recs.get(key)
                 tandem_cells += ['', '', ''] if rec is None else [_csv_number(rec['beta']), _csv_number(rec['z']),
                                                                  _csv_number(rec['at_median'])]
+            library_cells = ([s.get('library') or '', '' if s.get('out_of_library') is None else s['out_of_library']]
+                             if libraries else [])
             writer.writerow([name, s['total_events'], s['untransduced'], s['unresolved'], s['rescued'],
-                             s.get('rescued_toofew', 0), s['pairwise_corrected']]
+                             s.get('rescued_toofew', 0), s['pairwise_corrected']] + library_cells
                             + [s['per_combo'].get(c, 0) for c in design.combo_names]
                             + tandem_cells + ([warning] if warning else []))
 

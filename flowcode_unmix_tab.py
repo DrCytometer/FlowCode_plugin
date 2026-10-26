@@ -5153,6 +5153,89 @@ class PluginWidget(QWidget):
             return 'Select at least one sample.'
         return None
 
+    def export_library_gaps(self, sample_keys) -> list:
+        """Samples of *sample_keys* that need a library and have none
+        (several libraries only)."""
+        state = self.state
+        if not state.multi_library:
+            return []
+        needing = set(self.library_samples())
+        return [key for key in sample_keys if key in needing and state.library_of(key) is None]
+
+    def confirm_export_libraries(self, sample_keys) -> bool:
+        """With several libraries, stop an export of samples without a
+        library: the user can go to section 2 to assign them, assign them
+        to Other and export, or cancel. True when the export can go on."""
+        gaps = self.export_library_gaps(sample_keys)
+        if not gaps:
+            return True
+        names = [_sample_name(self.controller, key) for key in gaps]
+        shown = ', '.join(names[:10]) + (f' and {len(names) - 10} more' if len(names) > 10 else '')
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle('Samples without a library')
+        box.setText(f'{len(gaps)} sample(s) have no library: {shown}.')
+        box.setInformativeText('Assign them in section 2 (Tags & Combos) before exporting. Samples that are not '
+                               'part of a library (e.g. FMOs) can be assigned as Other: they are exported with '
+                               'triplet names only and left out of the Analysis by default.')
+        go = box.addButton('Go to section 2', QMessageBox.ActionRole)
+        other = box.addButton('Assign as Other and export', QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(go)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is other:
+            for key in gaps:
+                self.state.sample_libraries[key] = fcs.OTHER_LIBRARY
+            self.state_changed()
+            return True
+        if clicked is go:
+            self.tabs.setCurrentIndex(list(self.pages).index(2))
+        return False
+
+    def export_library_combos(self, sample_keys) -> dict | None:
+        """{sample: (library, names of the combinations its library uses)}
+        for *sample_keys* with several libraries (Other uses none), else
+        None."""
+        state = self.state
+        if not state.multi_library:
+            return None
+        rows = state.included_combos()
+        out = {}
+        for key in sample_keys:
+            lib = state.library_of(key) or fcs.OTHER_LIBRARY
+            out[key] = (lib, {row['name'] for row in rows if lib in (row.get('names') or {})})
+        return out
+
+    def export_library_keywords(self, design, pnn: list, sample_keys) -> dict | None:
+        """
+        {sample: keywords} of an export with several libraries (None
+        otherwise): each FlowCode combination channel's ``$PnS`` is the
+        guide of the sample's library (the triplet for Other or a triplet
+        the library does not use), ``FLOWCODELIBRARY`` and
+        ``FLOWCODELIBRARYLABEL`` name the library, and ``FLOWCODEGUIDES``
+        lists ``FC <triplet>=<guide>`` for its guides (not written for
+        Other, which has none).
+        """
+        state = self.state
+        if not state.multi_library:
+            return None
+        names = {row['name']: row.get('names') or {} for row in state.included_combos()}
+        labels = {str(lib.get('name', '')): fcs.library_label(lib) for lib in state.libraries}
+        position = {name: pnn.index(fcc.combo_channel_name(name)) + 1 for name in design.combo_names}
+        out = {}
+        for key in sample_keys:
+            lib = state.library_of(key) or fcs.OTHER_LIBRARY
+            guides = {name: (names.get(name) or {}).get(lib) for name in design.combo_names}
+            keywords = {f'$P{i}S': guides[name] or name for name, i in position.items()}
+            keywords['FLOWCODELIBRARY'] = lib
+            keywords['FLOWCODELIBRARYLABEL'] = labels.get(lib, lib)
+            listed = ';'.join(f'{fcc.combo_channel_name(name)}={guide}' for name, guide in guides.items() if guide)
+            if listed:
+                keywords['FLOWCODEGUIDES'] = listed
+            out[key] = keywords
+        return out
+
     def export_running(self) -> bool:
         return self._export_run is not None
 
@@ -5195,10 +5278,14 @@ class PluginWidget(QWidget):
                 f'Unmix and export {len(sample_keys)} sample(s) without FRET correction?'):
             page.set_run_status('Export cancelled.')
             return
+        if not self.confirm_export_libraries(sample_keys):
+            page.set_run_status('Export cancelled: assign a library to every sample first.')
+            return
         self._sync_unmixing_inputs()
         design = fc.design
         job = {'design': design, 'folder': self.export_folder(), 'current': None, 'samples': [],
                'inputs': state.section_inputs(5, self.fingerprint()), 'fc': fc, 'tandems': [], 'tandem': None}
+        in_library = self.export_library_combos(sample_keys)
 
         def on_block(summary):
             job['current'] = fcc.add_summaries(job['current'], summary)
@@ -5211,6 +5298,11 @@ class PluginWidget(QWidget):
             summary = job['current'] or empty
             if job['tandems']:
                 summary = dict(summary, tandem=job['tandem'] or [])
+            if in_library is not None:
+                lib, own = in_library[sample_key]
+                outside = (sum(n for c, n in summary['per_combo'].items() if c not in own)
+                           if lib != fcs.OTHER_LIBRARY else None)
+                summary = dict(summary, library=lib, out_of_library=outside)
             job['samples'].append((sample_key, summary))
             job['current'] = None
             job['tandem'] = None
@@ -5223,12 +5315,20 @@ class PluginWidget(QWidget):
         job.update(plan=plan, tandems=tandems,
                    af_profiles={key: list(af.profile_names) for key, af in af_by_sample.items() if af is not None},
                    methods={key: plan.sample_label(af, key) for key, af in af_by_sample.items() if af is not None})
+        library_keywords = self.export_library_keywords(design, fce.export_pnn(layout, extra_channels), sample_keys)
+
+        def sample_keywords(key):
+            out = {'FLOWCODESOURCE': str(key)}
+            if library_keywords is not None:
+                out.update(library_keywords[key])
+            return out
+
         exporter = fce.FlowCodeExporter(
             sample_keys, layout, unmix_fn, af_by_sample, bus=self.bus, extra_channels=extra_channels,
             output_root=job['folder'], name_suffix=EXPORT_NAME_SUFFIX,
             method_label=lambda key, af: f'FlowCode; {plan.sample_label(af, key)}',
             spectra_for=plan.spectra_for, extra_keywords=keywords, sample_done=sample_done,
-            sample_keywords=lambda key: {'FLOWCODESOURCE': str(key)},
+            sample_keywords=sample_keywords,
         )
 
         def probe(raw_fl, af, key):
@@ -5305,6 +5405,8 @@ class PluginWidget(QWidget):
             with open(folder / RUN_FILE, 'w', encoding='utf-8') as fh:
                 json.dump(self._run_record(job), fh, indent=2,
                           default=lambda v: v.item() if hasattr(v, 'item') else str(v))
+            if state.multi_library:
+                self._write_library_combinations()
         except OSError as exc:
             page.set_run_status(f'Exported, but the summary files could not be written: {exc}')
             return
@@ -5357,8 +5459,27 @@ class PluginWidget(QWidget):
                                            .get(t.fluor, {}).items() if k not in ('combo_beta', 'combo_null')}}
                             for t in job['tandems']],
             'af_profiles': job.get('af_profiles') or {},
+            **({'libraries': [{k: lib.get(k) for k in ('name', 'label', 'csv_path', 'combos')}
+                              for lib in state.libraries],
+                'sample_libraries': {key: state.library_of(key) for key, _s in job['samples']},
+                'merge_same_names': bool(state.merge_same_names)} if state.multi_library else {}),
             'samples': [{'sample': key, **summary} for key, summary in job['samples']],
         }
+
+    def _write_library_combinations(self):
+        """``FlowCode/combinations <library>.csv`` per library, in the
+        FlowCodeUnmix format with the channels' tag names: the guides of the
+        included combinations that library uses."""
+        out_dir = Path(self.controller.experiment_dir) / OUTPUT_SUBDIR
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rows = self.state.included_combos()
+        for lib in self.state.libraries:
+            name = str(lib.get('name', ''))
+            used = [row for row in rows if name in (row.get('names') or {})]
+            safe = ''.join('_' if ch in '\\/:*?"<>|' else ch for ch in name)
+            fcc.write_combinations_csv(out_dir / f'combinations {safe}.csv',
+                                       SimpleNamespace(combo_names=[row['names'][name] for row in used],
+                                                       combo_tags=[tuple(row['tags']) for row in used]))
 
     def _on_export_error(self, message: str):
         self.pages[5].set_run_status(f'Error: {message}')

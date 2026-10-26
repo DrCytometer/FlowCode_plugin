@@ -49,6 +49,16 @@ Markers: each combination's mean marker intensity minus its reference
 cells' in the same sample, tested against zero within each group with a
 moderated t and cluster-first FDR over combinations (``marker_deltas``,
 ``marker_statistics``).
+
+Several libraries: each sample carries only its own library's guides (NaN
+elsewhere), and every guide is fitted on the samples that carry it, in one
+fit per comparison with priors shared by every library's guides; the FDR
+covers them together. Library sizes and expanded clones are worked out
+within each library (and population). A library's guides are left out of a
+group where the library has fewer than ``MIN_SAMPLES_PER_GROUP`` samples
+(a guide shared by several libraries counts the samples of all of them).
+Library is never an adjustment covariate: it is confounded with the mice.
+Split by library to compare within each library on its own.
 """
 
 from __future__ import annotations
@@ -185,7 +195,9 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
                    control_combos: list | None = None, clone_filter: dict | None = None,
                    strata: dict | None = None, within_strata: bool = True,
                    clone_groups: dict | None = None, clone_reference: str | None = None,
-                   population_contrasts: str | None = None, allow_no_comparisons: bool = False) -> dict:
+                   population_contrasts: str | None = None, allow_no_comparisons: bool = False,
+                   libraries: dict | None = None, feature_libraries: dict | None = None,
+                   library_labels: dict | None = None) -> dict:
     """
     Test every combination between sample groups.
 
@@ -219,14 +231,22 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
                   the reference population; see ``_population_contrasts``.
     allow_no_comparisons : return the prepared counts when no comparison
                   can be made (for the marker test alone) instead of raising.
+    libraries   : several libraries: {sample: library}. Counts are NaN
+                  outside a sample's library; library sizes and clones are
+                  worked out within each library.
+    feature_libraries : {feature: [libraries carrying it]}, for leaving a
+                  library's guides out of a group where it has fewer than
+                  MIN_SAMPLES_PER_GROUP samples.
+    library_labels : {library: name shown in the notes}.
 
     Returns {'samples', 'group_vec', 'split', 'pairing', 'comparisons'
     (labels), 'pairs' ([(base, other, level)]), 'counts', 'counts_values',
     'freq', 'freq_values', 'log2_values', 'removed', 'denominator',
-    'library_sizes', 'clones', 'strata', 'interaction', 'notes'}; a result
-    is None when not requested. 'removed' marks the counts left out as
-    expanded clones; 'interaction' describes the population contrasts
-    ({label: {'units', 'cell', 'line', 'population'}}).
+    'library_sizes', 'clones', 'strata', 'interaction', 'libraries',
+    'feature_libraries', 'library_labels', 'notes'}; a result is None when
+    not requested. 'removed' marks the counts left out as expanded clones;
+    'interaction' describes the population contrasts ({label: {'units',
+    'cell', 'line', 'population'}}).
     Raises RuntimeError when no comparison can be made.
     """
     order = list(group_order or [])
@@ -254,10 +274,17 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
         names_all = _qualifying(samples, groups, order)
         clone_reference = (reference if reference in names_all else (names_all[0] if names_all else '')) \
             if contrast_mode == 'reference' else None
+    libraries = {s: str(libraries[s]) for s in samples} if libraries else None
+    labels = dict(library_labels or {})
     analysed, denom_used, library, clones = _prepare_counts(
         counts.loc[samples], denominator.loc[samples], pairing, normalisation, control_combos, clone_filter,
-        notes, strata, clone_groups, clone_reference)
+        notes, strata, clone_groups, clone_reference, libraries, labels)
+    removed = analysed.isna() & counts.loc[samples].notna()
     log2_all = ds.log2_frequencies(analysed, library.values)
+    if libraries and feature_libraries:
+        small = _small_library_groups(samples, unit_level, groups, order, libraries, feature_libraries,
+                                      list(analysed.columns), labels, notes)
+        analysed, log2_all = analysed.mask(small), log2_all.mask(small)
 
     for level in levels:
         level_samples = [s for s in samples if unit_level[s] == level]
@@ -312,6 +339,11 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
         return ds.apply_significance(table, pval_threshold, fc_threshold, fdr_scope=fdr_scope,
                                      use_treat=use_treat)
 
+    results = {key: stacked(key) for key in ('counts', 'freq')}
+    if libraries and feature_libraries:
+        primary = results['counts'] if results['counts'] is not None else results['freq']
+        notes.extend(_untested_library_notes(primary, pairs, interaction, samples, unit_level, groups,
+                                             libraries, feature_libraries, labels))
     kept = [s for s in samples if groups.get(s)]
     return {
         'samples': kept,
@@ -320,21 +352,79 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
         'pairing': {s: str(pairing[s]) for s in kept if pairing.get(s) not in (None, '')} if pairing else None,
         'comparisons': [comparison_label(b, o, lv) for b, o, lv in pairs],
         'pairs': pairs,
-        'counts': stacked('counts'),
+        'counts': results['counts'],
         'counts_values': counts.loc[kept] if run_counts else None,
-        'freq': stacked('freq'),
+        'freq': results['freq'],
         'freq_values': (100.0 * counts.loc[kept].div(denominator.loc[kept], axis=0)),
         'log2_values': ds.log2_frequencies(counts.loc[kept], library.loc[kept].values),
-        'removed': analysed.loc[kept].isna(),
+        'removed': removed.loc[kept],
         'denominator': denom_used.loc[kept],
         'library_sizes': library.loc[kept],
         'clones': clones,
         'strata': {s: strata[s] for s in kept} if strata is not None else None,
         'interaction': interaction,
+        'libraries': {s: libraries[s] for s in kept} if libraries else None,
+        'feature_libraries': dict(feature_libraries) if libraries and feature_libraries else None,
+        'library_labels': labels if libraries else None,
         'counts_method': counts_method,
         'normalisation': normalisation,
         'notes': notes,
     }
+
+
+def _small_library_groups(samples: list, unit_level: dict, groups: dict, order: list, libraries: dict,
+                          feature_libraries: dict, columns: list, labels: dict, notes: list) -> pd.DataFrame:
+    """
+    samples × *columns*, True where a guide is left out of a group: within
+    a comparison level, the samples of the group that carry the guide (its
+    libraries in *feature_libraries*) are fewer than MIN_SAMPLES_PER_GROUP.
+    Only groups compared in their level are looked at; a note names the
+    libraries, the group and the number of samples.
+    """
+    mask = pd.DataFrame(False, index=samples, columns=columns)
+    by_carriers: dict = {}
+    for feature in columns:
+        carriers = tuple(sorted(str(lib) for lib in feature_libraries.get(feature) or ()))
+        if carriers:
+            by_carriers.setdefault(carriers, []).append(feature)
+    for level in dict.fromkeys(unit_level[s] for s in samples):
+        members = [s for s in samples if unit_level[s] == level]
+        for group in _qualifying(members, groups, order):
+            cell = [s for s in members if groups.get(s) == group]
+            where = group if level is None else f'{group} [{level}]'
+            for carriers, features in by_carriers.items():
+                inside = [s for s in cell if libraries.get(s) in carriers]
+                if not 0 < len(inside) < MIN_SAMPLES_PER_GROUP:
+                    continue
+                mask.loc[inside, features] = True
+                names = ' + '.join(labels.get(lib, lib) for lib in carriers)
+                which = 'its guides are' if len(carriers) == 1 else 'their shared guides are'
+                notes.append(f'{names}: {len(inside)} sample(s) in {where}, fewer than {MIN_SAMPLES_PER_GROUP}; '
+                             f'{which} not compared in {group} there.')
+    return mask
+
+
+def _untested_library_notes(results: pd.DataFrame | None, pairs: list, interaction: dict, samples: list,
+                            unit_level: dict, groups: dict, libraries: dict, feature_libraries: dict,
+                            labels: dict) -> list:
+    """A note for each group comparison where a library has samples but
+    none of its guides could be tested."""
+    if results is None:
+        return []
+    notes = []
+    for base, other, level in pairs:
+        label = comparison_label(base, other, level)
+        if label in (interaction or {}):
+            continue
+        view = results[results['comparison'] == label]
+        tested = set(view.loc[np.isfinite(view['P.Value'].astype(float)), 'feature'])
+        present = dict.fromkeys(libraries[s] for s in samples
+                                if unit_level[s] == level and groups.get(s) in (base, other))
+        for lib in present:
+            own = [f for f, libs in feature_libraries.items() if lib in libs]
+            if own and not tested.intersection(own):
+                notes.append(f'{label}: no {labels.get(lib, lib)} guide could be tested.')
+    return notes
 
 
 def _offsets(sub: pd.DataFrame, size: pd.Series) -> pd.DataFrame:
@@ -443,28 +533,40 @@ def _population_contrasts(analysed, log2_all, library, samples, groups, order, r
 
 def _prepare_counts(counts: pd.DataFrame, denominator: pd.Series, pairing: dict | None, normalisation: str,
                     control_combos: list | None, clone_filter: dict | None, notes: list,
-                    strata: dict | None, clone_groups: dict, clone_reference: str | None) -> tuple:
+                    strata: dict | None, clone_groups: dict, clone_reference: str | None,
+                    libraries: dict | None = None, library_labels: dict | None = None) -> tuple:
     """
     Counts with expanded clones removed (when *clone_filter*), the barcoded
     events left per sample, the library size per sample and the clone table
-    (None without a filter). Each population of *strata* is handled on its
-    own; clones are looked for in the samples whose clone group is not
-    *clone_reference*, compared within their clone group.
+    (None without a filter). Each population of *strata*, and each library
+    of *libraries*, is handled on its own; clones are looked for in the
+    samples whose clone group is not *clone_reference*, compared within
+    their clone group.
     """
-    if strata is None:
+    if strata is None and libraries is None:
         return _prepare_stratum(counts, denominator, pairing, normalisation, control_combos, clone_filter,
                                 notes, clone_groups, clone_reference, '')
+
+    def part_of(s):
+        return (strata[s] if strata is not None else None, libraries[s] if libraries is not None else None)
+
+    keys = list(dict.fromkeys(part_of(s) for s in counts.index))
     parts = []
-    for pop in dict.fromkeys(strata[s] for s in counts.index):
-        rows = [s for s in counts.index if strata[s] == pop]
+    for pop, lib in keys:
+        rows = [s for s in counts.index if part_of(s) == (pop, lib)]
+        names = [pop, None if lib is None else (library_labels or {}).get(lib, lib)]
+        prefix = ' · '.join(n for n in names if n is not None) + ': '
         parts.append(_prepare_stratum(counts.loc[rows], denominator.loc[rows], pairing, normalisation,
-                                      control_combos, clone_filter, notes, clone_groups, clone_reference,
-                                      f'{pop}: '))
+                                      control_combos, clone_filter, notes, clone_groups, clone_reference, prefix))
     analysed = pd.concat([p[0] for p in parts]).loc[counts.index]
     denom_used = pd.concat([p[1] for p in parts]).loc[counts.index]
     library = pd.concat([p[2] for p in parts]).loc[counts.index]
-    tables = [p[3].assign(population=pop) for p, pop in zip(parts, dict.fromkeys(strata[s] for s in counts.index))
-              if p[3] is not None]
+    tables = []
+    for p, (pop, lib) in zip(parts, keys):
+        if p[3] is None:
+            continue
+        table = p[3] if pop is None else p[3].assign(population=pop)
+        tables.append(table if lib is None else table.assign(library=lib))
     clones = pd.concat(tables, ignore_index=True) if tables else None
     return analysed, denom_used, library, clones
 
@@ -490,9 +592,13 @@ def _prepare_stratum(counts, denominator, pairing, normalisation, control_combos
     denom_used = denominator.astype(float) - removed_events
 
     if normalisation == 'control':
-        controls = [c for c in (control_combos or []) if c in counts.columns]
-        if not controls:
+        chosen = [c for c in (control_combos or []) if c in counts.columns]
+        controls = [c for c in chosen if counts[c].notna().any()]
+        if not chosen:
             raise RuntimeError('Control normalisation: choose at least one control combination.')
+        if not controls:
+            raise RuntimeError(f'{prefix}Control normalisation: none of the chosen control combinations is '
+                               'in this library.')
         own = found[found['combination'].isin(controls)]
         ctrl_counts, _table = remove_clones(analysed[controls], own, pairing, None)
         sizes = ds.library_sizes(ctrl_counts, denom_used.values, 'control', controls)
@@ -500,7 +606,8 @@ def _prepare_stratum(counts, denominator, pairing, normalisation, control_combos
             notes.append(f"{prefix}Control normalisation: {len(own)} expanded control clone(s) left out of "
                          "the control totals.")
     else:
-        sizes = ds.library_sizes(analysed, denom_used.values, normalisation)
+        measured = analysed.loc[:, analysed.notna().any(axis=0)]
+        sizes = ds.library_sizes(measured, denom_used.values, normalisation)
     library = pd.Series(sizes, index=counts.index)
     factors = library / denom_used.replace(0.0, np.nan)
     if normalisation != 'total' and factors.notna().any():
@@ -564,17 +671,22 @@ def results_table(stats: dict) -> pd.DataFrame | None:
 # Sample PCA
 # ---------------------------------------------------------------------------
 
-def sample_pca(stats: dict, n_loadings: int = 10) -> dict | None:
+def sample_pca(stats: dict, n_loadings: int = 10, library: str | None = None) -> dict | None:
     """
     Two-component PCA of every sample on log2 % of barcoded events
     (z-scored per combination), with the top loadings by length. Same
     result layout as ``ag_results.sample_pca``, for
-    ``ag_report.make_pca_figure``. None with fewer than 2 samples or 2
-    varying combinations.
+    ``ag_report.make_pca_figure``. With *library* (several libraries), the
+    samples of that library on its own guides. None with fewer than 2
+    samples or 2 varying combinations.
     """
     from sklearn.decomposition import PCA
 
     values = stats.get('log2_values')
+    if values is not None and library is not None:
+        own = [s for s in values.index if (stats.get('libraries') or {}).get(s) == library]
+        values = values.loc[own]
+        values = values.loc[:, values.notna().all(axis=0)]
     if values is None or values.shape[0] < 2:
         return None
     sd = values.std(axis=0, ddof=0)
@@ -610,6 +722,26 @@ X_LABELS = {'counts': 'log2 fold change (barcode share, NB GLM)',
             'freq': 'log2 fold change (% of barcoded)'}
 
 
+def library_colours(names) -> dict:
+    """{library: colour} from the RColorBrewer Set2 palette, in the order
+    given (the groups have their own palette)."""
+    import matplotlib
+
+    cmap = matplotlib.colormaps['Set2']
+    return {name: matplotlib.colors.to_hex(cmap(i % cmap.N)) for i, name in enumerate(names)}
+
+
+def library_blocks(stats: dict, sample_labels: dict | None = None) -> tuple:
+    """({sample label: library label}, {library label: colour}) for the
+    per-sample heatmaps with several libraries, or (None, None)."""
+    libraries = stats.get('libraries')
+    if not libraries:
+        return None, None
+    labels = stats.get('library_labels') or {}
+    shown = {(sample_labels or {}).get(s, s): labels.get(lib, lib) for s, lib in libraries.items()}
+    return shown, library_colours(dict.fromkeys(labels.get(lib, lib) for lib in libraries.values()))
+
+
 def comparison_figures(stats: dict, pair: tuple, pval_threshold: float, fc_threshold: float,
                        fdr_scope: str, is_dark: bool, population: str,
                        sample_labels: dict | None = None, group_colours: dict | None = None,
@@ -622,6 +754,8 @@ def comparison_figures(stats: dict, pair: tuple, pval_threshold: float, fc_thres
     'results', 'make'}}; 'results' is the table a volcano or the bars were
     drawn from, 'make' draws a fresh copy of the figure (for Pop Out).
     *group_colours* ({group: colour}) colour the groups in every figure.
+    With several libraries the heatmaps keep each library's samples
+    together, under a library colour bar.
     """
     from honeychrome.view_components import differential_plots as dp
 
@@ -638,6 +772,8 @@ def comparison_figures(stats: dict, pair: tuple, pval_threshold: float, fc_thres
         group_by_sample = {sample_labels.get(s, s): g for s, g in group_by_sample.items()}
     run_label = f'{population}: {label}'
     colours = dict(group_colours or {})
+    blocks, block_colours = library_blocks(stats, sample_labels)
+    heatmap_blocks = {} if blocks is None else dict(sample_blocks=blocks, block_colours=block_colours)
     out = {}
 
     def add(key, tab_title, maker, results=None, **kwargs):
@@ -670,12 +806,12 @@ def comparison_figures(stats: dict, pair: tuple, pval_threshold: float, fc_thres
         add('heatmap_significant', 'Heatmap (significant)', dp.make_heatmap_figure,
             results_df=first, sample_df=sample_df, title=f'Significant combinations: {label}',
             group_by_sample=group_by_sample, group_a=base, group_b=other, is_dark=is_dark,
-            run_label=run_label, value_label='% of barcoded', group_colours=colours)
+            run_label=run_label, value_label='% of barcoded', group_colours=colours, **heatmap_blocks)
         add('heatmap_all', 'Heatmap (all)', dp.make_heatmap_figure,
             results_df=first.assign(significant=True), sample_df=sample_df,
             title=f'All combinations: {label}', group_by_sample=group_by_sample, group_a=base,
             group_b=other, is_dark=is_dark, run_label=run_label, value_label='% of barcoded',
-            group_colours=colours)
+            group_colours=colours, **heatmap_blocks)
     if combination:
         add('combination', f'Combination: {combination}', combination_figure, stats=stats,
             combination=combination, pair=pair, fdr_scope=fdr_scope, is_dark=is_dark, population=population,
@@ -688,7 +824,8 @@ def summary_figures(stats: dict, is_dark: bool, population: str, heatmap_order: 
                     sample_labels: dict | None = None, group_colours: dict | None = None) -> dict:
     """Figures over every comparison: the comparison heatmap of the
     primary test and the sample PCA ({key: {'fig', 'title', 'error',
-    'make'}})."""
+    'make'}}). With several libraries there is one PCA per library
+    (``sample_pca <library>``), each on its own samples and guides."""
     from honeychrome.view_components import differential_plots as dp
 
     _bundled_plugins_on_path()
@@ -708,16 +845,23 @@ def summary_figures(stats: dict, is_dark: bool, population: str, heatmap_order: 
         except Exception as exc:
             out['comparison_heatmap'] = {'fig': None, 'title': 'Comparison heatmap',
                                          'error': str(exc) or type(exc).__name__}
-    pca = sample_pca(stats, n_loadings=n_loadings)
-    if pca is not None:
-        def make_pca():
+    libraries = stats.get('libraries')
+    labels = stats.get('library_labels') or {}
+    runs = ([(f'sample_pca {lib}', f'Sample PCA ({labels.get(lib, lib)})', lib)
+             for lib in dict.fromkeys(libraries.values())] if libraries else [('sample_pca', 'Sample PCA', None)])
+    for pca_key, title, lib in runs:
+        pca = sample_pca(stats, n_loadings=n_loadings, library=lib)
+        if pca is None:
+            continue
+
+        def make_pca(pca=pca):
             return ag_report.make_pca_figure(pca, is_dark, sample_labels=sample_labels,
                                              group_colours=group_colours)
 
         try:
-            out['sample_pca'] = {'fig': make_pca(), 'title': 'Sample PCA', 'error': None, 'make': make_pca}
+            out[pca_key] = {'fig': make_pca(), 'title': title, 'error': None, 'make': make_pca}
         except Exception as exc:
-            out['sample_pca'] = {'fig': None, 'title': 'Sample PCA', 'error': str(exc) or type(exc).__name__}
+            out[pca_key] = {'fig': None, 'title': title, 'error': str(exc) or type(exc).__name__}
     return out
 
 
@@ -848,7 +992,8 @@ def combination_values(stats: dict, combination: str, pair: tuple, group_order: 
     per sample of every group (within the comparison's split level), with
     its group, pairing level, % of library size (half an event added, as the
     Frequencies test uses) and whether the count was left out as an expanded
-    clone. Rows follow *group_order*, then the samples' order. For a
+    clone; samples without the combination (another library's) are left
+    out. Rows follow *group_order*, then the samples' order. For a
     population contrast the rows are its units, grouped by population and
     group, and the pairing level is the mouse within each population.
     """
@@ -867,7 +1012,7 @@ def combination_values(stats: dict, combination: str, pair: tuple, group_order: 
                    if level is None or split.get(s) == level]
     rows = []
     for s, g in members:
-        if s not in log2.index or combination not in log2.columns:
+        if s not in log2.index or combination not in log2.columns or not np.isfinite(log2.loc[s, combination]):
             continue
         rows.append({'sample': s, 'group': g, 'pair': pairing.get(s, ''),
                      'percent': float(2.0 ** log2.loc[s, combination]),
@@ -1149,6 +1294,75 @@ def marker_spillover(spread: pd.DataFrame, sums: np.ndarray, counts: pd.DataFram
         out[np.flatnonzero(ok), :, k] = np.abs(shifted - level[ok, k][:, None])
     names = [marker_feature(c, ch) for c in combos for ch in channels]
     return pd.DataFrame(out.reshape(len(counts), -1), index=counts.index, columns=names)
+
+
+_REFERENCE_FALLBACK = ('tags', 'controls', 'all')
+
+
+def marker_deltas_by_library(data: dict, counts: pd.DataFrame, channels: list, unit_library: dict,
+                             feature_map: dict, reference: str = 'tags', control_combos: list | None = None,
+                             min_events: int = MARKER_DEFAULTS['min_events'], removed: pd.DataFrame | None = None,
+                             tag_matrix: pd.DataFrame | None = None, spread: pd.DataFrame | None = None,
+                             transforms: dict | None = None) -> tuple:
+    """
+    ``marker_deltas`` and ``marker_spillover`` with several libraries: each
+    library's samples (*unit_library*) are taken on their own guides, so
+    the tag model and the reference cells come from the sample's own
+    library. A guide's marker sums are those of its triplet in the saved
+    sums (*data*, ``flowcode_analysis.load_marker_sums``; summed when one
+    guide has several triplets in a library), and its tags (*tag_matrix*)
+    and spillover spread (*spread*), both indexed by triplet, are its
+    triplet's. *feature_map* is ``flowcode_analysis.library_feature_map``.
+
+    Returns (deltas, meta, reference used, means, reference means,
+    spillover or None), the tables of every library joined (NaN where a
+    guide is not in a sample's library). The reference used is the
+    furthest fallback any library needed.
+    """
+    from flowcode_analysis import marker_sums_for
+
+    parts, used = [], []
+    for lib, fmap in feature_map.items():
+        units = [u for u in counts.index if unit_library.get(u) == lib]
+        triplets_of: dict = {}
+        for triplet, feature in fmap.items():
+            if feature in counts.columns:
+                triplets_of.setdefault(feature, []).append(triplet)
+        features = [f for f in counts.columns if f in triplets_of]
+        if not units or not features:
+            continue
+        triplets = [t for f in features for t in triplets_of[f]]
+        owner = np.repeat(np.arange(len(features)), [len(triplets_of[f]) for f in features])
+        raw = marker_sums_for(data, units, triplets, channels)
+        sums = np.zeros((len(units), len(features), len(channels)))
+        np.add.at(sums, (slice(None), owner), raw)
+        first = [triplets_of[f][0] for f in features]
+        sub = counts.loc[units, features]
+        tags = None if tag_matrix is None else tag_matrix.reindex(first).set_axis(features, axis=0)
+        gone = None if removed is None else removed.reindex(index=units, columns=features, fill_value=False)
+        deltas, meta, ref, means, ref_means = marker_deltas(sums, sub, channels, reference, control_combos,
+                                                            min_events, removed=gone, return_means=True,
+                                                            tag_matrix=tags)
+        spill = None
+        if spread is not None:
+            spill = marker_spillover(spread.reindex(first).set_axis(features, axis=0), sums, sub, channels,
+                                     transforms or {})
+        parts.append((deltas, meta, means, ref_means, spill))
+        used.append(ref)
+    if not parts:
+        raise RuntimeError('No library has samples with guides to compare.')
+    names = [marker_feature(c, ch) for c in counts.columns for ch in channels]
+
+    def joined(k):
+        frame = pd.concat([p[k] for p in parts], axis=0)
+        return frame.reindex(index=[u for u in counts.index if u in frame.index],
+                             columns=[n for n in names if n in frame.columns])
+
+    meta = pd.concat([p[1] for p in parts]).drop_duplicates('feature').set_index('feature')
+    meta = meta.reindex([n for n in names if n in meta.index]).reset_index()
+    reference_used = max(used, key=_REFERENCE_FALLBACK.index)
+    spillover = joined(4) if spread is not None else None
+    return joined(0), meta, reference_used, joined(2), joined(3), spillover
 
 
 def _marker_significance(results: pd.DataFrame, pval_threshold: float, threshold: float, fdr_scope: str,
