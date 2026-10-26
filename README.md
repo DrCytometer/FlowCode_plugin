@@ -45,7 +45,7 @@ The plugin reuses Honeychrome's AutoSpectral machinery: AF profiles from AutoSpe
 | `flowcode_export.py` | Reading, FlowCode unmixing and writing of whole samples: the export and the Analysis page's live unmix |
 | `flowcode_analysis.py`, `flowcode_stats.py` | Analysis page numerics, no Qt |
 | `flowcode_analysis_page.py` | Section 6 (Analysis) |
-| `flowcode_rescue_assess.py` | Optional standalone script that assesses the too-few rescue. Not loaded by the plugin |
+| `flowcode_rescue_assess.py` | Optional standalone script that assesses the too-few rescue. Not loaded by the plugin and not copied by the installer |
 
 ---
 
@@ -53,7 +53,7 @@ The plugin reuses Honeychrome's AutoSpectral machinery: AF profiles from AutoSpe
 
 ### 2.1 Requirements
 
-- Honeychrome run from Python (the PyPI package or a source clone, Python 3.12 or higher), in a version with the AutoSpectral tab's unmixing method (`controller_components/unmix_method.py`). With an older Honeychrome the tab shows a message instead. The plugin system is not available in the packaged executables.
+- Honeychrome run from Python 3.12, from a source clone of the `autospectral` branch of [Cytkit/honeychrome](https://github.com/Cytkit/honeychrome). The installer in 2.2 sets this up. The plugin needs the AutoSpectral tab's unmixing method (`controller_components/unmix_method.py`); with an older Honeychrome, including the PyPI package, the tab shows a message instead. The plugin system is not available in the packaged executables.
 - No packages beyond Honeychrome's own requirements (numpy, scipy, scikit-learn, matplotlib, pyqtgraph, flowkit, flowio).
 - In the experiment, before opening the FlowCode tab:
   - The unmixing matrix is calculated (Spectral Process tab). The tab shows a disabled message until it is.
@@ -68,11 +68,35 @@ The order of work (shown, with buttons that open each AutoSpectral page, in the 
 4. **Spectral corrections** (AutoSpectral › Spectral Correction, optional): *Fix Unmix* with the tag fluorophores in its *Fluorophores kept fixed* list (the button fills the list in). Fix My Unmix reads the raw FlowCode samples, where FRET is still uncorrected; with the tag rows free it would absorb FRET into the tag spectra and the FlowCode correction would remove the same error a second time.
 5. **Section 5 export**, or **section 6** directly: it can unmix live without exporting.
 
-Optional: the compiled kernels (`bundled_plugins/build_autospectral_opt_kernel.py`) make the noise model and spectral variants fast; without them the noise model runs in NumPy and the export asks you to confirm an estimated run time first. The Spectral Variants page's positivity thresholds, when computed, are the too-many rescue's noise floor; otherwise it is the 99.5th percentile of the matched unstained.
+The compiled kernels make the noise model and spectral variants fast. The installer builds them and checks that they load; in a manual install, build them with `bundled_plugins/build_som_kernel.py`, `build_autospectral_opt_kernel.py` and `build_fix_my_unmix_kernel.py`. Without them the noise model runs in NumPy and the export asks you to confirm an estimated run time first. The Spectral Variants page's positivity thresholds, when computed, are the too-many rescue's noise floor; otherwise it is the 99.5th percentile of the matched unstained.
 
-### 2.2 Install the plugin files
+### 2.2 Install and update
 
-Honeychrome looks for plugins in `Experiments/plugins` in the user's home folder (`~/Experiments/plugins`). It creates the folder on first launch.
+One command installs Honeychrome (`autospectral` branch), the compiled kernels and this plugin, and the same command updates them. Step-by-step instructions for people new to the Terminal, troubleshooting and the list of what goes where are in [STUDENT_INSTALL_GUIDE.md](STUDENT_INSTALL_GUIDE.md). An administrator account is needed the first time.
+
+- **Mac** (Terminal):
+
+  ```bash
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install/install_honeychrome.sh)"
+  ```
+
+- **Windows 10/11, x64** (PowerShell):
+
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install/install_honeychrome.ps1 | iex"
+  ```
+
+The installer puts everything in `~/Honeychrome`, copies the plugin files into `~/Experiments/plugins`, and adds **Honeychrome** and **Update Honeychrome** icons to the Desktop. It logs to `~/Honeychrome/install.log`.
+
+1. Start Honeychrome with the **Honeychrome** icon. Keep its Terminal or console window open while you work.
+2. First time only: open **Application Configuration**. Each file in `~/Experiments/plugins` that ends in `_tab.py` appears as a row, "Tabbed plugin", with the checkbox **Enable FlowCode** (the name comes from `plugin_name` in the file). Tick it and accept. Honeychrome reloads the experiment and a **FlowCode** tab appears.
+3. To update: quit Honeychrome, double-click **Update Honeychrome**, wait for **Done.**, then start Honeychrome again. If the icon is missing, run the install command again.
+
+If the tab does not appear, check `~/Experiments/honeychrome.log`. A missing companion file, or a Python package that is not installed, shows up there as an import error.
+
+### 2.3 Manual installation into an existing Honeychrome source clone
+
+For developers who already run Honeychrome from a source clone of the `autospectral` branch. Honeychrome looks for plugins in `Experiments/plugins` in the user's home folder (`~/Experiments/plugins`). It creates the folder on first launch.
 
 1. Copy these nine files into `~/Experiments/plugins/`, keeping them in the same folder:
 
@@ -90,20 +114,20 @@ Honeychrome looks for plugins in `Experiments/plugins` in the user's home folder
 
    Only `*_tab.py` files are discovered. The tab puts its own folder on `sys.path` and imports the others, so all nine must sit side by side. Copy files, not symlinks. `flowcode_rescue_assess.py` is optional and can stay out of the plugins folder.
 
-2. Start Honeychrome from your Python environment:
+2. Start Honeychrome from your Python environment, in the clone's folder:
 
    ```bash
    source .venv/bin/activate      # Windows: .venv\Scripts\activate
-   honeychrome                    # PyPI install, or from a source clone after "pip install -e ."
+   python -m honeychrome.main     # after "pip install -e ."
    ```
 
-3. Enable the plugin. Open **Application Configuration**. Each file in `~/Experiments/plugins` that ends in `_tab.py` appears as a row, "Tabbed plugin", with the checkbox **Enable FlowCode** (the name comes from `plugin_name` in the file). Tick it and accept. Honeychrome reloads the experiment and a **FlowCode** tab appears.
+3. Enable the plugin in **Application Configuration** as in 2.2.
 
 4. After updating any of the plugin files later, copy the new versions over the old ones and restart Honeychrome (or untick and re-tick the plugin) so the modules are re-imported.
 
-If the tab does not appear, check `~/Experiments/honeychrome.log`. A missing companion file, or a Python package that is not installed, shows up there as an import error.
+Do not mix the two methods: the installer overwrites the plugin files in `~/Experiments/plugins` on every run.
 
-### 2.3 Optional: the AF library and fluorophore database
+### 2.4 Optional: the AF library and fluorophore database
 
 - Tag fluorophores must be in the experiment's fluorophore profiles (`process['profiles']`).
 - The tandem check reads a `tandem.parent` column in `src/honeychrome/data/fluorophore_database.csv` (for example, PE-Cy7 → PE). Tags whose fluorophore class is "Protein tandem" with a parent listed are ticked for the check automatically.
@@ -118,7 +142,7 @@ Open the **FlowCode** tab. The six sections are listed down the left side; the m
 
 - **Backbone.** Tick the samples whose cells carry the FlowCode combinations, typically pools of transduced cells. Several samples can be ticked and their events are pooled (at most 2,000,000 events per file). Every combination needs enough bright, barcoded events to be characterised: aim for at least 50 events per combination with every tag at least 3 times its threshold. Samples with "backbone" or "FRET" in the name are ticked at first. Single-stain controls and unstained samples are not listed.
 - **Matched unstained.** The unstained sample whose FSC/SSC distribution is closest to the pooled backbone, scored by the Bhattacharyya coefficient of the scatter histograms (1 = identical). Click a row to choose a different one, or **Match again** to recompute.
-- **AF library for debarcoding.** The AF profiles extracted from the chosen unstained sample in the AutoSpectral AF tab. If none exist, the section shows how to extract one and stays incomplete.
+- **AF library for debarcoding.** The AF profiles extracted from the chosen unstained sample in AutoSpectral › Autofluorescence. If none exist, the section shows how to extract one and stays incomplete.
 - **Combinations CSV** (optional). A FlowCodeUnmix file with an `Id` column and three tag columns. Without it, every 3-tag combination of the ticked tags is used.
 - **No FRET backbone: skip FRET correction (results invalid)**. For samples acquired before FRET backbone controls were run, to test the pipeline. Ticking it asks you to acknowledge, in a pop-up, that the downstream results are untrustworthy (the time is saved with the experiment). The Backbone box becomes *Samples for gates and thresholds*: the ticked barcoded samples set the FlowCode gates, the thresholds and the rescue references, and no FRET error is fitted on them (stained samples would put their marker signal into the error). See [No FRET backbone](#no-fret-backbone) below.
 
@@ -360,7 +384,7 @@ At least 5 combinations with and 5 without the tag are required. The backbone st
 
 ## 6. Differences from the R package
 
-- AF libraries come from the AutoSpectral AF tab (extracted on the whole unstained file), not from `get.af.spectra()` on the FlowCode-gated unstained. `AF.Mean` is still taken from the gated unstained.
+- AF libraries come from AutoSpectral › Autofluorescence (extracted on the whole unstained file), not from `get.af.spectra()` on the FlowCode-gated unstained. `AF.Mean` is still taken from the gated unstained.
 - Only the FSC-A/FSC-H singlet pass is applied; the SSC-A/SSC-H pass is not.
 - The landmark gate uses scikit-learn's FastMCD, not `MASS::cov.rob("mcd")`.
 - The rescue transform is a fixed Honeychrome logicle, not AutoSpectral's cytometer-specific biexponential.
