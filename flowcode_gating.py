@@ -40,13 +40,27 @@ VIEW_OVERRIDES = {VIEW_UNCORRECTED: {'correction': 'none', 'tandem_tags': [], 'c
 
 HIGHLIGHT_BARCODED = 'barcoded'
 HIGHLIGHT_NONE = 'none'
+# A phenotype population (flowcode_phenotype): 'phenotype:<population name>'.
+HIGHLIGHT_PHENOTYPE = 'phenotype:'
 # Highlighted events drawn per 2D plot (all events are counted).
 MAX_HIGHLIGHT_POINTS = 5_000
 
 
+def phenotype_highlight(name: str) -> str:
+    return HIGHLIGHT_PHENOTYPE + str(name)
+
+
+def highlighted_phenotype(highlight) -> str | None:
+    """The population name of a phenotype highlight, else None."""
+    text = str(highlight or '')
+    return text[len(HIGHLIGHT_PHENOTYPE):] if text.startswith(HIGHLIGHT_PHENOTYPE) else None
+
+
 def focus_mask(ids: np.ndarray, highlight=HIGHLIGHT_BARCODED, n_combos: int = 0) -> np.ndarray:
-    """Events highlighted: none, barcoded (1..*n_combos*), or one combination."""
-    if highlight == HIGHLIGHT_NONE:
+    """Events highlighted: none, barcoded (1..*n_combos*), or one combination
+    (a phenotype highlight is scored by ``flowcode_phenotype.population_mask``
+    instead and gives no events here)."""
+    if highlight == HIGHLIGHT_NONE or highlighted_phenotype(highlight) is not None:
         return np.zeros(len(ids), dtype=bool)
     if highlight == HIGHLIGHT_BARCODED:
         return (ids >= 1) & (ids <= n_combos) if n_combos else ids >= 1
@@ -114,9 +128,10 @@ def gate_rows(data: dict, reference_membership: dict | None = None, focus: np.nd
     """
     One row per gate of *data* (``plot_data``): 'name', 'parent', 'n_in'
     (the population's events, the counts' 'in_population'), 'percent' (of
-    its parent) and 'changed': the highlighted (*focus*) events inside the
-    gate in one view and not in the other (None without
-    *reference_membership*, the uncorrected view's).
+    its parent), 'n_focus' (the highlighted events inside the gate; None
+    without *focus*) and 'changed': the highlighted events inside the gate
+    in one view and not in the other (None without *reference_membership*,
+    the uncorrected view's).
     """
     gating, stats, membership = data['gating'], data['statistics'], data['gate_membership']
     rows = []
@@ -133,6 +148,7 @@ def gate_rows(data: dict, reference_membership: dict | None = None, focus: np.nd
             parent = gpath[-2] if len(gpath) > 1 else 'root'
         rows.append({'name': gid, 'parent': parent, 'n_in': int(np.count_nonzero(inside)),
                      'percent': 100.0 * float(stats.get(gid, {}).get('p_gate_parent', np.nan)),
+                     'n_focus': None if focus is None else int(np.count_nonzero(inside & focus)),
                      'changed': changed})
     return rows
 

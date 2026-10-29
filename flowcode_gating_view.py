@@ -33,15 +33,17 @@ logger = logging.getLogger(__name__)
 TASK = 'analysis_gating'
 MODE = 'flowcode_gating'
 COLUMNS = 4
-HIGHLIGHT_COLOUR = (255, 59, 48)
+HIGHLIGHT_COLOUR = (255, 0, 123)
 INTRO = ('The experiment\'s Unmixed Data plots and gates over the FlowCode-unmixed events of the sample selected '
          'in the sample browser, gated exactly as the Analysis counts them (the sample\'s own gate overrides '
          'included). <i>Uncorrected</i> is the experiment\'s own unmix of the raw file; <i>FlowCode standard</i> '
          'adds the FRET correction (and tandem); <i>FlowCode calibrated</i> also the per-sample combination '
-         'calibration (section 5, Advanced settings). Highlighted events are drawn in red; the table gives each '
-         'gate\'s % of its parent and how many highlighted events change side against the uncorrected view, '
-         'which is unmixed as well for that comparison. View only: edit gates in the main window.')
-TABLE_COLUMNS = ('Gate', 'Parent', '% of parent', 'Events', 'Changing side')
+         'calibration (section 5, Advanced settings). Highlighted events (barcoded, one combination, or a '
+         'phenotype population: membership at least one half, inside the FlowCode gates) are drawn in pink; the '
+         'table gives each gate\'s % of its parent, how many highlighted events it holds and how many change '
+         'side against the uncorrected view, which is unmixed as well for that comparison. View only: edit gates '
+         'in the main window.')
+TABLE_COLUMNS = ('Gate', 'Parent', '% of parent', 'Events', 'Highlighted', 'Changing side')
 
 _ReadOnlyPlot = None
 
@@ -154,7 +156,7 @@ class GatingSection(QWidget):
             self.view_combo.addItem(text, key)
         self.view_combo.setCurrentIndex(self.view_combo.findData(fcg.VIEW_CALIBRATED))
         self.highlight_combo = QComboBox()
-        self.highlight_combo.setToolTip('Events drawn in red and counted for "changing side".')
+        self.highlight_combo.setToolTip('Events drawn in pink and counted for "changing side".')
         for text, w in (('View', self.view_combo), ('Highlight', self.highlight_combo)):
             row.addWidget(QLabel(text))
             row.addWidget(w)
@@ -200,12 +202,26 @@ class GatingSection(QWidget):
         self.highlight_combo.clear()
         self.highlight_combo.addItem('Barcoded events', fcg.HIGHLIGHT_BARCODED)
         self.highlight_combo.addItem('Nothing', fcg.HIGHLIGHT_NONE)
+        for name in self._phenotypes():
+            self.highlight_combo.addItem(f'Phenotype: {name}', fcg.phenotype_highlight(name))
         design = page._current_design()
         for i, name in enumerate(design.combo_names if design is not None else []):
             self.highlight_combo.addItem(name, i + 1)
         index = self.highlight_combo.findData(chosen)
         self.highlight_combo.setCurrentIndex(index if index >= 0 else 0)
         self.highlight_combo.blockSignals(False)
+
+    def _phenotypes(self) -> dict:
+        """``{population name: Resolved}`` of every resolved definition (split
+        by congenic marker when the Data tab asks), the ticked ones first."""
+        import flowcode_phenotype as fp
+        page = self.page
+        resolved = page.resolved_phenotypes()
+        keys = [k for k, r in resolved.items() if isinstance(r, fp.Resolved)]
+        ticked = page.phenotype_populations()
+        out = dict(ticked)
+        out.update({name: res for name, res in page.phenotype_populations(keys).items() if name not in out})
+        return out
 
     def on_shown(self):
         """The tab became visible: draw the selected sample when it is not drawn."""
@@ -268,8 +284,37 @@ class GatingSection(QWidget):
         unmixed = experiment.settings['unmixed']
         fluorescence = [unmixed['event_channels_pnn'][i] for i in unmixed.get('fluorescence_channel_ids') or []]
         highlight = self.highlight_combo.currentData()
+        phenotype = None
+        name = fcg.highlighted_phenotype(highlight)
+        if name is not None:
+            import flowcode_phenotype as fp
+            import flowcode_state as fcs
+            resolved = self._phenotypes().get(name)
+            if resolved is None:
+                self.status.setText(f'The phenotype {name} is no longer resolved on this panel.')
+                if token is not None:
+                    token.release()
+                return
+            inp = inputs[view]
+            model = fp.sample_negative_model(inp['af_by_sample'][key], list(inp['layout'].fluor_names),
+                                             inp['plan'].state, key)
+            if model is None:
+                self.status.setText(f'{page._name(key)} has no negative model for phenotypes: no AF library and '
+                                    'no noise model.')
+                if token is not None:
+                    token.release()
+                return
+            records = [plugin.state.gates[n] for n in fcs.GATE_NAMES if n in plugin.state.gates]
+            phenotype = (resolved, model, records)
         cache_keys = {v: fce.live_cache_key(inputs[v]['signature'], key, fce.file_signature(raw_path)) for v in views}
         steps = len(views) + 1
+
+        def focus_of(view_events, pnn, n_combos):
+            if phenotype is None:
+                return fcg.focus_mask(fa.event_combo_ids(view_events, pnn)[0], highlight, n_combos)
+            import flowcode_phenotype as fp
+            resolved, model, records = phenotype
+            return fp.population_mask(view_events, pnn, resolved, model, records)
 
         def work(progress):
             events = {}
@@ -283,18 +328,18 @@ class GatingSection(QWidget):
             pnn = inputs[view]['pnn']
             n_combos = len(fa.combo_names_in_file(pnn))
             data = fcg.plot_data(events[view], pnn, key, snapshot, plots, fluorescence)
-            focus = fcg.focus_mask(fa.event_combo_ids(events[view], pnn)[0], highlight, n_combos)
+            focus = focus_of(events[view], pnn, n_combos)
             reference = None
             if view != fcg.VIEW_UNCORRECTED:
                 other = events.pop(fcg.VIEW_UNCORRECTED)
                 reference = snapshot.memberships(key, other, pnn)
-                focus = focus | fcg.focus_mask(fa.event_combo_ids(other, pnn)[0], highlight, n_combos)
+                focus = focus | focus_of(other, pnn, n_combos)
                 del other
             rows = fcg.gate_rows(data, reference, focus)
             overlay = fcg.highlight_overlay(data, focus)
             progress(steps, steps, '')
             return {'key': key, 'view': view, 'highlight': highlight, 'data': data, 'rows': rows,
-                    'overlay': overlay}
+                    'overlay': overlay, 'n_focus': int(focus.sum())}
 
         if plugin._start_task(TASK, work):
             self._token = token
@@ -313,7 +358,9 @@ class GatingSection(QWidget):
         self._fill_table(result['rows'])
         self._draw(result['data'], result['overlay'])
         n_plots = len(result['data']['plots'])
-        self.status.setText(f"{self.page._name(result['key'])}, {fcg.VIEWS[result['view']]}: {n_plots} plot(s)."
+        highlighted = result.get('n_focus')
+        self.status.setText(f"{self.page._name(result['key'])}, {fcg.VIEWS[result['view']]}: {n_plots} plot(s)"
+                            + (f"; {highlighted:,} highlighted events" if highlighted else '') + '.'
                             + ('' if n_plots else ' The experiment has no Unmixed Data plots on these channels.'))
         if self._pending:
             QTimer.singleShot(0, self.start)
@@ -335,7 +382,8 @@ class GatingSection(QWidget):
         self.table.setRowCount(len(rows))
         for r, g in enumerate(rows):
             values = (g['name'], 'all events' if g['parent'] == 'root' else g['parent'],
-                      f"{g['percent']:.2f}", f"{g['n_in']:,}", '' if g['changed'] is None else f"{g['changed']:,}")
+                      f"{g['percent']:.2f}", f"{g['n_in']:,}", '' if g.get('n_focus') is None else f"{g['n_focus']:,}",
+                      '' if g['changed'] is None else f"{g['changed']:,}")
             for c, v in enumerate(values):
                 item = QTableWidgetItem(str(v))
                 item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)

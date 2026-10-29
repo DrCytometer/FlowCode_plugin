@@ -1,6 +1,6 @@
 # FlowCode plugin for Honeychrome
 
-FlowCode debarcoding with FRET and spillover correction for spectral flow cytometry. The plugin is a Honeychrome tab (`FlowCode`) and a Python port of the FlowCodeUnmix 0.6.1 AF-matched staged pipeline, extended with a through-origin error model, a too-few-tag rescue and a tandem-breakdown check.
+FlowCode debarcoding with FRET and spillover correction for spectral flow cytometry. The plugin is a Honeychrome tab (`FlowCode`) and a Python port of the FlowCodeUnmix 0.6.0 AF-matched staged pipeline, extended with a through-origin error model, a too-few-tag rescue and a tandem-breakdown check.
 
 Contents
 
@@ -45,7 +45,9 @@ The plugin reuses Honeychrome's AutoSpectral machinery: AF profiles from AutoSpe
 | `flowcode_export.py` | Reading, FlowCode unmixing and writing of whole samples: the export and the Analysis page's live unmix |
 | `flowcode_analysis.py`, `flowcode_stats.py` | Analysis page numerics, no Qt |
 | `flowcode_analysis_page.py` | Section 6 (Analysis) |
-| `flowcode_rescue_assess.py` | Optional standalone script that assesses the too-few rescue. Not loaded by the plugin and not copied by the installer |
+| `flowcode_gating.py`, `flowcode_gating_view.py` | Section 6's Gating tab: the experiment's gates over FlowCode-unmixed events (numerics and figure, no Qt; the tab) |
+| `flowcode_phenotype.py`, `flowcode_phenotypes.csv` | Phenotype populations for the Analysis page: marker definitions scored on the live-unmixed events, no Qt; the plugin's own definitions |
+| `flowcode_rescue_assess.py` | Optional standalone script that assesses the too-few rescue. Not loaded by the plugin |
 
 ---
 
@@ -53,7 +55,7 @@ The plugin reuses Honeychrome's AutoSpectral machinery: AF profiles from AutoSpe
 
 ### 2.1 Requirements
 
-- Honeychrome run from Python 3.12, from a source clone of the `autospectral` branch of [Cytkit/honeychrome](https://github.com/Cytkit/honeychrome). The installer in 2.2 sets this up. The plugin needs the AutoSpectral tab's unmixing method (`controller_components/unmix_method.py`); with an older Honeychrome, including the PyPI package, the tab shows a message instead. The plugin system is not available in the packaged executables.
+- Honeychrome run from Python (the PyPI package or a source clone, Python 3.12 or higher), in a version with the AutoSpectral tab's unmixing method (`controller_components/unmix_method.py`). With an older Honeychrome the tab shows a message instead. The plugin system is not available in the packaged executables.
 - No packages beyond Honeychrome's own requirements (numpy, scipy, scikit-learn, matplotlib, pyqtgraph, flowkit, flowio).
 - In the experiment, before opening the FlowCode tab:
   - The unmixing matrix is calculated (Spectral Process tab). The tab shows a disabled message until it is.
@@ -65,40 +67,16 @@ The order of work (shown, with buttons that open each AutoSpectral page, in the 
 1. **AF profiles** (AutoSpectral › Autofluorescence): extract them for the matched unstained and assign every sample to export.
 2. **Noise model** (AutoSpectral › Noise, recommended): *Model Noise*, then *Use noise model*. It is fitted on the controls only. Model it before section 3 if debarcoding is to use it.
 3. **FlowCode sections 1 to 4.**
-4. **Spectral corrections** (AutoSpectral › Spectral Correction, optional): *Fix Unmix* with the tag fluorophores in its *Fluorophores kept fixed* list (the button fills the list in). Fix My Unmix reads the raw FlowCode samples, where FRET is still uncorrected; with the tag rows free it would absorb FRET into the tag spectra and the FlowCode correction would remove the same error a second time. If you have performed the single-stained controls per the flow protocol, this step should not be necessary.
+4. **Spectral corrections** (AutoSpectral › Spectral Correction, optional): *Fix Unmix* with the tag fluorophores in its *Fluorophores kept fixed* list (the button fills the list in). Fix My Unmix reads the raw FlowCode samples, where FRET is still uncorrected; with the tag rows free it would absorb FRET into the tag spectra and the FlowCode correction would remove the same error a second time.
 5. **Section 5 export**, or **section 6** directly: it can unmix live without exporting.
 
-The compiled kernels make the noise model and spectral variants fast. The installer builds them and checks that they load; in a manual install, build them with `bundled_plugins/build_som_kernel.py`, `build_autospectral_opt_kernel.py` and `build_fix_my_unmix_kernel.py`. Without them the noise model runs in NumPy and the export asks you to confirm an estimated run time first. The Spectral Variants page's positivity thresholds, when computed, are the too-many rescue's noise floor; otherwise it is the 99.5th percentile of the matched unstained.
+Optional: the compiled kernels (`bundled_plugins/build_autospectral_opt_kernel.py`) make the noise model and spectral variants fast; without them the noise model runs in NumPy and the export asks you to confirm an estimated run time first. The Spectral Variants page's positivity thresholds, when computed, are the too-many rescue's noise floor; otherwise it is the 99.5th percentile of the matched unstained.
 
-### 2.2 Install and update
+### 2.2 Install the plugin files
 
-One command installs Honeychrome (`autospectral` branch), the compiled kernels and this plugin, and the same command updates them. Step-by-step instructions for people new to the Terminal, troubleshooting and the list of what goes where are in [INSTALL_GUIDE.md](INSTALL_GUIDE.md). An administrator account is needed the first time.
+Honeychrome looks for plugins in `Experiments/plugins` in the user's home folder (`~/Experiments/plugins`). It creates the folder on first launch.
 
-- **Mac** (Terminal):
-
-  ```bash
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install/install_honeychrome.sh)"
-  ```
-
-- **Windows 10/11, x64** (PowerShell):
-
-  ```powershell
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install/install_honeychrome.ps1 | iex"
-  ```
-
-The installer puts everything in `~/Honeychrome`, copies the plugin files into `~/Experiments/plugins`, and adds **Honeychrome** and **Update Honeychrome** icons to the Desktop. It logs to `~/Honeychrome/install.log`.
-
-1. Start Honeychrome with the **Honeychrome** icon. Keep its Terminal or console window open while you work.
-2. First time only: open **Application Configuration**. Each file in `~/Experiments/plugins` that ends in `_tab.py` appears as a row, "Tabbed plugin", with the checkbox **Enable FlowCode** (the name comes from `plugin_name` in the file). Tick it and accept. Honeychrome reloads the experiment and a **FlowCode** tab appears.
-3. To update: quit Honeychrome, double-click **Update Honeychrome**, wait for **Done.**, then start Honeychrome again. If the icon is missing, run the install command again.
-
-If the tab does not appear, check `~/Experiments/honeychrome.log`. A missing companion file, or a Python package that is not installed, shows up there as an import error.
-
-### 2.3 Manual installation into an existing Honeychrome source clone
-
-For developers who already run Honeychrome from a source clone of the `autospectral` branch. Honeychrome looks for plugins in `Experiments/plugins` in the user's home folder (`~/Experiments/plugins`). It creates the folder on first launch.
-
-1. Copy these nine files into `~/Experiments/plugins/`, keeping them in the same folder:
+1. Copy these fifteen files into `~/Experiments/plugins/`, keeping them in the same folder:
 
    ```
    flowcode_unmix_tab.py
@@ -110,24 +88,30 @@ For developers who already run Honeychrome from a source clone of the `autospect
    flowcode_analysis.py
    flowcode_stats.py
    flowcode_analysis_page.py
+   flowcode_figure_panel.py
+   flowcode_fix_unmix.py
+   flowcode_gating.py
+   flowcode_gating_view.py
+   flowcode_phenotype.py
+   flowcode_phenotypes.csv
    ```
 
-   Only `*_tab.py` files are discovered. The tab puts its own folder on `sys.path` and imports the others, so all nine must sit side by side. Copy files, not symlinks.
+   Only `*_tab.py` files are discovered. The tab puts its own folder on `sys.path` and imports the others, so all fifteen must sit side by side. Copy files, not symlinks. `flowcode_rescue_assess.py` is optional and can stay out of the plugins folder.
 
-2. Start Honeychrome from your Python environment, in the clone's folder:
+2. Start Honeychrome from your Python environment:
 
    ```bash
    source .venv/bin/activate      # Windows: .venv\Scripts\activate
-   python -m honeychrome.main     # after "pip install -e ."
+   honeychrome                    # PyPI install, or from a source clone after "pip install -e ."
    ```
 
-3. Enable the plugin in **Application Configuration** as in 2.2.
+3. Enable the plugin. Open **Application Configuration**. Each file in `~/Experiments/plugins` that ends in `_tab.py` appears as a row, "Tabbed plugin", with the checkbox **Enable FlowCode** (the name comes from `plugin_name` in the file). Tick it and accept. Honeychrome reloads the experiment and a **FlowCode** tab appears.
 
 4. After updating any of the plugin files later, copy the new versions over the old ones and restart Honeychrome (or untick and re-tick the plugin) so the modules are re-imported.
 
-Do not mix the two methods: the installer overwrites the plugin files in `~/Experiments/plugins` on every run.
+If the tab does not appear, check `~/Experiments/honeychrome.log`. A missing companion file, or a Python package that is not installed, shows up there as an import error.
 
-### 2.4 Optional: the AF library and fluorophore database
+### 2.3 Optional: the AF library and fluorophore database
 
 - Tag fluorophores must be in the experiment's fluorophore profiles (`process['profiles']`).
 - The tandem check reads a `tandem.parent` column in `src/honeychrome/data/fluorophore_database.csv` (for example, PE-Cy7 → PE). Tags whose fluorophore class is "Protein tandem" with a parent listed are ticked for the check automatically.
@@ -136,13 +120,13 @@ Do not mix the two methods: the installer overwrites the plugin files in `~/Expe
 
 ## 3. Using it in the app
 
-Open the **FlowCode** tab. The six sections are listed down the left side; the main window's sample list is hidden while the tab is open. Each has a help toggle at the top and a status line: `Done`, `Needs re-run: <reason>` or `Waiting for section N`. Sections 3 to 6 split into a row of tabs (e.g. Combo frequencies, Assess correction); the open tab is remembered. Figures have a **Size** slider, **⤢ Pop Out** (a resizable window with the matplotlib toolbar) and **Export Graphic**. Work through them in order.
+Open the **FlowCode** tab. The six sections are listed down the left side; the main window's sample list is hidden while the tab is open. Each has a help toggle at the top and a status line: `Done`, `Needs re-run: <reason>` or `Waiting for section N`. Sections 3 to 6 split into a row of tabs (e.g. Combo frequencies, Assess correction); the open tab is remembered. In sections 4 and 5 the whole page scrolls: scroll past the controls at the top and the tabs fill the window. Every Advanced settings tab, and the Statistics, inclusion-rule and figure options of section 6, have a **Restore defaults** button (greyed when everything is at its default). Figures have a **Size** slider, **⤢ Pop Out** (a resizable window with the matplotlib toolbar) and **Export Graphic**. Work through them in order.
 
 ### Section 1: Inputs
 
 - **Backbone.** Tick the samples whose cells carry the FlowCode combinations, typically pools of transduced cells. Several samples can be ticked and their events are pooled (at most 2,000,000 events per file). Every combination needs enough bright, barcoded events to be characterised: aim for at least 50 events per combination with every tag at least 3 times its threshold. Samples with "backbone" or "FRET" in the name are ticked at first. Single-stain controls and unstained samples are not listed.
 - **Matched unstained.** The unstained sample whose FSC/SSC distribution is closest to the pooled backbone, scored by the Bhattacharyya coefficient of the scatter histograms (1 = identical). Click a row to choose a different one, or **Match again** to recompute.
-- **AF library for debarcoding.** The AF profiles extracted from the chosen unstained sample in AutoSpectral › Autofluorescence. If none exist, the section shows how to extract one and stays incomplete.
+- **AF library for debarcoding.** The AF profiles extracted from the chosen unstained sample in the AutoSpectral AF tab. If none exist, the section shows how to extract one and stays incomplete.
 - **Combinations CSV** (optional). A FlowCodeUnmix file with an `Id` column and three tag columns. Without it, every 3-tag combination of the ticked tags is used.
 - **No FRET backbone: skip FRET correction (results invalid)**. For samples acquired before FRET backbone controls were run, to test the pipeline. Ticking it asks you to acknowledge, in a pop-up, that the downstream results are untrustworthy (the time is saved with the experiment). The Backbone box becomes *Samples for gates and thresholds*: the ticked barcoded samples set the FlowCode gates, the thresholds and the rescue references, and no FRET error is fitted on them (stained samples would put their marker signal into the error). See [No FRET backbone](#no-fret-backbone) below.
 
@@ -191,19 +175,24 @@ With *No FRET backbone* ticked in section 1:
 
 ### Section 5: Unmix & Export
 
-- **Samples.** All samples except unstained and single-stain controls are listed and ticked (tick **Include single-stain controls and unstained samples** to list those too). The backbone is included. Samples whose AF library has fewer than 2 spectra are greyed out. A warning appears for selected samples that lack the AF profiles the thresholds were set with; those profiles are added to the sample's library for the export only (the experiment's assignments are not changed).
+- **Samples.** All samples except unstained and single-stain controls are listed and ticked (tick **Include single-stain controls and unstained samples** to list those too). The backbone is included. Samples whose AF library has fewer than 2 spectra are greyed out. **Group** lists the folders of the listed samples (as in the sample browser, with the number of samples); **Select group** and **Deselect group** tick or untick that folder's samples and keep the rest of the selection. A warning appears for selected samples that lack the AF profiles the thresholds were set with; those profiles are added to the sample's library for the export only (the experiment's assignments are not changed).
 - **Output.** Default folder `<experiment>/FlowCode Unmixed`; sub-folders mirror the raw folder.
 - **Final unmix** (the line at the top): the experiment's method from the AutoSpectral tab, with the spectral corrections of each sample's group when they are in use. It is set there, not here; a change makes section 5 stale. A red note appears when Fix My Unmix has corrected a tag fluorophore.
 - **Advanced settings.** The tag shift minimum, the correction mode (`combo`, `pairwise`, `none`) and the regressor.
 - **Tandem tags.** Tick the tags on tandem fluorophores to check for sample-specific breakdown (5.7).
+- **Combination calibration.** *Calibrate each combination's correction per sample (out-of-span)*, on by default, rescales each combination's error model by what the sample itself shows (5.8). *Brightness-dependent calibration* (off by default) lets the scale change with tag brightness. The z threshold (3), minimum out-of-span share (0.05) and minimum singlet events per combination (40) are here too. It applies only with the `combo` correction and FRET correction. After an export the result line lists, per sample, the combinations calibrated out of those identifiable, the five largest changes and the combinations that could not be calibrated.
 
 Press **Unmix and export**. With a slow method (spectral variants, or the noise model without its compiled kernel) a probe estimates the run time and asks you to confirm before starting; it is rough, and the real time can differ by a factor of 2 or more. When Honeychrome runs one heavy job at a time, the export is refused, with the running job named, while another one holds the application.
 
 ### Section 6: Analysis
 
+**Gating** (first tab, view only): the experiment's Unmixed Data plots and gates, drawn with Honeychrome's own plot widget, over the FlowCode-unmixed events of the sample picked in the main window's sample browser (shown on this tab only). Choose the view (*Uncorrected*: the experiment's own unmix of the raw file through the same plan; *FlowCode standard*; *FlowCode calibrated*: with the per-sample combination calibration) and what to highlight in red (barcoded events, nothing, or one combination). The table gives each gate's % of its parent, its events and the highlighted events changing side against the uncorrected view, which is unmixed as well for that comparison. Membership is the counts' own (`SampleGating.memberships`, sample overrides included), and the view the counts use reads their live-unmix cache; the other views are cached too. Plots, axes and gates cannot be changed here: edit them in the main window.
+
 **Source**: *Live unmix* (default) FlowCode-unmixes each sample's raw file with the current characterisation and the experiment's method, exactly as section 5 would export it, without writing files; the unmixed values are cached in `cache/flowcode_unmixed` (pruned with the App Settings' unmixing cache size), so changing the population later does not unmix again. *Exported files* reads the files section 5 wrote. Counts from the two sources are identical for the same inputs. Saved counts say which source they came from and are marked out of date when the samples, the unmixing, the population or the gating change.
 
 **Populations**: tick one or more gates of the unmixed gating tree; each ticked gate is counted as a population of its own, in one pass over the samples (e.g. CD8 and Tconv, or Naive, Activated and Resident). Counting also sums each combination's marker intensities (every fluorophore of the spectral model except the FlowCode tags, on the experiment's display scale) into `cache/flowcode_analysis/marker_sums.npz` for the marker test.
+
+**Phenotypes**: populations without a gate, listed under the gating tree. A phenotype is a marker definition (`CD4 Treg`: CD3+ CD4+ FoxP3+ CD8- CD19-) from the plugin's `flowcode_phenotypes.csv` (same columns as Honeycluster's `drc_cell_type_database.csv`, whose rows are listed too; a plugin row hides a bundled row with the same cell type and species). Each definition is resolved against the antigens typed into the spectral model through the marker database's synonyms: a positive marker the panel lacks, or a marker on two fluorophores, leaves it unresolved (greyed, with the reason in its tooltip); a negative marker the panel lacks is left unchecked and said so; the panel's viability dye is added as a negative marker when there is one. Ticked, a phenotype is counted as a population of its own from the live unmix: every event inside the FlowCode Singlets and Cells gates gets, per listed marker, the probability of being positive, a logistic soft threshold in units of the sample's negative SD (the AF library's envelope null variance at the event's AF abundance plus the spillover spread at its abundances, as the AF assignment uses them; one half at 3 SD, 0.12 at 2 SD, 0.88 at 4 SD), and its membership is the product of those probabilities (positives) and their complements (negatives). The counts per combination are the memberships summed, so `in population`, `barcoded` and the counts are fractional; the marker sums are membership-weighted. The probability says "above the negative" only (no high/intermediate levels), scatter has no probability (the FlowCode gates do that), and the markers are taken as independent. Phenotypes need *Live unmix* (exported files carry no negative model), and counts that include one run the Frequencies and Markers tests only: the Counts test needs whole events and is withheld with a note. The resolution of each counted phenotype is written to `settings.txt`. Definitions can be added by editing `flowcode_phenotypes.csv` (canonical marker names, or any synonym the marker database knows).
 
 **Groups**: a table of groups with a sample-name pattern (regular expression, case-insensitive) and a colour each. *Assign by pattern* gives every listed sample the first group whose pattern matches its name. Double-click a colour to change it; group colours are saved with the experiment and used in every figure (volcano direction ramps, heatmap group bars, fold-change bars, PCA, QC, combination plots).
 
@@ -211,7 +200,9 @@ Press **Unmix and export**. With a slow method (spectral variants, or the noise 
 
 **Expanded clones**: the lab R rule. Within each non-reference group, a combination is a clone in a sample when its % of barcoded events exceeds the median + SD of that combination's % over the group's samples in which it was seen, with more than 200 events and 10 %. It is removed for that mouse in every tissue unless it is expanded in more than two mice of that group.
 
-**Markers**: for every combination and marker, the mean intensity of the combination's cells minus a reference in the same sample. The default reference is the *tag model*: per sample and marker, the combinations' means are fitted on their tags (one additive term per tag, weighted by cells, Huber-robust), and each combination is compared with what the other combinations predict for its own tags. A tag fluorophore's spillover into a marker, shared by every combination carrying the tag, is then not taken for an effect (against tag-unbalanced controls it shows as blocks of hits). The control combinations, or every other barcoded cell, can be chosen instead. *Leave out features with high tag spillover* (on by default, limit 0.03 display units): the spillover spread of each combination's tags into each marker at their median brightness, from the reference spectra, the characterisation and the noise model, converted to the display scale at the sample's level of the marker; above the limit the feature is not tested (hatched in the heatmap, listed with its spillover in the table). Each group's (and population's) differences are tested against zero with a moderated t, one value per sample, and combinations are families for the cluster-first FDR. A combination or reference with fewer than the minimum events in a sample has no value there; expanded clones removed from the counts are left out too. The *Markers* menu in Results picks the group whose heatmap (combinations × markers, coloured where significant), volcano and table are shown; it is independent of the *Comparison* menu. Double-click a marker volcano point or a table row for the *Marker* tab: every sample's reference and combination means joined by a line, one column per group, a mouse's samples linked across groups. The export writes `markers.csv` and every group's figures.
+**Markers**: for every combination and marker, the mean intensity of the combination's cells minus a reference in the same sample. The default reference is the *tag model*: per sample and marker, the combinations' means are fitted on their tags (one additive term per tag, weighted by cells, Huber-robust), and each combination is compared with what the other combinations predict for its own tags. A tag fluorophore's spillover into a marker, shared by every combination carrying the tag, is then not taken for an effect (against tag-unbalanced controls it shows as blocks of hits). The control combinations, or every other barcoded cell, can be chosen instead. *Account for tag spillover* (on by default): the spillover spread of each combination's tags into each marker at their median brightness, from the reference spectra, the characterisation and the noise model, converted to the display scale at the sample's level of the marker, is added to the feature's standard error, SE_total² = SE_moderated² + (k × spillover)², and t, the p-value (TREAT included) and the confidence interval come from SE_total. Every feature stays tested. With *Auto (NON-Targetting)* (default) k is, per population, the smallest value from 0 to 4 in steps of 0.25 at which the control combinations have no significant marker hits; untick it to set k. The value used is shown under the setting and in `settings.txt`. Features whose uncertainty is mostly spillover (k × spillover above the moderated SE) are hatched in the heatmap; the table and `markers.csv` give the spillover, k and both standard errors. Each group's (and population's) differences are tested against zero with a moderated t, one value per sample, and combinations are families for the cluster-first FDR. A combination or reference with fewer than the minimum events in a sample has no value there; expanded clones removed from the counts are left out too. The *Markers* menu in Results picks the group whose heatmap (combinations × markers, coloured where significant), volcano and table are shown; it is independent of the *Comparison* menu. Double-click a marker volcano point or a table row for the *Marker* tab: every sample's reference and combination means joined by a line, one column per group, a mouse's samples linked across groups. The export writes `markers.csv` and every group's figures.
+
+**Saved results**: each statistics run is saved as soon as it finishes, in `cache/flowcode_analysis/stats/` (`data.json` and one CSV per table), and shown again when the experiment is reopened, with the current FDR, |log2FC| and |Δ| thresholds, TREAT, FDR correction and spillover k applied. If the counts or any other Analysis setting (groups, design, tests, normalisation, clone removal, markers, inclusion rules, library setup) has changed since the run, the results are still shown, with an orange *Out of date* note on the Statistics and Results tabs, and the analysis cannot be exported until statistics are run again. Changing a setting during a session clears the results from view, as before; the saved run stays until the next one replaces it.
 
 **Results**: double-click a combination in the results table, a volcano or the fold-change bars to plot it in every sample (*Combination* tab: a column per group, a line per mouse, expanded clones hollow); right-click for *Open in a window*. Changing the comparison redraws only that comparison's figures.
 
@@ -230,8 +221,9 @@ Per exported sample: `<sample> FlowCode (Unmixed).fcs`, uncompensated, with
 
 In the output folder:
 
-- `FlowCode_debarcode_summary.csv`: per sample, total events, untransduced, unresolved, rescued (too many), rescued (too few), pairwise corrected, one count column per combination, and three columns (beta, z, at median) per ticked tandem tag.
-- `FlowCode_run.json`: backbone, thresholds, settings, AF profiles per sample, tandem records.
+- `FlowCode_debarcode_summary.csv`: per sample, total events, untransduced, unresolved, rescued (too many), rescued (too few), pairwise corrected, one count column per combination, three columns (beta, z, at median) per ticked tandem tag and, with the calibration, *Calibrated combos* (calibrated / identifiable).
+- `FlowCode_run.json`: backbone, thresholds, settings (the calibration settings included), `calibration` (`on`, `brightness` or `off`), AF profiles per sample, tandem records, and per sample `combo_scales`: for each identifiable combination `s`, `slope`, `se`, `z`, `weight`, `applied`, `share`, `n`, plus the combinations `not_identifiable` and with `too_few` events, and the detector `weighting`.
+- The FCS keyword `FLOWCODECALIBRATION` (`on`, `brightness` or `off`).
 
 ---
 
@@ -333,7 +325,7 @@ Diagnostics per combination (the fit table): `kappa` (condition number of the re
 
 ### 5.5 Applying the correction
 
-For each block of events in an exported sample, `unmix_staged` runs:
+Each sample is debarcoded once, as a whole, before it is unmixed (steps 1–3, in blocks of 2,000,000 events for the unmixing). The rescues therefore take their per-tag shift (from the events inside the FlowCode gates) and their too-few references from the whole sample, which matters where barcoded events are sparse. The calibration (5.8), the tandem estimate (5.7) and every block of the final unmix reuse this debarcoding. Then, for each block of events, `unmix_staged` runs steps 4–8:
 
 1. Per-cell AF unmixing with the sample's own AF library gives the debarcoding space.
 2. Debarcode with the backbone thresholds, then both rescues (against the backbone's combination medians and untransduced background).
@@ -342,9 +334,10 @@ For each block of events in an exported sample, `unmix_staged` runs:
    - barcoded events of a combination with its own model: `raw_corrected = raw − x(a − a0) · E_g`;
    - every other event: `raw_corrected = raw − PairModel(a − a0, active tags)`, where the active tags are the combination's tags for a barcoded event and the above-threshold tags otherwise;
    - the `none` setting leaves raw unchanged, and `pairwise` uses the pairwise model for every event.
-5. Optionally subtract the tandem breakdown (5.7).
-6. Final unmix of the corrected raw with the sample's AF library, by the experiment's method.
-7. `FlowCode` and `FC <name>` channels: median of the final abundances of the event's three tags.
+5. Rescale each calibrated combination's error by the sample's own scale (5.8).
+6. Optionally subtract the tandem breakdown (5.7), estimated on the calibrated correction.
+7. Final unmix of the corrected raw with the sample's AF library, by the experiment's method.
+8. `FlowCode` and `FC <name>` channels: median of the final abundances of the event's three tags.
 
 The correction is applied in raw (detector) space, before the final unmix, so AF assignment and variant selection see the corrected spectrum.
 
@@ -367,7 +360,23 @@ The check uses the barcodes as an internal control. For each ticked tag and samp
 
 At least 5 combinations with and 5 without the tag are required. The backbone statistic is computed in section 4; the per-sample estimate is made once per sample, on at most 2,000,000 gated events, at the start of its export.
 
-### 5.8 Guards
+### 5.8 Per-sample combination calibration
+
+The backbone's error model of a combination need not hold in a sample. On JA_007, in vivo T cells carry less error per unit tag than the backbone for some combinations, so their bright cells are over-corrected and pushed out of CD3. Marker biology and AF can move an event only within the span of the reference spectra and the AF directions; the part of a combination's error outside that span shows only as unmixing residual, so it can be measured in each sample without confusion with biology.
+
+For each sample, at the start of its export (or live unmix), on its FlowCode singlets (at most the tandem's event limit):
+
+1. Detectors are whitened with weights 1 / V(the sample's median raw signal) from the experiment's noise model when it unmixes with M2pg; otherwise 1 / the median raw signal (Poisson-like, floored at 1 % of the largest detector median; recorded as `poisson`).
+2. The span is the reference spectra, the sample's AF library mean and its top 3 principal directions. P projects onto its complement. (The whole AF library would span every detector.)
+3. y = P(raw) − the median P(raw) of the untransduced singlets.
+4. For each combination with its own error model and at least 40 singlet events: x its `combo_features`, e = x · P(E_g). The out-of-span share is Σ‖e‖² / Σ‖x · W · E_g‖²; below 0.05 the combination is *not identifiable* and keeps the backbone's model.
+5. s = Σ⟨y, e⟩ / Σ‖e‖², its SE from 100 bootstrap resamples (seeded by the sample), z = (s − 1) / SE, weight `max(0, 1 − (z_min / z)²)` and the applied scale clip(1 + weight · (s − 1), 0, 1.5).
+6. With the brightness option, s0 + s1 · u (u the log on-tag fold sum minus its median in the combination), z the bootstrap Mahalanobis distance of (s0 − 1, s1), and the per-event scale clipped to [0, 1.5].
+7. `(1 − s) · x · E_g` is added back to every event of the combination (all events, not only singlets). Pairwise-model events are unchanged.
+
+The backbone defines scale 1: its error model is its own, so its scales are 1. Scales are not borrowed across combinations (the over-correction is specific to each combination, not to its tags), so a combination whose error lies inside the span (C_FLAG_HA) stays as the backbone model has it. The calibration is not part of the characterisation and does not apply to section 4's figures.
+
+### 5.9 Guards
 
 | Change | Effect |
 |---|---|
@@ -384,10 +393,10 @@ At least 5 combinations with and 5 without the tag are required. The backbone st
 
 ## 6. Differences from the R package
 
-- AF libraries come from AutoSpectral › Autofluorescence (extracted on the whole unstained file), not from `get.af.spectra()` on the FlowCode-gated unstained. `AF.Mean` is still taken from the gated unstained.
+- AF libraries come from the AutoSpectral AF tab (extracted on the whole unstained file), not from `get.af.spectra()` on the FlowCode-gated unstained. `AF.Mean` is still taken from the gated unstained.
 - Only the FSC-A/FSC-H singlet pass is applied; the SSC-A/SSC-H pass is not.
 - The landmark gate uses scikit-learn's FastMCD, not `MASS::cov.rob("mcd")`.
 - The rescue transform is a fixed Honeychrome logicle, not AutoSpectral's cytometer-specific biexponential.
 - The error model is a through-origin fit with pair products measured from the untransduced median, with a shared pairwise fallback. It replaces R's centred per-combination fit and global error.
 - The too-few-tag rescue, the export AF library (assigned profiles plus the profiles the thresholds were set with) and the tandem-breakdown check have no R counterpart.
-- Per-sample threshold overrides are not available (and should not be necessary).
+- Per-sample threshold overrides are not available.

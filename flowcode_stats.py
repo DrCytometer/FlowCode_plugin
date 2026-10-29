@@ -1813,6 +1813,73 @@ def _bundled_plugins_on_path():
 
 
 # ---------------------------------------------------------------------------
+# Saved statistics
+# ---------------------------------------------------------------------------
+
+STATS_FORMAT_VERSION = 1
+_SERIES_TAG = '__series__'
+
+
+def stats_path(experiment_dir) -> Path:
+    """Folder of the last statistics run (a Honeycluster bundle: data.json
+    plus one CSV per table), in the experiment's cache."""
+    return Path(experiment_dir) / 'cache' / 'flowcode_analysis' / 'stats'
+
+
+def _storable(obj):
+    """*obj* with every pandas Series as a one-column table, which the
+    bundle format stores."""
+    if isinstance(obj, pd.Series):
+        return {_SERIES_TAG: obj.to_frame(name='values'), 'name': obj.name}
+    if isinstance(obj, dict):
+        return {k: _storable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_storable(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_storable(v) for v in obj)
+    return obj
+
+
+def _restored(obj):
+    """The inverse of ``_storable``."""
+    if isinstance(obj, dict):
+        if set(obj) == {_SERIES_TAG, 'name'}:
+            series = obj[_SERIES_TAG]['values']
+            series.name = obj['name']
+            return series
+        return {k: _restored(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_restored(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_restored(v) for v in obj)
+    return obj
+
+
+def save_stats(path, stats: dict, inputs: str, when: datetime | None = None):
+    """Write a statistics run (``run_statistics`` with its marker results)
+    to the bundle at *path*, with *inputs*, the digest of the counts and
+    settings it was run on."""
+    _bundled_plugins_on_path()
+    import drc_persist
+
+    when = when or datetime.now()
+    drc_persist.save_bundle(Path(path), {'format_version': STATS_FORMAT_VERSION, 'inputs': inputs,
+                                         'saved': when.isoformat(timespec='seconds'), 'stats': _storable(stats)})
+
+
+def load_stats(path) -> tuple | None:
+    """(stats, inputs digest, time saved as ISO text) of the run saved at
+    *path*, or None when there is none or it is of another format."""
+    _bundled_plugins_on_path()
+    import drc_persist
+
+    payload = drc_persist.load_bundle(Path(path))
+    if not payload or payload.get('format_version') != STATS_FORMAT_VERSION:
+        return None
+    return _restored(payload['stats']), payload.get('inputs'), payload.get('saved')
+
+
+# ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
 

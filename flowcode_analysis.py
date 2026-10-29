@@ -27,6 +27,14 @@ For every sample it
    (each ticked gate on its own), and sums each combination's marker
    intensities on the display scale for the marker test.
 
+A population can also be a phenotype (``flowcode_phenotype``): a marker
+definition scored on the live-unmixed events inside the FlowCode gates,
+where each event has a membership between 0 and 1 and the counts are the
+memberships summed (soft counts), so ``events``, ``in_population`` and
+``barcoded`` can be fractional and the count tables hold floats. Phenotype
+populations need the live unmix, whose AF library gives the negative model;
+exported files carry no such model.
+
 ``live_links`` lists the raw files the live unmix can use,
 ``link_exports`` matches exported files to samples, ``SampleGating`` (taken on the
 main thread with ``SampleGating.from_controller``) holds the gates and gates
@@ -93,6 +101,8 @@ ANALYSIS_DEFAULTS = {
     'source': SOURCE_LIVE,
     'folder': None,
     'gates': [],
+    'phenotypes': [],
+    'congenic_split': False,
     'exclude_combos': [],
     'min_combo_events': DEFAULT_MIN_COMBO_EVENTS,
     'min_sample_events': DEFAULT_MIN_SAMPLE_EVENTS,
@@ -221,16 +231,21 @@ def file_signature(path) -> list:
         return [str(path)]
 
 
-def counts_signature(files: dict, gate_names: list, gating_signature: str, unmixing=None) -> str:
+def counts_signature(files: dict, gate_names: list, gating_signature: str, unmixing=None,
+                     phenotypes: list | None = None) -> str:
     """Identifies a set of counts: the files ({sample: path}) as they are on
-    disk, the chosen gates and the gating they were counted with, and for a
-    live unmix everything that decides the unmixed values (*unmixing*)."""
+    disk, the chosen gates and the gating they were counted with, for a
+    live unmix everything that decides the unmixed values (*unmixing*), and
+    the phenotype populations as resolved and scored (*phenotypes*, their
+    ``Resolved.signature_parts()``)."""
     parts = {'files': {k: file_signature(p) for k, p in sorted(files.items())},
              'gates': list(gate_names), 'gating': gating_signature}
     if len(gate_names) > 1:
         parts['populations'] = 'each gate'
     if unmixing is not None:
         parts['unmixing'] = unmixing
+    if phenotypes:
+        parts['phenotypes'] = list(phenotypes)
     return _digest(parts)
 
 
@@ -435,7 +450,8 @@ def count_table(records: dict, combo_order: list | None = None) -> tuple:
     ``(counts, meta)`` from ``{sample key: count_sample() record}``: counts
     is samples × combinations (combinations in *combo_order*, then any
     others in first-seen order; a combination missing from a file counts 0),
-    meta is samples × COUNT_COLUMNS.
+    integers unless a record holds fractional (soft) counts, meta is
+    samples × COUNT_COLUMNS.
     """
     keys = list(records)
     names = list(combo_order or [])
@@ -443,14 +459,24 @@ def count_table(records: dict, combo_order: list | None = None) -> tuple:
         for name in rec['counts']:
             if name not in names:
                 names.append(name)
-    counts = pd.DataFrame(0, index=pd.Index(keys, name='sample'), columns=names, dtype=np.int64)
+    counts = pd.DataFrame(0.0, index=pd.Index(keys, name='sample'), columns=names, dtype=np.float64)
     meta = pd.DataFrame(index=pd.Index(keys, name='sample'), columns=list(COUNT_COLUMNS), dtype=object)
     for key, rec in records.items():
         for name, n in rec['counts'].items():
-            counts.loc[key, name] = int(n)
+            counts.loc[key, name] = float(n)
         for col in COUNT_COLUMNS:
             meta.loc[key, col] = rec.get(col)
+    if np.all(np.mod(counts.values, 1.0) == 0):
+        counts = counts.astype(np.int64)
     return counts, meta
+
+
+def whole_or_float(value, tolerance: float = 1e-6):
+    """An integer when *value* is whole to within *tolerance* (sums of
+    memberships carry rounding residuals), else the float (soft counts)."""
+    value = float(value)
+    nearest = round(value)
+    return int(nearest) if abs(value - nearest) <= tolerance else value
 
 
 # ---------------------------------------------------------------------------
@@ -476,24 +502,33 @@ def unit_parts(unit: str, population: str = '') -> tuple:
 
 
 def count_populations(events: np.ndarray, pnn: list, sample_key: str, snapshot: SampleGating,
-                      populations: list, marker_channels=()) -> dict:
+                      populations: list, marker_channels=(), phenotypes: dict | None = None,
+                      gate_records=()) -> dict:
     """
     Gate one sample's FlowCode-unmixed events (columns *pnn*) and count them
     per combination in each population (each gate of *populations* on its
     own; no gate: every event, as population ``ALL_EVENTS``).
 
+    A population named in *phenotypes* (``{name: (Resolved, NegativeModel)}``,
+    ``flowcode_phenotype``) is scored instead of gated: each event inside
+    the FlowCode gates (*gate_records*, raw-unit polygons on the scatter
+    channels; every event without them) weighs its membership, and the
+    record's counts are the memberships summed (soft counts, floats).
+
     Returns ``{population: record}`` with the ``count_events`` fields, plus
     'marker_sums': per combination (file order) and marker channel, the sum
     of the events' intensities on the experiment's display scale for that
-    channel (None without *marker_channels*), and 'marker_channels': the
-    channels summed (those in *pnn* with a fixed transform).
+    channel (None without *marker_channels*; membership-weighted for a
+    phenotype), and 'marker_channels': the channels summed (those in *pnn*
+    with a fixed transform).
     """
     pnn = list(pnn)
     names = combo_names_in_file(pnn)
     if not names:
         raise ValueError(f'{sample_key}: no FlowCode combination channels.')
     pops = list(populations) or [ALL_EVENTS]
-    gates = [p for p in pops if p != ALL_EVENTS]
+    phenotypes = dict(phenotypes or {})
+    gates = [p for p in pops if p != ALL_EVENTS and p not in phenotypes]
     membership = snapshot.memberships(sample_key, events, pnn, gates) if gates else {}
     ids, has_id = event_combo_ids(events, pnn)
     n = len(names)
@@ -505,30 +540,50 @@ def count_populations(events: np.ndarray, pnn: list, sample_key: str, snapshot: 
         values = np.empty((len(events), len(channels)), dtype=np.float64)
         for j, ch in enumerate(channels):
             values[:, j] = snapshot.transforms[ch].xform.apply(events[:, pnn.index(ch)])
+    inside = None
+    if phenotypes:
+        import flowcode_core as fcc
+        inside = fcc.gate_records_mask(events, pnn, list(gate_records)) if gate_records else None
+        if inside is None:
+            inside = np.ones(len(events), dtype=bool)
     out = {}
     for pop in pops:
+        weights = None
         if pop == ALL_EVENTS:
             mask = np.ones(len(events), dtype=bool)
+        elif pop in phenotypes:
+            import flowcode_phenotype as fp
+            resolved, model = phenotypes[pop]
+            weights = fp.score_events(events, pnn, resolved, model)['membership'] * inside
+            mask = weights > 0
         elif pop in membership:
             mask = np.asarray(membership[pop], dtype=bool)
         else:
             raise ValueError(f'Gate "{pop}" could not be applied: it does not exist, or one of its '
                              f'channels (or an ancestor gate\'s) is not in the data.')
         own = ids[mask]
-        per = np.bincount(own, minlength=n + 2)
-        barcoded = int(per[1:n + 1].sum())
+        if weights is None:
+            per = np.bincount(own, minlength=n + 2)
+            in_population = int(mask.sum())
+            number = int
+        else:
+            per = np.bincount(own, weights=weights[mask], minlength=n + 2)
+            in_population = whole_or_float(weights.sum())
+            number = whole_or_float
+        barcoded = number(per[1:n + 1].sum())
         sums = None
         if values is not None:
-            sums = np.stack([np.bincount(own, weights=values[mask, j], minlength=n + 2)[1:n + 1]
+            w = values[mask] if weights is None else values[mask] * weights[mask][:, np.newaxis]
+            sums = np.stack([np.bincount(own, weights=w[:, j], minlength=n + 2)[1:n + 1]
                              for j in range(len(channels))], axis=1)
         out[pop] = {
-            'counts': {name: int(per[i + 1]) for i, name in enumerate(names)},
+            'counts': {name: number(per[i + 1]) for i, name in enumerate(names)},
             'events': int(len(events)),
-            'in_population': int(mask.sum()),
+            'in_population': in_population,
             'barcoded': barcoded,
-            'untransduced': int(per[0]) if has_id else None,
-            'unresolved': int(per[n + 1]) if has_id else None,
-            'not_barcoded': int(mask.sum()) - barcoded,
+            'untransduced': number(per[0]) if has_id else None,
+            'unresolved': number(per[n + 1]) if has_id else None,
+            'not_barcoded': number(in_population - barcoded),
             'marker_sums': sums,
             'marker_channels': channels,
         }
@@ -634,7 +689,7 @@ def library_features(counts: pd.DataFrame, meta: pd.DataFrame, sample_library: d
     out = pd.DataFrame(np.nan, index=pd.Index(keep, name=counts.index.name), columns=features)
     new_meta = meta.loc[keep].copy()
     new_meta['library'] = ''
-    new_meta['out_of_library'] = 0
+    new_meta['out_of_library'] = pd.Series(0, index=new_meta.index, dtype=object)
     for unit in keep:
         lib = sample_library[meta.loc[unit, 'sample']]
         row = counts.loc[unit]
@@ -642,9 +697,9 @@ def library_features(counts: pd.DataFrame, meta: pd.DataFrame, sample_library: d
         for triplet, feature in feature_map[lib].items():
             values[feature] = values.get(feature, 0.0) + (float(row[triplet]) if triplet in row.index else 0.0)
         out.loc[unit, list(values)] = list(values.values())
-        inside = int(sum(values.values()))
+        inside = whole_or_float(sum(values.values()))
         new_meta.loc[unit, 'library'] = lib
-        new_meta.loc[unit, 'out_of_library'] = int(row.sum()) - inside
+        new_meta.loc[unit, 'out_of_library'] = whole_or_float(row.sum() - inside)
         new_meta.loc[unit, 'barcoded'] = inside
     return out, new_meta, left_out
 
@@ -812,7 +867,7 @@ def qc_table(counts: pd.DataFrame, meta: pd.DataFrame, display_names: dict | Non
             'name': (display_names or {}).get(key, Path(str(key)).stem),
             'events': meta.loc[key, 'events'],
             'in_population': pop,
-            'barcoded': int(barcoded),
+            'barcoded': whole_or_float(barcoded),
             'pct_barcoded': 100.0 * barcoded / pop if pop else float('nan'),
             'untransduced': meta.loc[key, 'untransduced'],
             'unresolved': meta.loc[key, 'unresolved'],

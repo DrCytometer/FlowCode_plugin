@@ -77,9 +77,6 @@ import flowcode_export as fce  # noqa: E402
 import flowcode_method as fcm  # noqa: E402
 import flowcode_fix_unmix as fcfu  # noqa: E402
 import flowcode_figure_panel as fcfp  # noqa: E402
-import flowcode_timing  # noqa: E402
-
-flowcode_timing.install()
 
 logger = logging.getLogger(__name__)
 

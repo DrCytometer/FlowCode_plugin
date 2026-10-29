@@ -51,6 +51,8 @@ load it as a tab of its own.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from copy import deepcopy
 from datetime import datetime
@@ -118,6 +120,13 @@ THRESHOLD_KEYS = ('pval_threshold', 'fc_threshold', 'use_treat', 'fdr_scope', 'm
 RULE_DEFAULT_KEYS = ('min_combo_events', 'min_sample_events')
 FIGURE_DEFAULT_KEYS = ('heatmap_order', 'heatmap_rows', 'n_loadings')
 RESTORE_TOOLTIP = 'Put these settings back to their default values.'
+# Settings a statistics run does not depend on: figure options, export
+# folder, group colours and patterns, and the thresholds, which are applied
+# again to saved results.
+STATS_INPUT_EXCLUDED = ('heatmap_order', 'heatmap_rows', 'n_loadings', 'export_root', 'group_colors',
+                        'group_patterns', 'counts') + THRESHOLD_KEYS
+STALE_TEXT = ('Out of date: these saved results were made with other counts or settings. Run statistics again '
+              'to update them.')
 
 
 def _figure_set(key: str) -> str:
@@ -153,7 +162,17 @@ HELP = (
     'different cells than in the main window; the events in the population are listed per sample so this '
     'can be checked. Unstained samples, single-stain controls (also copies of them elsewhere in the raw '
     'folder, matched by file name) and bead samples are left out unless their <i>Include</i> tick box is '
-    'ticked. <b>Select all</b> and <b>Deselect all</b> tick or untick every sample in the table. '
+    'ticked. <b>Phenotypes</b> are populations without a gate: a marker definition (CD3+ CD4+ FoxP3+ CD8-, '
+    'from the plugin\'s <tt>flowcode_phenotypes.csv</tt> or Honeycluster\'s cell-type database) resolved '
+    'against the antigens of the spectral model, where every event inside the FlowCode gates gets a '
+    'membership between 0 and 1 (each marker is a soft threshold at 3 SD of the sample\'s negative, from the '
+    'AF library\'s envelope and the spillover spread) and the counts are memberships summed. A definition '
+    'is unresolved when a positive marker is not in the panel; a negative marker that is not is left '
+    'unchecked, and the viability dye is added when there is one. <i>Split by congenic marker</i> counts each '
+    'ticked phenotype as its CD45.1+ CD45.2- and CD45.1- CD45.2+ variants when the panel carries both. '
+    'Phenotypes need <i>Live unmix</i>, and their fractional counts take the Frequencies test only; the Gating '
+    'tab can highlight a phenotype\'s events (membership at least one half) over the gates. '
+    '<b>Select all</b> and <b>Deselect all</b> tick or untick every sample in the table. '
     '<b>Count events</b> gates every sample and counts its events per combination in each population, '
     'and sums each combination\'s marker intensities for the marker test; the counts are kept with the '
     'experiment and the marker sums in its <tt>cache/flowcode_analysis</tt> folder.</p>'
@@ -215,7 +234,9 @@ HELP = (
     'Highlight the barcoded events or one combination (red); the table gives each gate\'s % of its parent '
     'and how many highlighted events change side against the uncorrected view, which is unmixed too for that '
     'comparison (both are cached). Gates are edited in the main window.</p>'
-    '<p><b>Results.</b> With the marker test, the <i>Markers</i> menu chooses the group whose combination × '
+    '<p><b>Results.</b> Each statistics run is saved when it finishes and shown again when the experiment is '
+    'reopened, with the current thresholds. It is marked <i>Out of date</i> (and cannot be exported) when the counts '
+    'or other settings have changed since; run statistics again to update it. With the marker test, the <i>Markers</i> menu chooses the group whose combination × '
     'marker heatmap, volcano and table are shown (independent of the <i>Comparison</i> menu). Double-click a '
     'marker volcano point or a marker table row to plot that combination and marker in every sample '
     '(<i>Marker</i> tab: each sample\'s reference and combination means joined by a line).</p>'
@@ -302,6 +323,8 @@ class AnalysisPage(QWidget):
         self._auto_groupings_key = None
         self._auto_groupings_undo = None
         self._hierarchy_key = None
+        self._phenotype_key = None
+        self._phenotypes = {}
         self._count_token = None
         self._combination = None
         self._markers_key = ()
@@ -311,6 +334,8 @@ class AnalysisPage(QWidget):
         self._left_out = {}
         self._needing = None
         self._cov_start = 2
+        self._stats_checked = False
+        self._stats_stale = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -366,6 +391,8 @@ class AnalysisPage(QWidget):
         self._auto_groupings_key = None
         self._auto_groupings_undo = None
         self._hierarchy_key = None
+        self._phenotype_key = None
+        self._phenotypes = {}
         self._combination = None
         self._markers_key = ()
         self._markers = None
@@ -373,6 +400,8 @@ class AnalysisPage(QWidget):
         self._library_key = None
         self._left_out = {}
         self._needing = None
+        self._stats_checked = False
+        self._set_stats_stale(False)
         self._clear_figure_tabs()
         self._show_auto_note(None)
 
@@ -516,12 +545,134 @@ class AnalysisPage(QWidget):
 
     def population_name(self) -> str:
         """The ticked populations, joined (what the next count uses)."""
-        gates = self.settings.get('gates') or []
-        return ', '.join(gates) if gates else fa.ALL_EVENTS
+        pops = list(self.settings.get('gates') or []) + list(self.phenotype_names())
+        return ', '.join(pops) if pops else fa.ALL_EVENTS
 
     def counted_populations(self) -> list:
         """The populations of the saved counts."""
         return fa.saved_records(self.settings.get('counts') or {})[0]
+
+    def counted_phenotypes(self) -> dict:
+        """``{population: resolution summary}`` of the phenotype populations among the saved counts."""
+        return dict((self.settings.get('counts') or {}).get('phenotypes') or {})
+
+    # -- phenotypes -------------------------------------------------------------
+
+    def _panel(self):
+        """The experiment's labelled fluorophores and their markers (``flowcode_phenotype.Panel``)."""
+        import flowcode_method as fcm
+        import flowcode_phenotype as fp
+        c = self._controller()
+        return fp.panel_from_spectral_model(c.experiment.process.get('spectral_model') or [], fcm.fcc_fluor_names(c))
+
+    def resolved_phenotypes(self) -> dict:
+        """``{definition key: Resolved | Unresolved}`` of every known
+        definition on this panel; resolved again when the panel's
+        fluorophores or antigens, or the definitions, change."""
+        import flowcode_phenotype as fp
+        try:
+            panel = self._panel()
+            definitions = fp.load_definitions()
+            key = (panel.fluorophores, tuple(sorted(panel.antigens.items())), tuple(definitions))
+            if key != self._phenotype_key:
+                self._phenotype_key = key
+                self._phenotypes = {d.key: fp.resolve(d, panel) for d in definitions}
+            return dict(self._phenotypes)
+        except Exception as exc:
+            logger.warning('FlowCode analysis: phenotype definitions could not be resolved: %s', exc)
+            return {}
+
+    def congenic_split(self) -> bool:
+        """Whether each phenotype is counted as its CD45.1 and CD45.2 variants."""
+        return bool(self.settings.get('congenic_split'))
+
+    def phenotype_populations(self, keys=None) -> dict:
+        """``{population name: Resolved}`` of the resolved definitions among
+        *keys* (default: the ticked ones), in definition order; with the
+        congenic split, each becomes its CD45.1 and CD45.2 variants when the
+        panel carries both markers."""
+        import flowcode_phenotype as fp
+        chosen = set(self.settings.get('phenotypes') or []) if keys is None else set(keys)
+        split = self.congenic_split()
+        panel = self._panel() if split else None
+        out = {}
+        for key, res in self.resolved_phenotypes().items():
+            if key not in chosen or not isinstance(res, fp.Resolved):
+                continue
+            variants = fp.split_congenic(res, panel) if split else {}
+            if variants:
+                out.update(variants)
+            else:
+                out[res.definition.cell_type] = res
+        return out
+
+    def ticked_phenotypes(self) -> dict:
+        """``{population name: Resolved}`` of the ticked, resolved definitions (split when asked)."""
+        return self.phenotype_populations()
+
+    def phenotype_names(self) -> list:
+        return list(self.ticked_phenotypes())
+
+    def _on_congenic_split(self, checked: bool):
+        if self._filling:
+            return
+        self.settings['congenic_split'] = bool(checked)
+        self._changed()
+        self._fill_phenotype_list()
+        self._check_counts_current()
+        self.refresh_status()
+
+    def _on_phenotype_item_changed(self, _item):
+        if self._filling:
+            return
+        chosen = [self.phenotype_list.item(i).data(Qt.UserRole) for i in range(self.phenotype_list.count())
+                  if self.phenotype_list.item(i).checkState() == Qt.Checked]
+        self.settings['phenotypes'] = chosen
+        self._changed()
+        self._check_counts_current()
+        self.refresh_status()
+
+    def _fill_phenotype_list(self):
+        import flowcode_phenotype as fp
+        resolved = self.resolved_phenotypes()
+        chosen = [k for k in (self.settings.get('phenotypes') or []) if k in resolved]
+        if chosen != list(self.settings.get('phenotypes') or []):
+            self.settings['phenotypes'] = chosen
+        filling, self._filling = self._filling, True
+        try:
+            self.congenic_check.setChecked(self.congenic_split())
+            self.phenotype_list.clear()
+            for key, res in resolved.items():
+                d = res.definition
+                it = QListWidgetItem(f'{d.key}: {d.text()}')
+                it.setData(Qt.UserRole, key)
+                if isinstance(res, fp.Resolved):
+                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                    it.setCheckState(Qt.Checked if key in chosen else Qt.Unchecked)
+                    it.setToolTip(res.summary() + f' ({d.source})')
+                else:
+                    it.setFlags(Qt.ItemIsUserCheckable)
+                    it.setCheckState(Qt.Unchecked)
+                    it.setToolTip(f'Unresolved: {res.reason} ({d.source})')
+                self.phenotype_list.addItem(it)
+            ticked = self.ticked_phenotypes()
+            if not resolved:
+                self.phenotype_note.setText('No phenotype definition could be resolved: give the spectral model\'s '
+                                            'fluorophores their antigens.')
+            elif not self.is_live() and ticked:
+                self.phenotype_note.setStyleSheet(_WARN_STYLE)
+                self.phenotype_note.setText('Phenotypes are counted from the live unmix only: choose Live unmix '
+                                            'as the source.')
+            else:
+                import flowcode_phenotype as fp
+                self.phenotype_note.setStyleSheet(_HINT_STYLE)
+                notes = [f'{name}: {res.summary()}' for name, res in ticked.items()]
+                if self.congenic_split() and ticked and not any(
+                        m in fp.CONGENIC_MARKERS for res in ticked.values() for m, _f, _s in res.markers):
+                    notes.insert(0, 'Not split: the panel does not carry both CD45.1 and CD45.2.')
+                self.phenotype_note.setText('; '.join(notes))
+        finally:
+            self._filling = filling
 
     def counted_population(self) -> str:
         """The populations of the saved counts, joined (what results describe)."""
@@ -530,6 +681,14 @@ class AnalysisPage(QWidget):
 
     def several_populations(self) -> bool:
         return len(self.counted_populations()) > 1
+
+    def soft_counts(self) -> bool:
+        """Whether the saved counts include a phenotype population (fractional counts)."""
+        return bool(self.counted_phenotypes())
+
+    def run_counts(self) -> bool:
+        """The Counts test as it will run: ticked, and the counts are whole events."""
+        return bool(self.settings['run_counts']) and not self.soft_counts()
 
     def unit_sample(self, unit: str) -> str:
         """The sample key of a counts row (a population of a sample)."""
@@ -679,10 +838,26 @@ class AnalysisPage(QWidget):
         lay.addWidget(box)
 
         top = QHBoxLayout()
-        pop_box = QGroupBox('Populations (unmixed gates)')
+        pop_box = QGroupBox('Populations (unmixed gates and phenotypes)')
         pl = QVBoxLayout(pop_box)
         self.gate_tree = self._make_gate_tree()
         pl.addWidget(self.gate_tree)
+        self.phenotype_list = QListWidget()
+        self.phenotype_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.phenotype_list.setMinimumHeight(90)
+        self.phenotype_list.setToolTip('Tick a marker definition to count it as a population of its own, '
+                                       'scored on the live-unmixed events inside the FlowCode gates. '
+                                       'Greyed definitions have a positive marker the panel lacks.')
+        self.phenotype_list.itemChanged.connect(self._on_phenotype_item_changed)
+        pl.addWidget(self.phenotype_list)
+        self.congenic_check = QCheckBox('Split each phenotype by congenic marker (CD45.1+ CD45.2- and CD45.1- CD45.2+)')
+        self.congenic_check.setToolTip('Each ticked phenotype is counted twice, as "<name> CD45.1" and "<name> '
+                                       'CD45.2", when the panel carries both markers.')
+        self.congenic_check.toggled.connect(self._on_congenic_split)
+        pl.addWidget(self.congenic_check)
+        self.phenotype_note = _label('')
+        self.phenotype_note.setWordWrap(True)
+        pl.addWidget(self.phenotype_note)
         top.addWidget(pop_box, stretch=1)
 
         rules = QGroupBox('Combinations and inclusion rules')
@@ -942,11 +1117,13 @@ class AnalysisPage(QWidget):
     def _gating_snapshot(self):
         return fa.SampleGating.from_controller(self._controller())
 
-    def _counts_signature(self, snapshot=None) -> str:
+    def _counts_signature(self, snapshot=None, phenotypes: dict | None = None) -> str:
         snapshot = snapshot or self._gating_snapshot()
         files = self.used_files()
         unmixing = self.plugin.live_unmixing_signature(list(files)) if self.is_live() else None
-        return fa.counts_signature(files, self.settings.get('gates') or [], snapshot.signature(), unmixing)
+        phenotypes = self.ticked_phenotypes() if phenotypes is None else phenotypes
+        return fa.counts_signature(files, self.settings.get('gates') or [], snapshot.signature(), unmixing,
+                                   [res.signature_parts() for res in phenotypes.values()])
 
     def start_count(self):
         files = self.used_files()
@@ -954,12 +1131,17 @@ class AnalysisPage(QWidget):
             self.count_status.setText('No samples are ticked for use.')
             return
         gates = list(self.settings.get('gates') or [])
+        phenotypes = self.ticked_phenotypes()
         snapshot = self._gating_snapshot()
-        populations = gates or [fa.ALL_EVENTS]
+        populations = (gates + list(phenotypes)) or [fa.ALL_EVENTS]
         markers = self.plugin.analysis_marker_channels()
         cache = fa.marker_cache_path(self._controller().experiment_dir)
         if self.is_live():
-            self._start_live_count(files, gates, snapshot, populations, markers, cache)
+            self._start_live_count(files, gates, snapshot, populations, markers, cache, phenotypes)
+            return
+        if phenotypes:
+            self.count_status.setText('Phenotypes are counted from the live unmix only: choose Live unmix as the '
+                                      'source, or untick them.')
             return
         signature = fa.counts_signature(files, gates, snapshot.signature())
 
@@ -982,17 +1164,33 @@ class AnalysisPage(QWidget):
             self.count_btn.setEnabled(False)
             self.count_status.setText(f'Counting {len(files)} file(s)…')
 
-    def _start_live_count(self, files: dict, gates: list, snapshot, populations: list, markers: list, cache):
+    def _start_live_count(self, files: dict, gates: list, snapshot, populations: list, markers: list, cache,
+                          phenotypes: dict | None = None):
         """FlowCode-unmix each sample's raw file (or read its cached unmix),
-        gate it and count it, holding the heavy-job gate when there is one."""
+        gate and score it and count it, holding the heavy-job gate when
+        there is one. *phenotypes* is ``{population: Resolved}``; each
+        sample's negative model comes from its own AF library."""
         import flowcode_export as fce
+        import flowcode_phenotype as fp
+        import flowcode_state as fcs
 
         keys = list(files)
+        phenotypes = dict(phenotypes or {})
         try:
             inputs = self.plugin.live_unmix_inputs(keys)
         except ValueError as exc:
             self.count_status.setText(f'Cannot unmix: {exc}')
             return
+        gate_records = [self.plugin.state.gates[n] for n in fcs.GATE_NAMES if n in self.plugin.state.gates]
+        fluor_names = list(inputs['layout'].fluor_names)
+
+        def sample_phenotypes(key):
+            if not phenotypes:
+                return None
+            model = fp.sample_negative_model(inputs['af_by_sample'][key], fluor_names, inputs['plan'].state, key)
+            if model is None:
+                raise ValueError('no negative model: the sample has no AF library and the experiment no noise model')
+            return {name: (res, model) for name, res in phenotypes.items()}
         gate = getattr(self._controller(), 'job_gate', None)
         token = None
         if gate is not None:
@@ -1002,7 +1200,8 @@ class AnalysisPage(QWidget):
                 self.count_status.setText(busy() if callable(busy) else 'Another job is running.')
                 return
         unmixing = inputs['signature']
-        signature = fa.counts_signature(files, gates, snapshot.signature(), unmixing)
+        signature = fa.counts_signature(files, gates, snapshot.signature(), unmixing,
+                                        [res.signature_parts() for res in phenotypes.values()])
         cache_keys = {key: fce.live_cache_key(unmixing, key, fce.file_signature(path)) for key, path in files.items()}
 
         def work(progress):
@@ -1014,7 +1213,8 @@ class AnalysisPage(QWidget):
                         inputs['layout'], inputs['af_by_sample'][key], inputs['unmix_fn'], key, inputs['pnn'],
                         inputs['n_extra'], cache_key=cache_keys[key], max_cache_bytes=inputs['max_cache_bytes'])
                     counted = fa.count_populations(np.asarray(events, dtype=np.float64), inputs['pnn'], key,
-                                                   snapshot, gates, markers)
+                                                   snapshot, populations if phenotypes else gates, markers,
+                                                   phenotypes=sample_phenotypes(key), gate_records=gate_records)
                     for pop in populations:
                         records[pop][key] = counted[pop]
                     del events
@@ -1024,6 +1224,7 @@ class AnalysisPage(QWidget):
             progress(len(keys), len(keys), '')
             fa.save_marker_sums(cache, signature, records, populations)
             return {'records': records, 'errors': errors, 'signature': signature, 'populations': populations,
+                    'phenotypes': {name: res.summary() for name, res in phenotypes.items()},
                     'source': fa.SOURCE_LIVE, 'method': inputs['plan'].label}
 
         if self.plugin._start_task('analysis_count', work):
@@ -1043,6 +1244,7 @@ class AnalysisPage(QWidget):
         self.count_btn.setEnabled(True)
         self.settings['counts'] = {'signature': result['signature'], 'records': result['records'],
                                    'errors': result['errors'], 'populations': result['populations'],
+                                   'phenotypes': dict(result.get('phenotypes') or {}),
                                    'source': result.get('source', fa.SOURCE_EXPORTED),
                                    'method': result.get('method'),
                                    'time': datetime.now().strftime('%Y-%m-%d %H:%M')}
@@ -1797,6 +1999,11 @@ class AnalysisPage(QWidget):
             'zero within each group with a moderated t. Combinations are families: a combination is '
             'screened over all its markers first (cluster-first FDR).')
         form.addRow(self.chk_counts)
+        self.counts_note = _label('The Counts test needs whole events; the counts include a phenotype population '
+                                  '(memberships summed), so only the Frequencies and Markers tests run.')
+        self.counts_note.setWordWrap(True)
+        self.counts_note.setVisible(False)
+        form.addRow(self.counts_note)
         form.addRow(self.chk_freq)
         form.addRow(self.chk_markers)
         self.cb_count_test = QComboBox()
@@ -2041,6 +2248,9 @@ class AnalysisPage(QWidget):
             self.chk_counts.setChecked(bool(s['run_counts']))
             self.chk_freq.setChecked(bool(s['run_freq']))
             self.chk_markers.setChecked(bool(s['run_markers']))
+            soft = self.soft_counts()
+            self.chk_counts.setEnabled(not soft)
+            self.counts_note.setVisible(soft)
             self.cb_count_test.setCurrentIndex(max(self.cb_count_test.findData(s['counts_method']), 0))
             self.cb_norm.setCurrentIndex(max(self.cb_norm.findData(s['normalisation']), 0))
             self._fill_controls()
@@ -2278,11 +2488,12 @@ class AnalysisPage(QWidget):
                        'or untick them (Data).')
         elif self.filtered is None or self.filtered.counts.empty:
             problem = 'Count events first (Data).'
-        elif not (s['run_counts'] or s['run_freq'] or s['run_markers']):
-            problem = 'Tick at least one test.'
+        elif not (self.run_counts() or s['run_freq'] or s['run_markers']):
+            problem = ('Tick Frequencies or Markers: the counts include a phenotype population, so the Counts '
+                       'test cannot run.' if s['run_counts'] else 'Tick at least one test.')
         elif self.compare_mode() == 'groups' and len(s.get('group_names') or []) < 2:
             problem = 'Assign at least two groups (Groups).'
-        elif s['run_markers'] and not (s['run_counts'] or s['run_freq']) and self._marker_data() is None:
+        elif s['run_markers'] and not (self.run_counts() or s['run_freq']) and self._marker_data() is None:
             problem = 'No marker intensities with these counts: count again.'
         self.run_btn.setEnabled(problem is None and not self.plugin.task_running('analysis_stats'))
         if problem and self.stats is None:
@@ -2292,10 +2503,55 @@ class AnalysisPage(QWidget):
         if self.stats is not None:
             self.stats = None
             self.figures = {}
+            self._set_stats_stale(False)
             self.stats_status.setText('Settings changed: run statistics again.')
             self._show_results()
         self._show_marker_k()
         self._update_run_button()
+
+    def _stats_inputs(self) -> str:
+        """Digest of what a statistics run depends on: the counts (by their
+        signature), the library setup and the Analysis settings other than
+        ``STATS_INPUT_EXCLUDED``."""
+        s = self.settings
+        inputs = {k: v for k, v in s.items() if k not in STATS_INPUT_EXCLUDED}
+        inputs['counts_signature'] = (s.get('counts') or {}).get('signature')
+        inputs['library_setup'] = self._library_setup_key()
+        text = json.dumps(inputs, sort_keys=True, default=str)
+        return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+    def _set_stats_stale(self, stale: bool):
+        self._stats_stale = bool(stale)
+        self.stale_label.setVisible(self._stats_stale)
+
+    def _restore_saved_stats(self):
+        """Once per experiment, when the page is first refreshed with counts:
+        the last statistics run (saved when it was made) with the current
+        thresholds applied, marked out of date when the counts or settings
+        it was run with have changed since."""
+        if self._stats_checked:
+            return
+        self._stats_checked = True
+        if self.stats is not None or self.filtered is None:
+            return
+        path = fst.stats_path(self._controller().experiment_dir)
+        try:
+            saved = fst.load_stats(path)
+        except Exception:
+            logger.exception('FlowCode analysis: could not read the saved statistics in %s', path)
+            return
+        if saved is None:
+            return
+        stats, inputs, when = saved
+        self.stats = stats
+        self._set_stats_stale(inputs != self._stats_inputs())
+        n_comparisons = len(stats.get('comparisons') or [])
+        text = f'Saved results ({when}): {n_comparisons} comparison(s), {len(stats.get("samples") or [])} sample(s).'
+        if self._stats_stale:
+            text += f'<br><span style="{_WARN_STYLE}">{STALE_TEXT}</span>'
+        self.stats_status.setText(text)
+        self._show_marker_k()
+        self._reapply_thresholds()
 
     def _covariate_frame(self, names: list) -> pd.DataFrame | None:
         covs = self.settings.get('covariates') or {}
@@ -2370,12 +2626,13 @@ class AnalysisPage(QWidget):
             self.stats_status.setText(str(exc))
             return
         counts, denom = self.filtered.counts, self.filtered.denominator
-        markers_only = bool(s['run_markers']) and not (s['run_counts'] or s['run_freq'])
+        run_counts = self.run_counts()
+        markers_only = bool(s['run_markers']) and not (run_counts or s['run_freq'])
         kwargs = dict(group_order=order, contrast_mode=s['contrast_mode'],
                       reference=reference, pairing=pairing, covariates=covariates, split_by=split,
                       pval_threshold=float(s['pval_threshold']), fc_threshold=float(s['fc_threshold']),
                       use_treat=bool(s['use_treat']), fdr_scope=s['fdr_scope'],
-                      run_counts=bool(s['run_counts']), run_freq=bool(s['run_freq']),
+                      run_counts=run_counts, run_freq=bool(s['run_freq']),
                       counts_method=s['counts_method'], normalisation=s['normalisation'],
                       control_combos=list(s.get('control_combos') or []),
                       clone_filter=({'min_count': int(s['clone_min_count']),
@@ -2399,12 +2656,19 @@ class AnalysisPage(QWidget):
                               threshold=float(s['marker_threshold']), clones=bool(s['remove_clones']),
                               unit_library=unit_library, feature_map=self.feature_map())
 
+        inputs, path = self._stats_inputs(), fst.stats_path(self._controller().experiment_dir)
+
         def work(_progress):
             if markers_only:
                 kwargs.update(run_counts=False, run_freq=False)
             stats = fst.run_statistics(counts, denom, groups, **kwargs)
             if marker_job is not None:
                 stats['markers'] = self._run_markers(stats, counts, marker_job, kwargs)
+            try:
+                fst.save_stats(path, stats, inputs)
+            except Exception as exc:
+                logger.exception('FlowCode analysis: could not save the statistics to %s', path)
+                stats['notes'].append(f'The results could not be saved: {exc}')
             return stats
 
         if self.plugin._start_task('analysis_stats', work):
@@ -2497,6 +2761,7 @@ class AnalysisPage(QWidget):
 
     def on_stats_finished(self, stats):
         self.stats = stats
+        self._set_stats_stale(False)
         self._show_marker_k()
         notes = list(self.filtered.notes if self.filtered is not None else []) + list(stats.get('notes') or [])
         key, res = fst.primary_results(stats)
@@ -2561,6 +2826,9 @@ class AnalysisPage(QWidget):
         self.results_table = CopyableTableWidget([], [])
         self.results_table.setToolTip('Double-click a row to plot its combination in every sample.')
         self.results_table.cellDoubleClicked.connect(self._on_results_double_clicked)
+        self.stale_label = _label(STALE_TEXT, _WARN_STYLE)
+        self.stale_label.setVisible(False)
+        lay.addWidget(self.stale_label)
         self.figure_tabs = QTabWidget()
         self.figure_tabs.addTab(self.results_table, 'Table')
         lay.addWidget(self.figure_tabs, stretch=1)
@@ -3066,7 +3334,10 @@ class AnalysisPage(QWidget):
             f"Exported: {datetime.now().isoformat(timespec='seconds')}",
             f'Honeychrome: {hc_version}; FlowCode plugin: {fcs.PLUGIN_VERSION}',
             f'Experiment: {self._controller().experiment_dir}',
-            f'Populations: {self.counted_population()} (each a gate of the unmixed gating)',
+            f'Populations: {self.counted_population()} (each a gate of the unmixed gating'
+            + (', or a phenotype scored on the live-unmixed events inside the FlowCode gates: '
+               + '; '.join(f'{name}: {summary}' for name, summary in self.counted_phenotypes().items())
+               + '; counts are memberships summed' if self.soft_counts() else '') + ')',
             f"Counted: {saved.get('time', '')}",
             (f"Source: live unmix of the raw files ({saved.get('method') or ''})"
              if saved.get('source') == fa.SOURCE_LIVE else f'Exported files: {self.export_folder()}'),
@@ -3104,7 +3375,8 @@ class AnalysisPage(QWidget):
         tests = [n for k, n in (
             ('run_counts', f"Counts (NB GLM, {fst.COUNT_TEST_NAMES[s['counts_method']]})"),
             ('run_freq', 'Frequencies (moderated LM, log2 % of library size)'),
-            ('run_markers', 'Markers (moderated t of combination minus reference, cluster-first FDR)')) if s[k]]
+            ('run_markers', 'Markers (moderated t of combination minus reference, cluster-first FDR)'))
+            if (self.run_counts() if k == 'run_counts' else s[k])]
         pair_key, split_key = s.get(self._design_key('pairing')), s.get(self._design_key('split_by'))
         adjust = [c for c in s.get('adjust') or [] if c not in (pair_key, split_key)]
         factor_name = {fa.PAIR_BY_SAMPLE: 'sample', fa.SPLIT_BY_GROUP: 'sample group', fa.SPLIT_BY_LIBRARY: 'library'}
@@ -3165,6 +3437,9 @@ class AnalysisPage(QWidget):
     def start_export(self):
         if self.counts is None or self.filtered is None:
             self.export_status.setText('Count events first (Data).')
+            return
+        if self.stats is not None and self._stats_stale:
+            self.export_status.setText('The results are out of date: run statistics again before exporting.')
             return
         no_fret = self.uncorrected()
         if no_fret and not self.plugin.confirm_no_fret('Export the analysis report of samples debarcoded without '
@@ -3297,11 +3572,13 @@ class AnalysisPage(QWidget):
                 self._load_counts()
                 self._invalidate_stats()
         self._fill_gate_tree()
+        self._fill_phenotype_list()
         self._fill_data()
         self._check_counts_current()
         self._fill_groups()
         self.maybe_auto_suggest_groupings()
         self._fill_stats_choices()
+        self._restore_saved_stats()
         self.gating_view.refresh()
         self.root_label.setText(str(self.analysis_root()))
         self._update_default_buttons()

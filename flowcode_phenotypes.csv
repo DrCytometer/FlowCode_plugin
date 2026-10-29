@@ -1,0 +1,4 @@
+cell_type,species,positive_markers,negative_markers,notes
+CD4 Treg,mouse,CD3;CD4;FoxP3,CD8;CD19,Regulatory T cells by FoxP3; the viability dye is added at resolution
+CD4 T cell,mouse,CD3;CD4,CD8;CD19,Conventional and regulatory CD4 T cells together
+CD8 T cell,mouse,CD3;CD8,CD4;CD19,
