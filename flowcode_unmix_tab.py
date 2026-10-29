@@ -42,7 +42,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-from PySide6.QtCore import Qt, QObject, QSettings, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QEvent, QObject, QSettings, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListWidget,
@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
 from flowkit import GatingStrategy, gates as fk_gates
 
 import honeychrome.settings as hc_settings
+from honeychrome.controller_components.af_auto_assign import folder_groups
 from honeychrome.controller_components.autospectral_functions import af_index_lookup
 from honeychrome.controller_components.cytometer_whitelist import singlet_channels
 from honeychrome.controller_components.functions import calc_hists, calc_stats, define_polygon_gate
@@ -76,6 +77,9 @@ import flowcode_export as fce  # noqa: E402
 import flowcode_method as fcm  # noqa: E402
 import flowcode_fix_unmix as fcfu  # noqa: E402
 import flowcode_figure_panel as fcfp  # noqa: E402
+import flowcode_timing  # noqa: E402
+
+flowcode_timing.install()
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +112,6 @@ _ERROR_STYLE = 'color: #d62728;'
 _WARN_STYLE = 'color: #cc6600;'
 _DONE_STYLE = 'color: #2ca02c;'
 _HINT_STYLE = 'color: grey; font-style: italic;'
-_BANNER_STYLE = ('QLabel { color: #856404; background: #fff3cd; border: 1px solid #ffc107; '
-                 'border-radius: 4px; padding: 8px; }')
 _INVALID_STYLE = 'color: #d62728; font-weight: bold;'
 
 # Debarcoding without FRET correction (no FRET backbone).
@@ -124,6 +126,9 @@ NO_FRET_EXPLANATION = ('Without FRET backbone controls, FRET, residual tag spill
 NO_FRET_NOT_PERFORMED = ('FRET correction not performed: "No FRET backbone" is ticked in section 1.\n'
                          + fcs.NO_FRET_WARNING)
 
+LOADING_MESSAGE = f'Loading {plugin_name}…'
+NO_MATRIX_MESSAGE = (f'{plugin_name}: calculate the unmixing matrix (Spectral Process tab) before using this '
+                     'plugin.')
 METHOD_API_MESSAGE = (f'{plugin_name}: this version of Honeychrome does not apply the experiment\'s unmixing '
                       'method to plugins (no AutoSpectral tab noise model). Update Honeychrome to use this '
                       'version of the plugin.')
@@ -247,7 +252,17 @@ _HELP = {
         'fluorophore class is "Protein tandem" are ticked at first; the parent comes from the '
         '<tt>tandem.parent</tt> column of the fluorophore database, and its spectrum from the panel or, '
         'when it is not in the panel, from the cytometer\'s reference library. The backbone statistic is '
-        'computed in section 4.</p>'),
+        'computed in section 4.</p>'
+        '<p><b>Combination calibration</b> (Advanced settings, on by default): the backbone\'s error model of a '
+        'combination need not hold in a sample (in vivo cells can carry less error per unit tag, so bright cells '
+        'are over-corrected). Marker biology and AF move an event only within the span of the reference spectra '
+        'and the AF directions, so the part of a combination\'s error outside that span is measured in each '
+        'sample, on its FlowCode singlets: one scale per combination, with a bootstrap z against 1 and the same '
+        'soft threshold as the tandem, then the combination\'s whole error is rescaled. A combination whose '
+        'error lies almost wholly inside the span (out-of-span share below the minimum) is not identifiable and '
+        'keeps the backbone\'s model. Detectors are weighted by the noise model when the experiment uses M2pg, '
+        'else by the sample\'s median signal. The tandem breakdown is estimated after the calibration. '
+        '<i>Brightness-dependent calibration</i> lets the scale change with tag brightness.</p>'),
 }
 
 # Filled by _ensure_qt_imports() on the main thread: these modules create Qt
@@ -1022,6 +1037,17 @@ def _float_spin(lo, hi, decimals=2, step=0.05) -> QDoubleSpinBox:
     return spin
 
 
+def _restore_defaults_row(slot) -> tuple:
+    """(row layout, button): a 'Restore defaults' button for a settings tab."""
+    button = QPushButton('Restore defaults')
+    button.setToolTip('Put every setting on this tab back to its default value.')
+    button.clicked.connect(slot)
+    row = QHBoxLayout()
+    row.addWidget(button)
+    row.addStretch()
+    return row, button
+
+
 class _SideTabWidget(QWidget):
     """Vertical navigation list beside a page stack (as in Honeycluster)."""
 
@@ -1100,14 +1126,19 @@ class _Page(QWidget):
     Common page frame: title, status line and help above either one
     scrollable body or, with ``tabbed``, a fixed header (``body``) and a
     row of tabs (``add_section``) whose pages fill the rest of the page.
-    The open tab is remembered between sessions.
+    With ``page_scroll`` as well, header and tabs scroll together and the
+    tabs are at least as tall as the view, so scrolling past the header
+    gives them the whole height. The open tab is remembered between
+    sessions.
     """
 
-    def __init__(self, plugin: 'PluginWidget', section: int, parent=None, tabbed: bool = False):
+    def __init__(self, plugin: 'PluginWidget', section: int, parent=None, tabbed: bool = False,
+                 page_scroll: bool = False):
         super().__init__(parent)
         self.plugin = plugin
         self.section = section
         self.section_tabs = None
+        self._page_scroll = None
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         body = QWidget()
@@ -1115,13 +1146,27 @@ class _Page(QWidget):
         self.body.setAlignment(Qt.AlignTop)
         self.body.setSpacing(10)
         if tabbed:
-            outer.setSpacing(6)
-            outer.addWidget(body)
             self.section_tabs = QTabWidget()
             self.section_tabs.setDocumentMode(True)
-            outer.addWidget(self.section_tabs, stretch=1)
             self.section_tabs.currentChanged.connect(
                 lambda index: plugin.qsettings.setValue(f'open_section_{section}', int(index)))
+            if page_scroll:
+                page = QWidget()
+                column = QVBoxLayout(page)
+                column.setContentsMargins(0, 0, 0, 0)
+                column.setSpacing(6)
+                column.addWidget(body)
+                column.addWidget(self.section_tabs, stretch=1)
+                self._page_scroll = QScrollArea()
+                self._page_scroll.setWidgetResizable(True)
+                self._page_scroll.setFrameShape(QFrame.NoFrame)
+                self._page_scroll.setWidget(page)
+                self._page_scroll.viewport().installEventFilter(self)
+                outer.addWidget(self._page_scroll)
+            else:
+                outer.setSpacing(6)
+                outer.addWidget(body)
+                outer.addWidget(self.section_tabs, stretch=1)
         else:
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
@@ -1135,6 +1180,12 @@ class _Page(QWidget):
         self.status = _status_label()
         self.body.addWidget(self.status)
         self.body.addWidget(fcfp.scrolling_help(_HELP[section]))
+
+    def eventFilter(self, obj, event):
+        if (self._page_scroll is not None and obj is self._page_scroll.viewport()
+                and event.type() == QEvent.Resize):
+            self.section_tabs.setMinimumHeight(event.size().height())
+        return super().eventFilter(obj, event)
 
     def add_section(self, title: str, scroll: bool = True) -> QVBoxLayout:
         """A new tab, scrolling on its own (or, without *scroll*, filling the
@@ -2695,6 +2746,9 @@ class GatesPage(_Page):
         self.restore_open_section()
 
     def _build_advanced(self, lay):
+        row, self.restore_btn = _restore_defaults_row(
+            lambda: self.plugin.restore_default_settings(self.default_keys))
+        lay.addLayout(row)
         form = QFormLayout()
         lay.addLayout(form)
         self.adv = {
@@ -2741,6 +2795,7 @@ class GatesPage(_Page):
         _no_wheel(self.debarcode_method)
         self.debarcode_method.currentIndexChanged.connect(self._on_debarcode_method)
         form.addRow('Debarcode with:', self.debarcode_method)
+        self.default_keys = (*self.adv, 'debarcode_method')
 
     def _on_debarcode_method(self, _index):
         value = self.debarcode_method.currentData()
@@ -2765,6 +2820,7 @@ class GatesPage(_Page):
         self.debarcode_method.setCurrentIndex(
             max(self.debarcode_method.findData(plugin.debarcode_method()), 0))
         self.debarcode_method.blockSignals(False)
+        self.restore_btn.setEnabled(not plugin.settings_at_defaults(self.default_keys))
 
         ready = plugin.section_ready(3)
         busy = plugin.task_running('load') or plugin.task_running('space') or plugin.task_running('auto_cells')
@@ -2838,7 +2894,7 @@ class CharacterisePage(_Page):
     SECTION_FREQUENCY, SECTION_HEATMAP, SECTION_EXPRESSION, SECTION_ASSESS, SECTION_FIT, SECTION_ADVANCED = range(6)
 
     def __init__(self, plugin, parent=None):
-        super().__init__(plugin, 4, parent, tabbed=True)
+        super().__init__(plugin, 4, parent, tabbed=True, page_scroll=True)
         _ensure_qt_imports()
         self._shown_key = None
         self._heat_key = None
@@ -2934,6 +2990,9 @@ class CharacterisePage(_Page):
         self.restore_open_section(self.SECTION_FREQUENCY)
 
     def _build_advanced(self, lay):
+        row, self.restore_btn = _restore_defaults_row(
+            lambda: self.plugin.restore_default_settings(self.default_keys))
+        lay.addLayout(row)
         form = QFormLayout()
         lay.addLayout(form)
         self.checks = {
@@ -2977,6 +3036,7 @@ class CharacterisePage(_Page):
             widget.valueChanged.connect(lambda value, k=key: self.plugin.on_setting_changed(k, value))
         for key, box in self.checks.items():
             box.toggled.connect(lambda checked, k=key: self.plugin.on_setting_changed(k, bool(checked)))
+        self.default_keys = (*self.checks, *self.adv)
 
     def highlight_point_size(self) -> int:
         return self.highlight_size.value() if self.highlight_check.isChecked() else 0
@@ -3009,6 +3069,7 @@ class CharacterisePage(_Page):
             box.blockSignals(True)
             box.setChecked(bool(settings[key]))
             box.blockSignals(False)
+        self.restore_btn.setEnabled(not plugin.settings_at_defaults(self.default_keys))
         ready = plugin.section_ready(4)
         busy = plugin.characterise_busy()
         self.run_btn.setText('Debarcode (no FRET correction)' if plugin.state.no_fret
@@ -3146,9 +3207,10 @@ class ExportPage(_Page):
     SECTION_SAMPLES, SECTION_OUTPUT, SECTION_ADVANCED = range(3)
 
     def __init__(self, plugin, parent=None):
-        super().__init__(plugin, 5, parent, tabbed=True)
+        super().__init__(plugin, 5, parent, tabbed=True, page_scroll=True)
         self._filling = False
         self._status_is_problem = False
+        self._groups = {}
 
         grp = QGroupBox('Spectral corrections (optional)')
         lay = QVBoxLayout(grp)
@@ -3194,7 +3256,7 @@ class ExportPage(_Page):
         lay.addWidget(self.result)
         self.body.addWidget(grp)
 
-        lay = self.add_section('Samples')
+        lay = self.add_section('Samples', scroll=False)
         row = QHBoxLayout()
         all_btn = QPushButton('Select all')
         all_btn.clicked.connect(lambda: self._select_all(True))
@@ -3206,13 +3268,28 @@ class ExportPage(_Page):
         row.addWidget(none_btn)
         row.addWidget(self.sample_count, stretch=1)
         lay.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(QLabel('Group:'))
+        self.group_combo = QComboBox()
+        self.group_combo.setToolTip('The folders of the listed samples, as in the sample browser.')
+        _no_wheel(self.group_combo)
+        row.addWidget(self.group_combo, stretch=1)
+        self.select_group_btn = QPushButton('Select group')
+        self.select_group_btn.setToolTip('Tick every sample of the group that can be exported.')
+        self.select_group_btn.clicked.connect(lambda: self._select_group(True))
+        self.deselect_group_btn = QPushButton('Deselect group')
+        self.deselect_group_btn.setToolTip('Untick every sample of the group.')
+        self.deselect_group_btn.clicked.connect(lambda: self._select_group(False))
+        row.addWidget(self.select_group_btn)
+        row.addWidget(self.deselect_group_btn)
+        lay.addLayout(row)
         self.controls_check = QCheckBox('Include single-stain controls and unstained samples')
         self.controls_check.toggled.connect(self._on_controls_toggled)
         lay.addWidget(self.controls_check)
         self.sample_list = QListWidget()
         self.sample_list.setMinimumHeight(240)
         self.sample_list.itemChanged.connect(self._on_sample_item_changed)
-        lay.addWidget(self.sample_list)
+        lay.addWidget(self.sample_list, stretch=1)
         self.af_warn = _message_label(_WARN_STYLE)
         lay.addWidget(self.af_warn)
 
@@ -3240,6 +3317,9 @@ class ExportPage(_Page):
         self.restore_open_section(self.SECTION_SAMPLES)
 
     def _build_advanced(self, lay):
+        row, self.restore_btn = _restore_defaults_row(
+            lambda: self.plugin.restore_default_settings(self.default_keys))
+        lay.addLayout(row)
         form = QFormLayout()
         lay.addLayout(form)
         self.correction = QComboBox()
@@ -3300,6 +3380,51 @@ class ExportPage(_Page):
             widget.valueChanged.connect(lambda value, k=key: self._on_value(k, value))
         lay.addWidget(grp)
 
+        cgrp = QGroupBox('Combination calibration: per sample')
+        clay = QVBoxLayout(cgrp)
+        self.calib_checks = {
+            'calib_combos': QCheckBox('Calibrate each combination\'s correction per sample (out-of-span)'),
+            'calib_brightness': QCheckBox('Brightness-dependent calibration'),
+        }
+        self.calib_checks['calib_combos'].setToolTip(
+            'Rescale each combination\'s FRET/error correction by what the sample itself shows outside the '
+            'span of the reference spectra and AF directions, where no marker or AF can reach (see Help). '
+            'The backbone is left unchanged by construction.')
+        self.calib_checks['calib_brightness'].setToolTip(
+            'Let the scale change linearly with the log of the combination\'s tag brightness (s0 + s1 u). '
+            'Fits the residual better but changes gating only marginally and has a small false-positive rate '
+            'on the backbone.')
+        for key, box in self.calib_checks.items():
+            clay.addWidget(box)
+            box.toggled.connect(lambda checked, k=key: self._on_calib_toggled(k, checked))
+        cform = QFormLayout()
+        clay.addLayout(cform)
+        self.calib_adv = {
+            'calib_z_min': _float_spin(0.0, 100.0, 1, 0.5),
+            'calib_min_share': _float_spin(0.0, 1.0, 3, 0.01),
+            'calib_min_events': _int_spin(5, 1_000_000, 10),
+        }
+        calib_labels = {
+            'calib_z_min': 'z threshold:',
+            'calib_min_share': 'Minimum out-of-span share of the error:',
+            'calib_min_events': 'Minimum singlet events per combination:',
+        }
+        self.calib_adv['calib_z_min'].setToolTip('The scale is applied in full well above this z, not at all '
+                                                 'below it (weight 1 - (z threshold / z)^2).')
+        self.calib_adv['calib_min_share'].setToolTip(
+            'A combination whose error lies almost wholly inside the span of the spectra and AF directions '
+            'cannot be calibrated (not identifiable) and keeps the backbone\'s model.')
+        for key, widget in self.calib_adv.items():
+            cform.addRow(calib_labels[key], widget)
+            widget.valueChanged.connect(lambda value, k=key: self._on_value(k, value))
+        self.calib_status = QLabel('')
+        self.calib_status.setWordWrap(True)
+        self.calib_status.setStyleSheet(_HINT_STYLE)
+        clay.addWidget(self.calib_status)
+        lay.addWidget(cgrp)
+        self.default_keys = ('correction', 'regressor', *self.adv, 'tandem_tags', *self.tandem_adv,
+                             *self.calib_checks, *self.calib_adv)
+
     # -- refresh -------------------------------------------------------------
 
     def refresh(self):
@@ -3324,8 +3449,10 @@ class ExportPage(_Page):
                 widget.setValue(state.settings[key])
                 widget.blockSignals(False)
             self._fill_tandems()
+            self._fill_calibration()
         finally:
             self._filling = False
+        self.restore_btn.setEnabled(not plugin.settings_at_defaults(self.default_keys))
         running = plugin.export_running()
         ready = plugin.section_ready(5)
         _kind, fix_text = plugin.correction_state()
@@ -3384,6 +3511,30 @@ class ExportPage(_Page):
         if not self._filling:
             self.plugin.set_tandem_tag(fluor, checked)
 
+    def _fill_calibration(self):
+        settings = self.plugin.state.settings
+        no_fret = bool(self.plugin.state.no_fret)
+        combo = settings.get('correction') == 'combo'
+        on = bool(settings['calib_combos'])
+        for key, box in self.calib_checks.items():
+            box.setChecked(bool(settings[key]))
+        for key, widget in self.calib_adv.items():
+            widget.blockSignals(True)
+            widget.setValue(settings[key])
+            widget.blockSignals(False)
+        usable = combo and not no_fret
+        self.calib_checks['calib_combos'].setEnabled(usable)
+        self.calib_checks['calib_brightness'].setEnabled(usable and on)
+        for widget in self.calib_adv.values():
+            widget.setEnabled(usable and on)
+        self.calib_status.setText(
+            'Not applied without FRET correction ("No FRET backbone" in section 1).' if no_fret else
+            'Applies only with the per-combination correction (Correction: combo).' if not combo else '')
+
+    def _on_calib_toggled(self, key: str, checked: bool):
+        if not self._filling:
+            self.plugin.on_setting_changed(key, bool(checked))
+
     def _fill_samples(self):
         plugin = self.plugin
         candidates = plugin.export_candidates()
@@ -3404,6 +3555,19 @@ class ExportPage(_Page):
         self.sample_count.setText(f'{len(selected)} of {n_eligible} sample(s) selected'
                                   + (f'; {len(candidates) - n_eligible} without an AF profile.'
                                      if n_eligible < len(candidates) else '.'))
+        self._fill_groups(candidates)
+
+    def _fill_groups(self, candidates):
+        """The Group drop-down: every folder holding listed samples, directly
+        or in a subfolder (the sample browser's folders)."""
+        current = self.group_combo.currentData()
+        self._groups = folder_groups([key for key, _name, _ok in candidates])
+        self.group_combo.clear()
+        for folder, keys in self._groups.items():
+            self.group_combo.addItem(f'{folder} ({len(keys)})', folder)
+        self.group_combo.setCurrentIndex(max(self.group_combo.findData(current), 0))
+        for widget in (self.group_combo, self.select_group_btn, self.deselect_group_btn):
+            widget.setEnabled(bool(self._groups))
 
     # -- handlers --------------------------------------------------------------
 
@@ -3428,6 +3592,18 @@ class ExportPage(_Page):
     def _select_all(self, checked: bool):
         eligible = [k for k, _n, ok in self.plugin.export_candidates() if ok]
         self.plugin.state.export_samples = list(eligible) if checked else []
+        self.plugin.state_changed()
+
+    def _select_group(self, checked: bool):
+        """Tick (or untick) the samples of the group chosen in the drop-down,
+        keeping the rest of the selection."""
+        members = set(self._groups.get(self.group_combo.currentData()) or [])
+        if not members:
+            return
+        eligible = [k for k, _n, ok in self.plugin.export_candidates() if ok]
+        selected = set(self.plugin.export_selection())
+        selected = selected | members if checked else selected - members
+        self.plugin.state.export_samples = [k for k in eligible if k in selected]
         self.plugin.state_changed()
 
     def _on_choose_folder(self):
@@ -3484,10 +3660,9 @@ class PluginWidget(QWidget):
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
-        self.label_disabled = QLabel(f'{plugin_name}: calculate the unmixing matrix (Spectral Process tab) '
-                                     f'before using this plugin.')
+        self.label_disabled = QLabel(LOADING_MESSAGE)
         self.label_disabled.setWordWrap(True)
-        self.label_disabled.setStyleSheet(_BANNER_STYLE)
+        self.label_disabled.setStyleSheet(_HINT_STYLE)
         outer.addWidget(self.label_disabled)
 
         self.content = QWidget()
@@ -3509,6 +3684,9 @@ class PluginWidget(QWidget):
         self.tabs.currentChanged.connect(self._on_page_changed)
         content.addWidget(self.tabs, stretch=1)
         outer.addWidget(self.content, stretch=1)
+        # Takes the space while the content is hidden, so the message stays
+        # one line at the top.
+        outer.addStretch()
         self.content.setVisible(False)
 
         gate = getattr(controller, 'job_gate', None)
@@ -3519,6 +3697,7 @@ class PluginWidget(QWidget):
             self.bus.modeChangeRequested.connect(self._on_mode_change)
             self.bus.spectralProcessRefreshed.connect(self._on_process_refreshed)
             self.bus.sampleTreeUpdated.connect(self._on_sample_tree_updated)
+            self.bus.loadSampleRequested.connect(self._on_sample_selected)
             if hasattr(self.bus, 'unmixingMethodChanged'):
                 self.bus.unmixingMethodChanged.connect(self._on_unmixing_method_changed)
 
@@ -3587,24 +3766,30 @@ class PluginWidget(QWidget):
                 self._active = False
             return
         self._active = True
+        self._show_if_ready()
+
+    def _show_if_ready(self):
+        """Show the pages when the experiment has an unmixing matrix (and this
+        Honeychrome applies the experiment's method), else say why not."""
         available = self._available()
-        if not fcm.method_api_available():
-            self.label_disabled.setText(METHOD_API_MESSAGE)
+        if not available:
+            self.label_disabled.setText(NO_MATRIX_MESSAGE if fcm.method_api_available() else METHOD_API_MESSAGE)
+            self.label_disabled.setStyleSheet(_WARN_STYLE)
         self.label_disabled.setVisible(not available)
         self.content.setVisible(available)
         if not available:
             return
-        # No page uses the sample browser: hide it (the main window shows it
-        # again on the next tab change).
-        signal = getattr(self.bus, 'sampleBrowserVisibilityRequested', None)
-        if signal is not None:
-            signal.emit(False)
+        self.update_sample_browser_visibility()
         self._sync_experiment()
         self.state_changed(save=False)
         QTimer.singleShot(0, self._on_page_shown)
 
     def _on_process_refreshed(self):
-        if self._active and self._available():
+        if not self._active:
+            return
+        if self.content.isHidden() or not self._available():
+            self._show_if_ready()
+        else:
             self.refresh()
 
     def _on_sample_tree_updated(self):
@@ -3612,8 +3797,24 @@ class PluginWidget(QWidget):
             self.refresh()
 
     def _on_page_changed(self, _index):
+        self.update_sample_browser_visibility()
         self.refresh()
         self._on_page_shown()
+
+    def update_sample_browser_visibility(self):
+        """Show the main window's sample browser only where a page follows it
+        (the Analysis page's Gating tab); the main window shows it again on
+        the next main tab change."""
+        signal = getattr(self.bus, 'sampleBrowserVisibilityRequested', None)
+        if signal is not None:
+            signal.emit(self._active and self.tabs.currentWidget() is self.pages[6]
+                        and self.pages[6].gating_view.is_shown())
+
+    def _on_sample_selected(self, _sample_path: str):
+        """A sample was picked in the sample browser: redraw the Gating tab
+        once the main window has loaded it."""
+        if self._active and self._available() and self.tabs.currentWidget() is self.pages[6]:
+            QTimer.singleShot(0, self.pages[6].gating_view.sample_changed)
 
     def _on_page_shown(self):
         page = self.tabs.currentWidget()
@@ -3623,6 +3824,8 @@ class PluginWidget(QWidget):
             self._restore_session()
         elif page is self.pages[4]:
             self._restore_characterisation()
+        elif page is self.pages[6] and page.gating_view.is_shown():
+            page.gating_view.on_shown()
 
     # -- refresh and status ------------------------------------------------------
 
@@ -3965,6 +4168,18 @@ class PluginWidget(QWidget):
 
     def on_setting_changed(self, key, value):
         self.state.settings[key] = value
+        self.state_changed()
+
+    def settings_at_defaults(self, keys) -> bool:
+        """True when every setting in *keys* has its default value."""
+        return all(self.state.settings.get(key) == fcs.DEFAULT_SETTINGS[key] for key in keys)
+
+    def restore_default_settings(self, keys):
+        """Put the settings in *keys* back to their defaults, as one change."""
+        if self.settings_at_defaults(keys):
+            return
+        for key in keys:
+            self.state.settings[key] = deepcopy(fcs.DEFAULT_SETTINGS[key])
         self.state_changed()
 
     def _scatter_transforms(self, channels) -> dict:
@@ -5077,12 +5292,12 @@ class PluginWidget(QWidget):
         return {key: sum(len(af_profiles[n].get('spectra') or []) for n in names if n in af_profiles) >= 2
                 for key, names in self.export_af_lists(list(keys)).items()}
 
-    def live_unmixing_signature(self, keys) -> dict | None:
+    def live_unmixing_signature(self, keys, overrides: dict | None = None) -> dict | None:
         """Everything that decides the FlowCode-unmixed values of *keys* apart
         from the raw files: the characterisation, the spectral model, the
         experiment's method and each sample's spectra set, the AF libraries,
-        the FlowCode gates and the section 5 settings. None without a saved
-        characterisation."""
+        the FlowCode gates and the section 5 settings (with *overrides*, as
+        ``export_job``). None without a saved characterisation."""
         fc = self.saved_spectra()
         if fc is None:
             return None
@@ -5091,7 +5306,11 @@ class PluginWidget(QWidget):
         af_profiles = _process(self.controller).get('af_profiles') or {}
         af_lists = self.export_af_lists(list(keys))
         used = sorted({n for names in af_lists.values() for n in names})
-        settings = {k: self.state.settings.get(k) for k in fcs.SECTION5_SETTINGS}
+        merged = {**self.state.settings, **(overrides or {})}
+        settings = {k: merged.get(k) for k in fcs.SECTION5_SETTINGS + fcs.CALIBRATION_SETTINGS}
+        tandems = self.tandem_selection()
+        if overrides and 'tandem_tags' in overrides:
+            tandems = [t for t in tandems if t in overrides['tandem_tags']]
         return {
             'plugin': fcs.PLUGIN_VERSION,
             'characterisation': fc.characterisation_id(),
@@ -5103,23 +5322,24 @@ class PluginWidget(QWidget):
             'af_spectra': {n: fcs._digest(af_profiles[n].get('spectra')) for n in used if n in af_profiles},
             'gates': {name: (self.state.gates.get(name) or {}).get('vertices_raw') for name in fcs.GATE_NAMES},
             'settings': settings,
-            'tandems': self.tandem_selection(),
+            'tandems': tandems,
         }
 
-    def live_unmix_inputs(self, keys) -> dict:
+    def live_unmix_inputs(self, keys, overrides: dict | None = None) -> dict:
         """What a worker needs to FlowCode-unmix *keys* as section 5 would
-        export them (``flowcode_export.live_sample_events``). Raises
-        ValueError when it cannot. Main thread."""
+        export them (``flowcode_export.live_sample_events``); with
+        *overrides*, as it would with those section 5 settings
+        (``export_job``). Raises ValueError when it cannot. Main thread."""
         if self.section_status(4)[0] != 'done':
             raise ValueError('Characterise the backbone in section 4 first.')
         fc = self.export_spectra()
         layout = fce.build_export_layout(self.controller)
         self._sync_unmixing_inputs()
-        job = self.export_job(fc, layout, list(keys))
+        job = self.export_job(fc, layout, list(keys), overrides=overrides)
         if job is None:
             raise ValueError('The AF libraries could not be read.')
         plan, af_by_sample, unmix_fn, extra_channels, _keywords, _tandems = job
-        signature = self.live_unmixing_signature(keys)
+        signature = self.live_unmixing_signature(keys, overrides)
         from honeychrome import settings as app_settings
         max_bytes = int(getattr(app_settings, 'unmixing_cache_gb_retrieved', 8)) * 1024 ** 3
         return {'layout': layout, 'plan': plan, 'af_by_sample': af_by_sample, 'unmix_fn': unmix_fn,
@@ -5253,6 +5473,13 @@ class PluginWidget(QWidget):
         if last.get('tandem_tags'):
             text += (f' Tandem breakdown ({", ".join(last["tandem_tags"])}) was corrected in '
                      f'{last.get("tandem_corrected", 0)} sample(s); the estimates are in the same file.')
+        calibration = last.get('calibration')
+        if calibration:
+            text += ' Combination calibration (calibrated / identifiable; largest changes):<br>' + '<br>'.join(
+                f'&nbsp;&nbsp;{name}: {row["calibrated"]} / {row["identifiable"]}'
+                + (f'; {", ".join(f"{c} {v:.2f}" for c, v in row["largest"])}' if row['largest'] else '')
+                + (f'; not identifiable: {", ".join(row["not_identifiable"])}' if row['not_identifiable'] else '')
+                for name, row in calibration.items())
         return text
 
     def start_export(self):
@@ -5284,7 +5511,8 @@ class PluginWidget(QWidget):
         self._sync_unmixing_inputs()
         design = fc.design
         job = {'design': design, 'folder': self.export_folder(), 'current': None, 'samples': [],
-               'inputs': state.section_inputs(5, self.fingerprint()), 'fc': fc, 'tandems': [], 'tandem': None}
+               'inputs': state.section_inputs(5, self.fingerprint()), 'fc': fc, 'tandems': [], 'tandem': None,
+               'scales': None, 'calibrate': self.calibration_mode(fc) != 'off'}
         in_library = self.export_library_combos(sample_keys)
 
         def on_block(summary):
@@ -5293,11 +5521,16 @@ class PluginWidget(QWidget):
         def on_tandem(records):
             job['tandem'] = records
 
+        def on_scales(scales):
+            job['scales'] = scales
+
         def sample_done(sample_key, n_events):
             empty = fcc.debarcode_summary(np.zeros(0, dtype=np.int64), design)
             summary = job['current'] or empty
             if job['tandems']:
                 summary = dict(summary, tandem=job['tandem'] or [])
+            if job['calibrate']:
+                summary = dict(summary, combo_scales=job['scales'])
             if in_library is not None:
                 lib, own = in_library[sample_key]
                 outside = (sum(n for c, n in summary['per_combo'].items() if c not in own)
@@ -5306,8 +5539,10 @@ class PluginWidget(QWidget):
             job['samples'].append((sample_key, summary))
             job['current'] = None
             job['tandem'] = None
+            job['scales'] = None
 
-        job_inputs = self.export_job(fc, layout, sample_keys, on_block=on_block, on_tandem=on_tandem)
+        job_inputs = self.export_job(fc, layout, sample_keys, on_block=on_block, on_tandem=on_tandem,
+                                     on_scales=on_scales)
         if job_inputs is None:
             page.set_run_status('The AF libraries of the selected samples could not be read.', problem=True)
             return
@@ -5350,11 +5585,37 @@ class PluginWidget(QWidget):
             self._export_job = None
         self.refresh()
 
-    def export_job(self, fc, layout, sample_keys, on_block=None, on_tandem=None):
+    def calibration_mode(self, fc) -> str:
+        """The per-sample combination calibration an export with *fc* uses:
+        'on', 'brightness' or 'off' (switched off, no FRET correction, or a
+        correction other than the per-combination one). Also the
+        FLOWCODECALIBRATION keyword."""
+        settings = self.state.settings
+        if not (settings.get('calib_combos') and fc.fret_corrected and settings.get('correction') == 'combo'):
+            return 'off'
+        return 'brightness' if settings.get('calib_brightness') else 'on'
+
+    @staticmethod
+    def _calibration_noise(plan):
+        """The noise model (cells) the combination calibration weights
+        detectors with: the experiment's, when it unmixes with M2pg; else
+        None (Poisson-like weights)."""
+        from honeychrome.controller_components import unmix_method as um
+
+        state = plan.state
+        if state is None or state.method != um.M2PG or state.noise is None:
+            return None
+        return state.noise.model_for(False)
+
+    def export_job(self, fc, layout, sample_keys, on_block=None, on_tandem=None, on_scales=None,
+                   overrides: dict | None = None):
         """``(plan, {sample: AFState}, per-chunk function, extra channels,
         keywords, ticked tandems)`` of a FlowCode unmix of *sample_keys*:
         what the export writes and the Analysis page's live unmix counts.
-        None when an AF library cannot be read. Main thread."""
+        *overrides* replace section 5 settings for this unmix only (the
+        corrected gating viewer's views); a 'tandem_tags' override narrows
+        the ticked tandems. None when an AF library cannot be read. Main
+        thread."""
         state = self.state
         plan = self.unmix_plan(sample_keys)
         af_lists = self.export_af_lists(sample_keys)
@@ -5365,13 +5626,16 @@ class PluginWidget(QWidget):
         names = list(layout.fluor_names)
         spectra = np.asarray(plan.spectra, dtype=np.float64)
         tandems, tandem_pool = self.export_tandems()
+        settings = {**state.settings, **(overrides or {})}
+        if overrides and 'tandem_tags' in overrides:
+            tandems = [t for t in tandems if t.fluor in overrides['tandem_tags']]
         records = [state.gates[name] for name in fcs.GATE_NAMES if name in state.gates]
         unmix_fn = fcc.staged_export_fn(fc, spectra, names, plan.final, records, layout.pnn_raw_export,
-                                        dict(state.settings), on_block=on_block, tandems=tandems,
+                                        settings, on_block=on_block, tandems=tandems,
                                         tandem_pool=tandem_pool, on_tandem=on_tandem,
-                                        debarcode_fn=plan.debarcode)
-        if not tandems:
-            unmix_fn.prepare = None
+                                        debarcode_fn=plan.debarcode,
+                                        calibration_record=state.gates.get(fcs.SINGLETS_GATE),
+                                        noise=self._calibration_noise(plan), on_scales=on_scales)
         extra_channels = ([fcc.FLOWCODE_CHANNEL, fcc.FLOWCODE_ID_CHANNEL]
                           + [fcc.combo_channel_name(n) for n in design.combo_names])
         keywords = {
@@ -5379,6 +5643,7 @@ class PluginWidget(QWidget):
             'FLOWCODECOMBOS': fcc.combos_keyword(design),
             'FLOWCODECHARACTERISATION': fc.characterisation_id(),
         }
+        keywords['FLOWCODECALIBRATION'] = self.calibration_mode(fc)
         if not fc.fret_corrected:
             keywords['FLOWCODECORRECTION'] = fa.NO_CORRECTION_KEYWORD
             keywords['FLOWCODEWARNING'] = fcs.NO_FRET_WARNING
@@ -5413,11 +5678,13 @@ class PluginWidget(QWidget):
         events = sum(s['total_events'] for _n, s in rows)
         barcoded = sum(sum(s['per_combo'].values()) for _n, s in rows)
         tandem_corrected = sum(1 for _n, s in rows if any(r['beta'] for r in s.get('tandem') or ()))
+        calibration = ({name: fcc.calibration_summary(s.get('combo_scales'), job['design']) for name, s in rows}
+                       if job['calibrate'] else None)
         state.last_export = {'time': datetime.now().strftime('%Y-%m-%d %H:%M'), 'folder': str(folder),
                              'n_samples': len(rows), 'events': int(events), 'barcoded': int(barcoded),
                              'tandem_tags': [t.fluor for t in job['tandems']],
                              'tandem_corrected': int(tandem_corrected),
-                             'no_fret': not job['fc'].fret_corrected}
+                             'no_fret': not job['fc'].fret_corrected, 'calibration': calibration}
         if job['inputs'] == state.section_inputs(5, self.fingerprint()):
             state.mark_completed(5, self.fingerprint())
         page.set_run_status(f'Done: {len(rows)} sample(s) exported.')
@@ -5430,7 +5697,8 @@ class PluginWidget(QWidget):
         state = self.state
         fc = job['fc']
         design = job['design']
-        settings = {k: state.settings.get(k) for k in fcs.SECTION4_SETTINGS + fcs.SECTION5_SETTINGS}
+        settings = {k: state.settings.get(k) for k in
+                    fcs.SECTION4_SETTINGS + fcs.SECTION5_SETTINGS + fcs.CALIBRATION_SETTINGS}
         settings['debarcode_method'] = self.debarcode_method()
         plan = job['plan']
         return {
@@ -5450,6 +5718,7 @@ class PluginWidget(QWidget):
                                              'no_fret_acknowledged': state.no_fret_acknowledged}),
             'settings': settings,
             'final_unmix': plan.label,
+            'calibration': self.calibration_mode(fc),
             'unmixing_method_token': plan.token,
             'sample_unmixing': job.get('methods') or {},
             'fingerprint': fc.fingerprint(),

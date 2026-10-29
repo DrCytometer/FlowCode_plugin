@@ -57,8 +57,9 @@ def corrected_loader(unmix_fn, af_by_sample: dict, detectors, scatter_names, bas
     key: AFState of its export library}) and the raw events for any other.
 
     unmix_fn      : ``PluginWidget.export_job``'s per-chunk function
-                    (``staged_export_fn``); its ``prepare`` (None without
-                    tandem tags) estimates the sample's tandem breakdown.
+                    (``staged_export_fn``); its ``prepare`` debarcodes the
+                    sample and estimates its calibration and tandem
+                    breakdown.
     detectors     : the fluorescence columns the base loader returns.
     scatter_names : its scatter columns (FlowCode scatter gates are found
                     by name among both).

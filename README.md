@@ -1,6 +1,6 @@
 # FlowCode plugin for Honeychrome
 
-FlowCode debarcoding with FRET and spillover correction for spectral flow cytometry. The plugin is a Honeychrome tab (`FlowCode`) and a Python port of the FlowCodeUnmix 0.6.0 AF-matched staged pipeline, extended with a through-origin error model, a too-few-tag rescue and a tandem-breakdown check.
+FlowCode debarcoding with FRET and spillover correction for spectral flow cytometry. The plugin is a Honeychrome tab (`FlowCode`) and a Python port of the FlowCodeUnmix 0.6.1 AF-matched staged pipeline, extended with a through-origin error model, a too-few-tag rescue and a tandem-breakdown check.
 
 Contents
 
@@ -65,14 +65,14 @@ The order of work (shown, with buttons that open each AutoSpectral page, in the 
 1. **AF profiles** (AutoSpectral › Autofluorescence): extract them for the matched unstained and assign every sample to export.
 2. **Noise model** (AutoSpectral › Noise, recommended): *Model Noise*, then *Use noise model*. It is fitted on the controls only. Model it before section 3 if debarcoding is to use it.
 3. **FlowCode sections 1 to 4.**
-4. **Spectral corrections** (AutoSpectral › Spectral Correction, optional): *Fix Unmix* with the tag fluorophores in its *Fluorophores kept fixed* list (the button fills the list in). Fix My Unmix reads the raw FlowCode samples, where FRET is still uncorrected; with the tag rows free it would absorb FRET into the tag spectra and the FlowCode correction would remove the same error a second time.
+4. **Spectral corrections** (AutoSpectral › Spectral Correction, optional): *Fix Unmix* with the tag fluorophores in its *Fluorophores kept fixed* list (the button fills the list in). Fix My Unmix reads the raw FlowCode samples, where FRET is still uncorrected; with the tag rows free it would absorb FRET into the tag spectra and the FlowCode correction would remove the same error a second time. If you have performed the single-stained controls per the flow protocol, this step should not be necessary.
 5. **Section 5 export**, or **section 6** directly: it can unmix live without exporting.
 
 The compiled kernels make the noise model and spectral variants fast. The installer builds them and checks that they load; in a manual install, build them with `bundled_plugins/build_som_kernel.py`, `build_autospectral_opt_kernel.py` and `build_fix_my_unmix_kernel.py`. Without them the noise model runs in NumPy and the export asks you to confirm an estimated run time first. The Spectral Variants page's positivity thresholds, when computed, are the too-many rescue's noise floor; otherwise it is the 99.5th percentile of the matched unstained.
 
 ### 2.2 Install and update
 
-One command installs Honeychrome (`autospectral` branch), the compiled kernels and this plugin, and the same command updates them. Step-by-step instructions for people new to the Terminal, troubleshooting and the list of what goes where are in [STUDENT_INSTALL_GUIDE.md](STUDENT_INSTALL_GUIDE.md). An administrator account is needed the first time.
+One command installs Honeychrome (`autospectral` branch), the compiled kernels and this plugin, and the same command updates them. Step-by-step instructions for people new to the Terminal, troubleshooting and the list of what goes where are in [INSTALL_GUIDE.md](INSTALL_GUIDE.md). An administrator account is needed the first time.
 
 - **Mac** (Terminal):
 
@@ -112,7 +112,7 @@ For developers who already run Honeychrome from a source clone of the `autospect
    flowcode_analysis_page.py
    ```
 
-   Only `*_tab.py` files are discovered. The tab puts its own folder on `sys.path` and imports the others, so all nine must sit side by side. Copy files, not symlinks. `flowcode_rescue_assess.py` is optional and can stay out of the plugins folder.
+   Only `*_tab.py` files are discovered. The tab puts its own folder on `sys.path` and imports the others, so all nine must sit side by side. Copy files, not symlinks.
 
 2. Start Honeychrome from your Python environment, in the clone's folder:
 
@@ -390,4 +390,4 @@ At least 5 combinations with and 5 without the tag are required. The backbone st
 - The rescue transform is a fixed Honeychrome logicle, not AutoSpectral's cytometer-specific biexponential.
 - The error model is a through-origin fit with pair products measured from the untransduced median, with a shared pairwise fallback. It replaces R's centred per-combination fit and global error.
 - The too-few-tag rescue, the export AF library (assigned profiles plus the profiles the thresholds were set with) and the tandem-breakdown check have no R counterpart.
-- Per-sample threshold overrides are not available.
+- Per-sample threshold overrides are not available (and should not be necessary).

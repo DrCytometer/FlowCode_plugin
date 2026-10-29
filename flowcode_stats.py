@@ -969,6 +969,7 @@ def fold_change_bars_figure(results_df: pd.DataFrame, title: str, group_a: str, 
         if fc_threshold > 0:
             ax.axhline(y, color='#7f7f7f', linestyle='--', linewidth=0.8)
     ax.axhline(0.0, color='#7f7f7f', linewidth=0.8)
+    ax.grid(False)
     ax.set_xlim(-0.6, n - 0.4)
     ax.set_xticks(x)
     ax.set_xticklabels(bars['feature'].astype(str).tolist(), rotation=90, fontsize=6)
@@ -1121,7 +1122,12 @@ def combination_figure(stats: dict, combination: str, pair: tuple, fdr_scope: st
 # Per-combination marker intensities
 # ---------------------------------------------------------------------------
 
-MARKER_DEFAULTS = {'min_events': 10, 'threshold': 0.03, 'spillover_limit': 0.03}
+MARKER_DEFAULTS = {'min_events': 10, 'threshold': 0.03, 'spillover_k': 'auto'}
+# Values of k searched by ``calibrate_spillover_k``; the last is the largest
+# k it returns.
+SPILLOVER_K_GRID = tuple(round(0.25 * i, 2) for i in range(17))
+# k used when there are no control combinations to calibrate it on.
+SPILLOVER_K_NO_CONTROLS = 1.0
 MARKER_REFERENCES = {'tags': 'the tag model (other combinations, same tags)',
                      'controls': 'the control combinations', 'all': 'all other barcoded cells'}
 # Huber tuning constant and iterations of the tag model.
@@ -1367,20 +1373,125 @@ def marker_deltas_by_library(data: dict, counts: pd.DataFrame, channels: list, u
 
 def _marker_significance(results: pd.DataFrame, pval_threshold: float, threshold: float, fdr_scope: str,
                          use_treat: bool) -> pd.DataFrame:
-    """Cluster-first significance of the marker results that are tested
-    (``tested``); the others keep their estimates, with no adjusted
-    p-value and not significant."""
-    tested = results['tested'].astype(bool) if 'tested' in results.columns else pd.Series(True, results.index)
-    if not tested.any():
-        return results.assign(significant=False)
-    done = ds.apply_significance(results[tested], pval_threshold, threshold, fdr_scope=fdr_scope,
-                                 use_treat=use_treat, hierarchical=True)
-    rest = results[~tested].copy()
-    for col in done.columns:
-        if col not in rest.columns:
-            rest[col] = np.nan
-    rest['significant'] = False
-    return pd.concat([done, rest[done.columns]]).loc[results.index]
+    """Cluster-first significance of the marker results, with the
+    combinations as families; p-values come from the 'SE' column (the total
+    standard error after ``inflate``)."""
+    return ds.apply_significance(results, pval_threshold, threshold, fdr_scope=fdr_scope, use_treat=use_treat,
+                                 hierarchical=True)
+
+
+def _row_populations(results: pd.DataFrame) -> pd.Series:
+    """Each marker result's population ('' when the results have one)."""
+    if 'population' not in results.columns:
+        return pd.Series('', index=results.index)
+    return results['population'].fillna('').astype(str)
+
+
+def inflate(results: pd.DataFrame, k) -> pd.DataFrame:
+    """
+    Marker results with the tag spillover added to each feature's standard
+    error, without refitting:
+
+        SE_total² = SE_moderated² + (k × spillover)²
+
+    and t, the confidence interval and the 'SE' that the p-values are
+    computed from (``_marker_significance``) taken from SE_total. *k* is a
+    number, or {population: k} (a population not listed takes k = 0).
+    Features without a spillover value (NaN) keep the moderated SE, so
+    k = 0 or no spillover gives the moderated statistics unchanged.
+
+    Adds 'se_moderated', 'se_total', 'k' and 'spillover_dominant' (k ×
+    spillover larger than SE_moderated: the uncertainty is mostly tag
+    spillover). Results saved before the inflation existed (with a
+    'tested' column and no 'se_moderated') are taken as moderated.
+    """
+    from honeychrome.controller_components import moderated_stats as ms
+
+    out = results.drop(columns=['tested'], errors='ignore').copy()
+    if out.empty:
+        return out.assign(se_moderated=pd.Series(dtype=float), se_total=pd.Series(dtype=float),
+                          k=pd.Series(dtype=float), spillover_dominant=pd.Series(dtype=bool))
+    se0 = (out['se_moderated'] if 'se_moderated' in out.columns else out['SE']).astype(float).values
+    if isinstance(k, dict):
+        kk = _row_populations(out).map(lambda p: float(k.get(p, 0.0))).values.astype(float)
+    else:
+        kk = np.full(len(out), float(k))
+    spill = (out['spillover'].astype(float).values if 'spillover' in out.columns
+             else np.full(len(out), np.nan))
+    extra = np.where(np.isfinite(spill), kk * spill, 0.0)
+    se = np.sqrt(se0 ** 2 + extra ** 2)
+    df = out['df.total'].astype(float).values
+    q = ms._t_isf(np.full(len(out), 0.025), df)
+    est = out['logFC'].astype(float).values
+    with np.errstate(divide='ignore', invalid='ignore'):
+        out['t'] = est / se
+    out['CI.L'] = est - q * se
+    out['CI.R'] = est + q * se
+    out['se_moderated'] = se0
+    out['se_total'] = se
+    out['SE'] = se
+    out['k'] = kk
+    out['spillover_dominant'] = extra > se0
+    return out
+
+
+def calibrate_spillover_k(results: pd.DataFrame, control_combos: list | None, pval_threshold: float,
+                          threshold: float, fdr_scope: str, use_treat: bool,
+                          grid: tuple = SPILLOVER_K_GRID) -> tuple:
+    """
+    k for ``inflate`` from the control combinations, a built-in null: per
+    population, the smallest k on *grid* at which no feature of a control
+    combination is significant under the marker test's own rule
+    (``_marker_significance`` with these thresholds), pooled over the
+    population's comparisons.
+
+    Without control combinations among the results every population takes
+    ``SPILLOVER_K_NO_CONTROLS``; a population whose controls still have
+    hits at the largest k takes it. Both are said in the notes. With a
+    global FDR the populations share one correction, so the search is
+    repeated (up to three passes) until no population's k changes.
+
+    Returns ({population: k}, {population: number of control combinations
+    tested}, notes).
+    """
+    pops = list(dict.fromkeys(_row_populations(results)))
+    controls = set(control_combos or [])
+    is_control = results['combination'].isin(controls).values
+    n_controls = {p: int(results.loc[is_control & (_row_populations(results) == p).values,
+                                     'combination'].nunique()) for p in pops}
+    if not is_control.any():
+        return ({p: SPILLOVER_K_NO_CONTROLS for p in pops}, n_controls,
+                [f'no control combinations among the results, so k = {SPILLOVER_K_NO_CONTROLS:g}.'])
+    row_pop = _row_populations(results).values
+    ks = {p: float(grid[0]) for p in pops}
+    shared = fdr_scope == 'global' and len(pops) > 1
+
+    def control_hits(kmap: dict, pop: str) -> bool:
+        rows = np.ones(len(results), dtype=bool) if shared else row_pop == pop
+        res = _marker_significance(inflate(results[rows], kmap), pval_threshold, threshold, fdr_scope, use_treat)
+        hit = res['significant'].values.astype(bool) & is_control[rows] & (row_pop[rows] == pop)
+        return bool(hit.any())
+
+    for _pass in range(3 if shared else 1):
+        changed = False
+        for p in pops:
+            chosen = float(grid[-1])
+            for k in grid:
+                if not control_hits({**ks, p: float(k)}, p):
+                    chosen = float(k)
+                    break
+            changed |= chosen != ks[p]
+            ks[p] = chosen
+        if not changed:
+            break
+    notes = []
+    for p in pops:
+        if n_controls[p] == 0:
+            notes.append(f'{p + ": " if p else ""}no control combination tested, k = {ks[p]:g}.')
+        elif ks[p] >= float(grid[-1]) and control_hits(ks, p):
+            notes.append(f'{p + ": " if p else ""}control combinations still have hits at the largest k '
+                         f'({ks[p]:g}); they are not explained by tag spillover.')
+    return ks, n_controls, notes
 
 
 def marker_label(group: str, level: str | None = None) -> str:
@@ -1392,7 +1503,7 @@ def marker_statistics(deltas: pd.DataFrame, meta: pd.DataFrame, groups: dict, *,
                       split_by: dict | None = None, threshold: float = MARKER_DEFAULTS['threshold'],
                       pval_threshold: float = 0.05, fdr_scope: str = 'per_comparison',
                       use_treat: bool = False, spillover: pd.DataFrame | None = None,
-                      spillover_limit: float | None = None) -> dict:
+                      spillover_k=MARKER_DEFAULTS['spillover_k'], control_combos: list | None = None) -> dict:
     """
     Does a combination change a marker against its reference cells? For
     every group (within each population and split level), each feature's
@@ -1406,14 +1517,19 @@ def marker_statistics(deltas: pd.DataFrame, meta: pd.DataFrame, groups: dict, *,
 
     *spillover* (samples × features, ``marker_spillover``) adds each
     feature's mean expected spillover over the group's samples
-    ('spillover'). With *spillover_limit*, features above it are not tested
-    ('tested' False: they keep their estimate but take no part in the FDR
-    and are never significant), because the combination's own tags could
-    move the marker by that much.
+    ('spillover'), and every feature stays tested with its standard error
+    inflated by it (``inflate``): the combination's own tags could move the
+    marker by that much, so the test trusts the feature less. *spillover_k*
+    is the factor k: a number, or 'auto' to calibrate it per population on
+    the *control_combos* (``calibrate_spillover_k``). None, or no
+    *spillover*, leaves the moderated statistics as they are.
 
-    Returns {'results' (stacked, one 'comparison' per group and level),
-    'comparisons', 'sets' ({comparison: {'group', 'level', 'units'}}),
-    'notes'}. Raises RuntimeError when no group can be tested.
+    Returns {'results' (stacked, one 'comparison' per group and level, with
+    its 'population'), 'comparisons', 'sets' ({comparison: {'group',
+    'level', 'population', 'units'}}), 'notes', 'spillover_k' ({population:
+    k used} or None), 'spillover_k_auto', 'spillover_controls'
+    ({population: control combinations calibrated on}), 'control_combos'}.
+    Raises RuntimeError when no group can be tested.
     """
     from honeychrome.controller_components import moderated_stats as ms
 
@@ -1450,38 +1566,52 @@ def marker_statistics(deltas: pd.DataFrame, meta: pd.DataFrame, groups: dict, *,
             table = ms.top_table(fit, 0)
             table.insert(0, 'feature', list(deltas.columns))
             table['comparison'] = label
+            table['population'] = str(strata[members[0]]) if strata else ''
             table['n_samples'] = np.isfinite(expr).sum(axis=1)
-            if spillover is not None:
-                spill = spillover.reindex(index=members, columns=deltas.columns).mean(axis=0).values
-                table['spillover'] = spill
-                table['tested'] = ~(np.isfinite(spill) & (spill > spillover_limit)) if spillover_limit is not None \
-                    else True
-            else:
-                table['tested'] = True
+            table['spillover'] = (spillover.reindex(index=members, columns=deltas.columns).mean(axis=0).values
+                                  if spillover is not None else np.nan)
             frames.append(table[np.isfinite(table['logFC'].astype(float))])
             labels.append(label)
-            tested_sets[label] = {'group': g, 'level': lv, 'units': list(members)}
+            tested_sets[label] = {'group': g, 'level': lv, 'population': table['population'].iloc[0],
+                                  'units': list(members)}
     if not frames:
         raise RuntimeError(' '.join(notes) or 'No group has marker values to test.')
     results = pd.concat(frames, ignore_index=True).merge(meta, on='feature', how='left', sort=False)
-    results = _marker_significance(results, pval_threshold, threshold, fdr_scope, use_treat)
-    return {'results': results, 'comparisons': labels, 'sets': tested_sets, 'notes': notes,
-            'spillover_limit': spillover_limit if spillover is not None else None}
+    markers = {'results': results.assign(se_moderated=results['SE'].astype(float)), 'comparisons': labels,
+               'sets': tested_sets, 'notes': notes, 'control_combos': list(control_combos or [])}
+    out = reapply_marker_thresholds(markers, pval_threshold, threshold, fdr_scope, use_treat,
+                                    spillover_k if spillover is not None else None)
+    out['notes'] = notes + out.pop('spillover_k_notes')
+    return out
 
 
 def reapply_marker_thresholds(markers: dict, pval_threshold: float, threshold: float, fdr_scope: str,
-                              use_treat: bool, spillover_limit: float | None = None) -> dict:
-    """*markers* with significance recomputed for new thresholds and, when
-    the results carry spillover values, a new spillover limit (None: every
-    feature tested), without refitting."""
+                              use_treat: bool, spillover_k=MARKER_DEFAULTS['spillover_k']) -> dict:
+    """
+    *markers* with the spillover inflation (``inflate``) and significance
+    recomputed for new thresholds and a new *spillover_k* (a number, 'auto'
+    to calibrate it again on the control combinations, or None for the
+    moderated statistics), without refitting. Results without spillover
+    values are left uninflated. The calibration notes are in
+    'spillover_k_notes'.
+    """
     out = dict(markers)
     results = markers['results']
-    if 'spillover' in results.columns:
-        spill = results['spillover'].astype(float)
-        results = results.assign(tested=~(np.isfinite(spill) & (spill > spillover_limit))
-                                 if spillover_limit is not None else True)
-        out['spillover_limit'] = spillover_limit
-    out['results'] = _marker_significance(results, pval_threshold, threshold, fdr_scope, use_treat)
+    has_spill = 'spillover' in results.columns and np.isfinite(results['spillover'].astype(float)).any()
+    pops = list(dict.fromkeys(_row_populations(results)))
+    notes, controls_used = [], None
+    if spillover_k is None or not has_spill:
+        k_map = None
+    elif spillover_k == 'auto':
+        k_map, controls_used, notes = calibrate_spillover_k(results, markers.get('control_combos'),
+                                                            pval_threshold, threshold, fdr_scope, use_treat)
+    else:
+        k_map = {p: float(spillover_k) for p in pops}
+    inflated = inflate(results, k_map if k_map is not None else 0.0)
+    out['results'] = _marker_significance(inflated, pval_threshold, threshold, fdr_scope, use_treat)
+    out.update(spillover_k=k_map, spillover_k_auto=k_map is not None and spillover_k == 'auto',
+               spillover_controls=controls_used, spillover_k_notes=notes)
+    out.pop('spillover_limit', None)
     return out
 
 
@@ -1511,16 +1641,16 @@ def marker_figures(markers: dict, comparison: str, pval_threshold: float, thresh
                         'results': None}
 
     grid = view.assign(feature=view['combination'], comparison=view['channel'])
-    untested = ([] if 'tested' not in view.columns else
-                list(zip(view.loc[~view['tested'].astype(bool), 'combination'],
-                         view.loc[~view['tested'].astype(bool), 'channel'])))
+    dominant = view['spillover_dominant'].fillna(False).astype(bool) if 'spillover_dominant' in view.columns \
+        else pd.Series(False, index=view.index)
+    hatched = list(zip(view.loc[dominant, 'combination'], view.loc[dominant, 'channel']))
 
     def heatmap():
         fig = dp.make_comparison_heatmap_figure(
             grid, f'{comparison}: marker differences (significant)'
-            + ('; hatched: not tested (tag spillover above the limit)' if untested else ''),
+            + ('; hatched: uncertainty mostly tag spillover (k × spillover > moderated SE)' if hatched else ''),
             is_dark=is_dark, run_label=run_label, order=heatmap_order, value_label='Δ transformed intensity')
-        _hatch_cells(fig, untested)
+        _hatch_cells(fig, hatched)
         return fig
 
     add('marker_heatmap', 'Marker heatmap', heatmap)
@@ -1652,12 +1782,12 @@ def marker_value_figure(markers: dict, feature: str, comparison: str, fdr_scope:
         text = f"{comparison}: Δ {float(row['logFC']):+.3f}"
         if np.isfinite(float(row.get('CI.L', np.nan))) and np.isfinite(float(row.get('CI.R', np.nan))):
             text += f" [{float(row['CI.L']):+.3f}, {float(row['CI.R']):+.3f}]"
-        if 'tested' in row.index and not bool(row['tested']):
-            text += f", not tested: tag spillover {float(row['spillover']):.3f}"
-        else:
-            text += f", {P_NAMES.get(p_col, p_col)} = {float(row[p_col]):.3g}"
-            if np.isfinite(float(row.get('spillover', np.nan))):
-                text += f", tag spillover {float(row['spillover']):.3f}"
+        text += f", {P_NAMES.get(p_col, p_col)} = {float(row[p_col]):.3g}"
+        spill = float(row.get('spillover', np.nan))
+        if np.isfinite(spill):
+            se0, se1 = float(row.get('se_moderated', np.nan)), float(row.get('se_total', np.nan))
+            text += (f"\ntag spillover {spill:.3f}, k {float(row.get('k', 0.0)):g}: SE {se0:.3f} moderated, "
+                     f"{se1:.3f} total")
         lines.append(text)
     ax.set_title('\n'.join(lines), fontsize=9)
     handles = [Line2D([], [], marker='o', linestyle='', markerfacecolor='none', markeredgecolor=fg,

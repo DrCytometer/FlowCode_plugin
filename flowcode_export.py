@@ -52,7 +52,7 @@ PROBE_EVENTS = 5000
 JOB_LABEL = 'FlowCode export'
 
 LIVE_CACHE_SUBDIR = Path('cache') / 'flowcode_unmixed'
-LIVE_CACHE_VERSION = 1
+LIVE_CACHE_VERSION = 3
 
 
 # ---------------------------------------------------------------------------

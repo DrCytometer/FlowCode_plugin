@@ -7,6 +7,9 @@ gated on the FlowCode-unmixed data, and of the combinations' marker
 intensities.
 
 Sections
+    Gating      the experiment's unmixed gates over one sample's FlowCode-
+                unmixed events (uncorrected, standard or calibrated), view
+                only (flowcode_gating_view.py)
     Data        source (live unmix of the raw files, or the files section 5
                 exported), linked samples, populations (each ticked unmixed
                 gate), combinations and inclusion rules, counting
@@ -49,6 +52,7 @@ load it as a tab of its own.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -71,6 +75,7 @@ from honeychrome.view_components.help_toggle_widget import WheelBlocker
 
 import flowcode_analysis as fa
 import flowcode_figure_panel as fcfp
+import flowcode_gating_view as fcgv
 import flowcode_stats as fst
 from flowcode_state import NO_FRET_WARNING, OTHER_LIBRARY, library_label
 
@@ -101,6 +106,18 @@ HEATMAP_ORDERS = {'effect': 'By effect', 'alphabetical': 'Alphabetical'}
 SUMMARY_FIGURES = ('comparison_heatmap', 'sample_pca', 'qc')
 # Marker test tabs, drawn for the chosen marker group.
 MARKER_FIGURES = ('marker_table', 'marker_heatmap', 'marker_volcano', 'marker_combination')
+# Settings put back by the Restore defaults buttons. The design (groups,
+# reference, pairing, covariates, split, chosen markers and controls) is kept.
+STATS_DEFAULT_KEYS = ('run_counts', 'run_freq', 'run_markers', 'counts_method', 'normalisation', 'remove_clones',
+                      'clone_min_count', 'clone_min_pct', 'clone_max_levels', 'marker_reference',
+                      'marker_spillover', 'marker_spillover_k', 'marker_min_events', 'marker_threshold',
+                      'pval_threshold', 'fc_threshold', 'use_treat', 'fdr_scope')
+# Statistics settings applied to stored results without running them again.
+THRESHOLD_KEYS = ('pval_threshold', 'fc_threshold', 'use_treat', 'fdr_scope', 'marker_threshold',
+                  'marker_spillover_k')
+RULE_DEFAULT_KEYS = ('min_combo_events', 'min_sample_events')
+FIGURE_DEFAULT_KEYS = ('heatmap_order', 'heatmap_rows', 'n_loadings')
+RESTORE_TOOLTIP = 'Put these settings back to their default values.'
 
 
 def _figure_set(key: str) -> str:
@@ -136,7 +153,8 @@ HELP = (
     'different cells than in the main window; the events in the population are listed per sample so this '
     'can be checked. Unstained samples, single-stain controls (also copies of them elsewhere in the raw '
     'folder, matched by file name) and bead samples are left out unless their <i>Include</i> tick box is '
-    'ticked. <b>Count events</b> gates every sample and counts its events per combination in each population, '
+    'ticked. <b>Select all</b> and <b>Deselect all</b> tick or untick every sample in the table. '
+    '<b>Count events</b> gates every sample and counts its events per combination in each population, '
     'and sums each combination\'s marker intensities for the marker test; the counts are kept with the '
     'experiment and the marker sums in its <tt>cache/flowcode_analysis</tt> folder.</p>'
     '<p><b>Inclusion rules</b> (applied in this order): unticked combinations are left out; combinations '
@@ -180,11 +198,23 @@ HELP = (
     '(and population) with a moderated t, one value per sample. The default reference is the <i>tag model</i>: '
     'what the combination\'s own tags predict from the other combinations of the sample, so a tag fluorophore\'s '
     'spillover into a marker, shared by every combination with that tag, is not taken for an effect; the control '
-    'combinations or all other barcoded cells can be chosen instead. <i>Leave out features with high tag '
-    'spillover</i>: where the spillover spread of the combination\'s tags into the marker (spectral model, '
-    'characterisation and noise model) exceeds the limit on the display scale, the feature is not tested and is '
-    'hatched in the heatmap. Combinations are families (cluster-first FDR). Expanded clones removed from the '
-    'counts are also left out here.</p>'
+    'combinations or all other barcoded cells can be chosen instead. <i>Account for tag spillover</i>: the '
+    'spillover spread of the combination\'s tags into the marker (spectral model, characterisation and noise '
+    'model, on the display scale) is added to the feature\'s standard error, '
+    'SE<sub>total</sub>² = SE<sub>moderated</sub>² + (k × spillover)², and t, the p-value (TREAT included) and '
+    'the confidence interval come from SE<sub>total</sub>. Every feature stays tested; where the spillover can '
+    'move the marker, the test trusts it less. With <i>Auto (NON-Targetting)</i>, k is the smallest value '
+    '(0 to 4, steps of 0.25) at which the control combinations have no significant marker hits, found per '
+    'population; untick it to set k yourself. Features whose uncertainty is mostly spillover (k × spillover '
+    'above the moderated SE) are hatched in the heatmap. Combinations are families (cluster-first FDR). '
+    'Expanded clones removed from the counts are also left out here.</p>'
+    '<p><b>Gating</b> (first tab, view only): the experiment\'s Unmixed Data plots and gates over the '
+    'FlowCode-unmixed events of the sample picked in the sample browser, gated exactly as the counts (sample '
+    'overrides included), in three views: <i>Uncorrected</i> (the experiment\'s own unmix of the raw file), '
+    '<i>FlowCode standard</i> and <i>FlowCode calibrated</i> (with the per-sample combination calibration). '
+    'Highlight the barcoded events or one combination (red); the table gives each gate\'s % of its parent '
+    'and how many highlighted events change side against the uncorrected view, which is unmixed too for that '
+    'comparison (both are cached). Gates are edited in the main window.</p>'
     '<p><b>Results.</b> With the marker test, the <i>Markers</i> menu chooses the group whose combination × '
     'marker heatmap, volcano and table are shown (independent of the <i>Comparison</i> menu). Double-click a '
     'marker volcano point or a marker table row to plot that combination and marker in every sample '
@@ -303,18 +333,28 @@ class AnalysisPage(QWidget):
         self.section_tabs.setDocumentMode(True)
         outer.addWidget(self.section_tabs, stretch=1)
 
+        self.gating_view = fcgv.GatingSection(self)
+        self.section_tabs.addTab(self.gating_view, 'Gating')
         self._build_data(self._add_section('Data'))
         self._build_groups(self._add_section('Groups'))
         self._build_stats(self._add_section('Statistics'))
         self._build_results(self._add_section('Results', scroll=False))
         self._build_export(self._add_section('Export'))
-        try:
-            index = int(plugin.qsettings.value(f'open_section_{SECTION}', 0))
-        except (TypeError, ValueError):
-            index = 0
-        self.section_tabs.setCurrentIndex(index if 0 <= index < self.section_tabs.count() else 0)
+        titles = [self.section_tabs.tabText(i) for i in range(self.section_tabs.count())]
+        opened = str(plugin.qsettings.value(f'open_section_{SECTION}_title', 'Data') or 'Data')
+        self.section_tabs.setCurrentIndex(titles.index(opened) if opened in titles else titles.index('Data'))
         self.section_tabs.currentChanged.connect(
-            lambda i: plugin.qsettings.setValue(f'open_section_{SECTION}', int(i)))
+            lambda i: plugin.qsettings.setValue(f'open_section_{SECTION}_title', self.section_tabs.tabText(i)))
+        self.section_tabs.currentChanged.connect(self._on_section_changed)
+
+    def _on_section_changed(self, _index):
+        """The Gating tab follows the main window's sample browser: show the
+        browser there only, and draw the selected sample."""
+        update = getattr(self.plugin, 'update_sample_browser_visibility', None)
+        if update is not None:
+            update()
+        if self.gating_view.is_shown():
+            self.gating_view.on_shown()
 
     def reset_session(self):
         """Forget everything held for the previous experiment."""
@@ -401,6 +441,56 @@ class AnalysisPage(QWidget):
         bus = self.plugin.bus
         if bus is not None:
             bus.autoSaveRequested.emit()
+        self._update_default_buttons()
+
+    def _at_defaults(self, keys) -> bool:
+        s = self.settings
+        return all(s.get(key) == fa.ANALYSIS_DEFAULTS[key] for key in keys)
+
+    def _update_default_buttons(self):
+        for button, keys in ((self.stats_defaults_btn, STATS_DEFAULT_KEYS),
+                             (self.rule_defaults_btn, RULE_DEFAULT_KEYS),
+                             (self.figure_defaults_btn, FIGURE_DEFAULT_KEYS)):
+            button.setEnabled(not self._at_defaults(keys))
+
+    def _restore_defaults(self, keys) -> list:
+        """Put the settings in *keys* back to their defaults; returns those
+        that changed."""
+        s = self.settings
+        changed = [key for key in keys if s.get(key) != fa.ANALYSIS_DEFAULTS[key]]
+        for key in changed:
+            s[key] = deepcopy(fa.ANALYSIS_DEFAULTS[key])
+        if changed:
+            self._changed()
+        return changed
+
+    def _restore_rule_defaults(self):
+        if not self._restore_defaults(RULE_DEFAULT_KEYS):
+            return
+        s = self.settings
+        self._filling = True
+        try:
+            self.min_combo_spin.setValue(int(s['min_combo_events']))
+            self.min_sample_spin.setValue(int(s['min_sample_events']))
+        finally:
+            self._filling = False
+        self._apply_filters()
+        self._invalidate_stats()
+
+    def _restore_stats_defaults(self):
+        changed = self._restore_defaults(STATS_DEFAULT_KEYS)
+        if not changed:
+            return
+        self._fill_stats_choices()
+        if set(changed) - set(THRESHOLD_KEYS):
+            self._invalidate_stats()
+        else:
+            self._reapply_thresholds()
+        self._update_run_button()
+
+    def _restore_figure_defaults(self):
+        if self._restore_defaults(FIGURE_DEFAULT_KEYS):
+            self._show_results()
 
     def _controller(self):
         return self.plugin.controller
@@ -614,6 +704,13 @@ class AnalysisPage(QWidget):
         self.min_combo_spin.valueChanged.connect(lambda v: self._on_rule('min_combo_events', int(v)))
         self.min_sample_spin.valueChanged.connect(lambda v: self._on_rule('min_sample_events', int(v)))
         rl.addLayout(form)
+        self.rule_defaults_btn = QPushButton('Restore defaults')
+        self.rule_defaults_btn.setToolTip(RESTORE_TOOLTIP + ' (minimum events per combination and per sample)')
+        self.rule_defaults_btn.clicked.connect(self._restore_rule_defaults)
+        rule_row = QHBoxLayout()
+        rule_row.addWidget(self.rule_defaults_btn)
+        rule_row.addStretch()
+        rl.addLayout(rule_row)
         top.addWidget(rules, stretch=1)
         lay.addLayout(top)
 
@@ -628,6 +725,14 @@ class AnalysisPage(QWidget):
         lay.addWidget(self.filter_note)
 
         include_row = QHBoxLayout()
+        select_all_btn = QPushButton('Select all')
+        select_all_btn.setToolTip('Tick every readable sample in the table below for counting.')
+        select_all_btn.clicked.connect(lambda: self._set_all_use(True))
+        deselect_all_btn = QPushButton('Deselect all')
+        deselect_all_btn.setToolTip('Untick every sample in the table below.')
+        deselect_all_btn.clicked.connect(lambda: self._set_all_use(False))
+        include_row.addWidget(select_all_btn)
+        include_row.addWidget(deselect_all_btn)
         self.include_checks = {}
         for key, text in (('unstained', 'Include unstained samples'),
                           ('single_stain', 'Include single-stained controls'),
@@ -752,6 +857,20 @@ class AnalysisPage(QWidget):
         self.settings['use'][key] = item.checkState() == Qt.Checked
         self._changed()
         self._check_counts_current()
+        self._fill_groups()
+        self.refresh_status()
+
+    def _set_all_use(self, ticked: bool):
+        """Tick or untick every readable sample in the sample table for counting."""
+        if self.links is None:
+            return
+        use = self.settings.setdefault('use', {})
+        for key, info in self.links['files'].items():
+            if info['path'] is not None and info['status'] != fa.LINK_UNREADABLE:
+                use[key] = ticked
+        self._changed()
+        self._check_counts_current()
+        self._fill_data()
         self._fill_groups()
         self.refresh_status()
 
@@ -1659,6 +1778,16 @@ class AnalysisPage(QWidget):
         left = QWidget()
         left.setMaximumWidth(480)
         form = QFormLayout(left)
+        self.stats_defaults_btn = QPushButton('Restore defaults')
+        self.stats_defaults_btn.setToolTip(
+            'Put the tests, normalisation, clone, marker and threshold settings back to their default values. '
+            'Groups, reference, pairing, covariates, split and the chosen markers and control combinations '
+            'are kept.')
+        self.stats_defaults_btn.clicked.connect(self._restore_stats_defaults)
+        defaults_row = QHBoxLayout()
+        defaults_row.addWidget(self.stats_defaults_btn)
+        defaults_row.addStretch()
+        form.addRow(defaults_row)
         self.chk_counts = QCheckBox('Counts (negative binomial GLM, library-size offset)')
         self.chk_freq = QCheckBox('Frequencies (moderated linear model on log2 % of library size)')
         self.chk_markers = QCheckBox('Markers (each combination against reference cells of its sample)')
@@ -1721,14 +1850,19 @@ class AnalysisPage(QWidget):
             'predict from the other combinations of the sample, so a tag fluorophore\'s spillover into a marker, '
             'shared by every combination carrying that tag, is not taken for an effect. Control combinations: '
             'those ticked for Control normalisation (their tags may not be balanced). All other barcoded cells.')
-        self.chk_marker_spill = QCheckBox('Leave out features with high tag spillover')
+        self.chk_marker_spill = QCheckBox('Account for tag spillover')
         self.chk_marker_spill.setToolTip(
             'For each combination and marker, the spillover spread of the combination\'s tags into the marker at '
             'their median brightness (from the spectral model, the characterisation and the noise model), on the '
-            'display scale at the sample\'s level of the marker. Above the limit the feature is not tested: '
-            'its tags alone could move the marker that much. Untested features are hatched in the heatmap.')
-        self.sb_marker_spill = _float_spin(0.0, 1.0, 3, 0.01)
-        self.sb_marker_spill.setToolTip('Spillover limit, in transformed units (the display scale, 0 to 1).')
+            'display scale at the sample\'s level of the marker, is added to the standard error: '
+            'SE_total² = SE_moderated² + (k × spillover)². Every feature is tested; features whose uncertainty is '
+            'mostly spillover are hatched in the heatmap.')
+        self.chk_marker_k_auto = QCheckBox('Auto (NON-Targetting)')
+        self.chk_marker_k_auto.setToolTip(
+            'k is the smallest value (0 to 4, steps of 0.25) at which the control combinations (those ticked for '
+            'Control normalisation) have no significant marker hits, per population. Untick to set k.')
+        self.sb_marker_spill = _float_spin(0.0, 10.0, 2, 0.25)
+        self.sb_marker_spill.setToolTip('k: how many spillover spreads are added to the standard error.')
         self.list_markers = QListWidget()
         self.list_markers.setMaximumHeight(110)
         self.list_markers.setToolTip('Markers to test.')
@@ -1745,15 +1879,18 @@ class AnalysisPage(QWidget):
         marker_row.addStretch()
         spill_row = QHBoxLayout()
         spill_row.addWidget(self.chk_marker_spill)
-        spill_row.addWidget(QLabel('limit'))
+        spill_row.addWidget(QLabel('k'))
+        spill_row.addWidget(self.chk_marker_k_auto)
         spill_row.addWidget(self.sb_marker_spill)
         spill_row.addStretch()
         self.marker_widgets = [self.cb_marker_ref, self.list_markers, self.sb_marker_events, self.sb_marker_delta,
-                               self.chk_marker_spill, self.sb_marker_spill]
+                               self.chk_marker_spill, self.chk_marker_k_auto, self.sb_marker_spill]
         form.addRow('Marker reference:', self.cb_marker_ref)
         form.addRow('Markers:', self.list_markers)
         form.addRow(marker_row)
         form.addRow(spill_row)
+        self.lbl_marker_k = _label('')
+        form.addRow(self.lbl_marker_k)
         form.addRow(self.lbl_markers)
         self.cb_compare = QComboBox()
         for key, text in COMPARE.items():
@@ -1854,8 +1991,10 @@ class AnalysisPage(QWidget):
         self.sb_marker_delta.valueChanged.connect(lambda v: self._on_stat_setting('marker_threshold', float(v)))
         self.chk_marker_spill.toggled.connect(
             lambda v: self._on_stat_setting('marker_spillover', bool(v), refit=True))
+        self.chk_marker_k_auto.toggled.connect(
+            lambda v: self._on_stat_setting('marker_spillover_k', 'auto' if v else float(self.sb_marker_spill.value())))
         self.sb_marker_spill.valueChanged.connect(
-            lambda v: self._on_stat_setting('marker_spillover_limit', float(v)))
+            lambda v: self._on_stat_setting('marker_spillover_k', float(v)))
         self.list_adjust.itemChanged.connect(self._on_adjust_changed)
         self.sb_p.valueChanged.connect(lambda v: self._on_stat_setting('pval_threshold', float(v)))
         self.sb_fc.valueChanged.connect(lambda v: self._on_stat_setting('fc_threshold', float(v)))
@@ -2003,7 +2142,9 @@ class AnalysisPage(QWidget):
             self.sb_marker_events.setValue(int(s['marker_min_events']))
             self.sb_marker_delta.setValue(float(s['marker_threshold']))
             self.chk_marker_spill.setChecked(bool(s['marker_spillover']))
-            self.sb_marker_spill.setValue(float(s['marker_spillover_limit']))
+            auto = s['marker_spillover_k'] == 'auto'
+            self.chk_marker_k_auto.setChecked(auto)
+            self.sb_marker_spill.setValue(fst.SPILLOVER_K_NO_CONTROLS if auto else float(s['marker_spillover_k']))
         finally:
             self._filling = filling
         if self.counts is not None and data is None:
@@ -2050,7 +2191,9 @@ class AnalysisPage(QWidget):
             w.setEnabled(bool(s['remove_clones']))
         for w in self.marker_widgets:
             w.setEnabled(bool(s['run_markers']))
-        self.sb_marker_spill.setEnabled(bool(s['run_markers']) and bool(s['marker_spillover']))
+        spill = bool(s['run_markers']) and bool(s['marker_spillover'])
+        self.chk_marker_k_auto.setEnabled(spill)
+        self.sb_marker_spill.setEnabled(spill and s['marker_spillover_k'] != 'auto')
 
     def _on_controls_changed(self, _item):
         if self._filling:
@@ -2078,7 +2221,7 @@ class AnalysisPage(QWidget):
         self._changed()
         if key in ('contrast_mode', 'population_contrasts'):
             self._update_design_controls()
-        if key in ('normalisation', 'remove_clones', 'run_markers', 'marker_spillover'):
+        if key in ('normalisation', 'remove_clones', 'run_markers', 'marker_spillover', 'marker_spillover_k'):
             self._update_count_controls()
         if key in ('pairing', 'split_by', 'population_pairing', 'population_split', 'compare'):
             s = self.settings
@@ -2087,16 +2230,44 @@ class AnalysisPage(QWidget):
             self._fill_stats_choices()
         if refit:
             self._invalidate_stats()
-        elif self.stats is not None:
-            s = self.settings
-            self.stats = fst.reapply_thresholds(self.stats, s['pval_threshold'], s['fc_threshold'],
-                                                s['fdr_scope'], s['use_treat'])
-            if self.stats.get('markers') is not None:
-                self.stats['markers'] = fst.reapply_marker_thresholds(
-                    self.stats['markers'], s['pval_threshold'], s['marker_threshold'], s['fdr_scope'],
-                    s['use_treat'], float(s['marker_spillover_limit']) if s['marker_spillover'] else None)
-            self._show_results()
+        else:
+            self._reapply_thresholds()
         self._update_run_button()
+
+    def _reapply_thresholds(self):
+        """Apply the current thresholds to the stored results and redraw."""
+        if self.stats is None:
+            return
+        s = self.settings
+        self.stats = fst.reapply_thresholds(self.stats, s['pval_threshold'], s['fc_threshold'],
+                                            s['fdr_scope'], s['use_treat'])
+        if self.stats.get('markers') is not None:
+            self.stats['markers'] = fst.reapply_marker_thresholds(
+                self.stats['markers'], s['pval_threshold'], s['marker_threshold'], s['fdr_scope'],
+                s['use_treat'], s['marker_spillover_k'] if s['marker_spillover'] else None)
+            self._show_marker_k()
+        self._show_results()
+
+    def marker_k_text(self) -> str:
+        """The spillover k used by the marker results, per population, e.g.
+        'k = 0.75 (calibrated on 4 control combinations, CD8)'; '' without
+        spillover inflation."""
+        markers = (self.stats or {}).get('markers') or {}
+        k_map = markers.get('spillover_k')
+        if not k_map:
+            return ''
+        controls = markers.get('spillover_controls') or {}
+        parts = []
+        for pop, k in k_map.items():
+            name = pop or self.counted_population()
+            if markers.get('spillover_k_auto'):
+                parts.append(f'k = {k:g} (calibrated on {controls.get(pop, 0)} control combinations, {name})')
+            else:
+                parts.append(f'k = {k:g} ({name})')
+        return '; '.join(parts)
+
+    def _show_marker_k(self):
+        self.lbl_marker_k.setText(self.marker_k_text())
 
     def _update_run_button(self):
         s = self.settings
@@ -2123,6 +2294,7 @@ class AnalysisPage(QWidget):
             self.figures = {}
             self.stats_status.setText('Settings changed: run statistics again.')
             self._show_results()
+        self._show_marker_k()
         self._update_run_button()
 
     def _covariate_frame(self, names: list) -> pd.DataFrame | None:
@@ -2216,7 +2388,7 @@ class AnalysisPage(QWidget):
             marker_split = split if split_key not in ('', None, fa.SPLIT_BY_GROUP) else None
             tag_matrix, spread, spill_note = self._marker_tag_inputs(bool(s['marker_spillover']))
             marker_job = dict(tag_matrix=tag_matrix, spread=spread, spill_note=spill_note,
-                              spillover_limit=float(s['marker_spillover_limit']) if s['marker_spillover'] else None,
+                              spillover_k=s['marker_spillover_k'] if s['marker_spillover'] else None,
                               transforms=self._marker_transforms(),
                               path=fa.marker_cache_path(self._controller().experiment_dir),
                               signature=(s.get('counts') or {}).get('signature'), channels=self.marker_channels(),
@@ -2257,14 +2429,14 @@ class AnalysisPage(QWidget):
             return tag_matrix, None, None
         fc = self.plugin.saved_spectra()
         if fc is None:
-            return tag_matrix, None, 'no saved characterisation (section 4), so no feature is left out for spillover.'
+            return tag_matrix, None, 'no saved characterisation (section 4), so the tag spillover is not accounted for.'
         try:
             from honeychrome.controller_components import gls_unmix
             c = self._controller()
             noise = gls_unmix.load_noise_state(c.experiment.process, c.experiment_dir, list(fc.detectors))
             if noise is None:
-                return tag_matrix, None, ('no noise model fitted (AutoSpectral tab, Noise page), so no feature is '
-                                          'left out for spillover.')
+                return tag_matrix, None, ('no noise model fitted (AutoSpectral tab, Noise page), so the '
+                                          'tag spillover is not accounted for.')
             fc = fcc.rename_combos(fc, design)
             spread = fcc.spillover_spread(fc, noise.model.g)
         except Exception as exc:
@@ -2309,23 +2481,23 @@ class AnalysisPage(QWidget):
                                             strata=job['strata'], split_by=job['split_by'],
                                             threshold=job['threshold'], pval_threshold=kwargs['pval_threshold'],
                                             fdr_scope=kwargs['fdr_scope'], use_treat=kwargs['use_treat'],
-                                            spillover=spillover,
-                                            spillover_limit=job['spillover_limit'] if spillover is not None
-                                            else None)
+                                            spillover=spillover, spillover_k=job['spillover_k'],
+                                            control_combos=job['controls'])
         except RuntimeError as exc:
             stats['notes'].append(f'Markers: {exc}')
             return None
         markers.update(reference=used, channels=list(job['channels']), min_events=job['min_events'],
                        means=means, reference_means=reference_means)
-        if markers.get('spillover_limit') is not None:
+        if markers.get('spillover_k'):
             res = markers['results']
-            stats['notes'].append(f"Markers: {int((~res['tested'].astype(bool)).sum())} of {len(res)} features not "
-                                  f"tested (tag spillover above {markers['spillover_limit']:.3f}).")
+            stats['notes'].append(f"Markers: {int(res['spillover_dominant'].sum())} of {len(res)} features have an "
+                                  "uncertainty that is mostly tag spillover (hatched).")
         stats['notes'].extend(f'Markers: {n}' if not n.startswith('Markers') else n for n in markers['notes'])
         return markers
 
     def on_stats_finished(self, stats):
         self.stats = stats
+        self._show_marker_k()
         notes = list(self.filtered.notes if self.filtered is not None else []) + list(stats.get('notes') or [])
         key, res = fst.primary_results(stats)
         n_sig = int(res['significant'].sum()) if res is not None else 0
@@ -2375,6 +2547,10 @@ class AnalysisPage(QWidget):
         opts.addWidget(QLabel('PCA loadings:'))
         self.sb_loadings = _int_spin(0, 50)
         opts.addWidget(self.sb_loadings)
+        self.figure_defaults_btn = QPushButton('Restore defaults')
+        self.figure_defaults_btn.setToolTip(RESTORE_TOOLTIP + ' (heatmap order, heatmap rows, PCA loadings)')
+        self.figure_defaults_btn.clicked.connect(self._restore_figure_defaults)
+        opts.addWidget(self.figure_defaults_btn)
         opts.addStretch()
         lay.addLayout(opts)
         _no_wheel(self.cb_heat_order)
@@ -2620,8 +2796,9 @@ class AnalysisPage(QWidget):
         markers = self.stats['markers']
         res = markers['results']
         view = res[res['comparison'] == self.cb_marker_comparison.currentText()]
-        cols = [c for c in ('combination', 'channel', 'logFC', 'CI.L', 'CI.R', 'n_samples', 'spillover', 'tested',
-                            'P.Value', 'cluster.adj.P.Val', 'stagewise.adj.P.Val', 'significant')
+        cols = [c for c in ('combination', 'channel', 'logFC', 'CI.L', 'CI.R', 'n_samples', 'spillover', 'k',
+                            'se_moderated', 'se_total', 'P.Value', 'cluster.adj.P.Val', 'stagewise.adj.P.Val',
+                            'significant')
                 if c in view.columns]
         view = view.sort_values('stagewise.adj.P.Val' if 'stagewise.adj.P.Val' in view.columns else 'P.Value')
         table = CopyableTableWidget([], [])
@@ -2963,11 +3140,21 @@ class AnalysisPage(QWidget):
             lines.append(f"  Markers: {', '.join(markers['channels'] if markers else self.marker_channels()) or 'none'}; "
                          f"reference: {fst.MARKER_REFERENCES.get(used, used)}; min. events "
                          f"{s['marker_min_events']}; |Δ| >= {s['marker_threshold']} (transformed units)")
-            limit = markers.get('spillover_limit') if markers else (
-                s['marker_spillover_limit'] if s['marker_spillover'] else None)
-            lines.append('  Marker spillover: ' + (
-                f"features whose tags' spillover spread into the marker exceeds {limit} (transformed units) "
-                "are not tested" if limit is not None else 'every feature tested'))
+            if not s['marker_spillover'] or (markers and not markers.get('spillover_k')):
+                rule = 'not accounted for (moderated standard errors)'
+            else:
+                rule = ("added to the standard error, SE_total^2 = SE_moderated^2 + (k x spillover)^2, with the "
+                        "tags' spillover spread into the marker in transformed units; t, p and CI from SE_total; ")
+                if markers:
+                    rule += self.marker_k_text()
+                elif s['marker_spillover_k'] == 'auto':
+                    rule += 'k calibrated on the control combinations'
+                else:
+                    rule += f"k = {s['marker_spillover_k']:g}"
+                if markers and markers.get('spillover_k_auto'):
+                    rule += ('; k is the smallest of 0 to 4 (steps of 0.25) at which the control combinations '
+                             'have no significant marker hits')
+            lines.append(f'  Marker spillover: {rule}')
         if stats is not None:
             lines.append('  Comparisons run: ' + ', '.join(stats['comparisons']))
             if markers:
@@ -3071,14 +3258,18 @@ class AnalysisPage(QWidget):
 
     def on_task_finished(self, key, result):
         {'analysis_count': self.on_count_finished, 'analysis_stats': self.on_stats_finished,
-         'analysis_figures': self.on_figures_finished, 'analysis_export': self.on_export_finished}[key](result)
+         'analysis_figures': self.on_figures_finished, 'analysis_export': self.on_export_finished,
+         fcgv.TASK: self.gating_view.on_finished}[key](result)
 
     def on_task_error(self, key, message):
         {'analysis_count': self.on_count_error, 'analysis_stats': self.on_stats_error,
-         'analysis_figures': self.on_figures_error, 'analysis_export': self.on_export_error}[key](message)
+         'analysis_figures': self.on_figures_error, 'analysis_export': self.on_export_error,
+         fcgv.TASK: self.gating_view.on_error}[key](message)
 
     def on_task_progress(self, key, n, total, text):
-        if key == 'analysis_count' and text:
+        if key == fcgv.TASK:
+            self.gating_view.on_progress(n, total, text)
+        elif key == 'analysis_count' and text:
             self.count_status.setText(f'Counting {text}… ({n + 1}/{total})')
         elif key == 'analysis_export' and text:
             self.export_status.setText(f'Writing {text}… ({n + 1}/{total})')
@@ -3111,5 +3302,7 @@ class AnalysisPage(QWidget):
         self._fill_groups()
         self.maybe_auto_suggest_groupings()
         self._fill_stats_choices()
+        self.gating_view.refresh()
         self.root_label.setText(str(self.analysis_root()))
+        self._update_default_buttons()
         self.refresh_status()

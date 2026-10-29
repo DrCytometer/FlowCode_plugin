@@ -98,6 +98,11 @@ DEFAULT_SETTINGS = {
     'tandem_z_min': 3.0,
     'tandem_min_combos': 5,
     'tandem_max_events': 2_000_000,
+    'calib_combos': True,
+    'calib_brightness': False,
+    'calib_z_min': 3.0,
+    'calib_min_share': 0.05,
+    'calib_min_events': 40,
 }
 
 SECTION3_SETTINGS = ('backbone_max_events', 'unstained_max_events', 'cell_weight')
@@ -107,6 +112,9 @@ SECTION4_SETTINGS = ('rescue_toomany', 'rescue_flat_threshold', 'rescue_gate_fra
                      'min_cells_per_combo', 'spill_ridge')
 SECTION5_SETTINGS = ('tag_shift_min_n', 'correction', 'regressor', 'tandem_tags', 'tandem_z_min',
                      'tandem_min_combos', 'tandem_max_events')
+# Per-sample combination calibration (section 5): a run input of its own, so
+# that exports made before it existed say why they need a re-run.
+CALIBRATION_SETTINGS = ('calib_combos', 'calib_brightness', 'calib_z_min', 'calib_min_share', 'calib_min_events')
 
 # Final-unmix settings of earlier versions; the experiment's method (AutoSpectral tab) replaces them.
 RETIRED_SETTINGS = ('use_variants', 'n_passes', 'n_af_passes', 'refine_af_quantile', 'noise_floor', 'alpha',
@@ -125,6 +133,7 @@ _REASONS = {
     'thresholds': 'thresholds changed',
     'settings4': 'section 4 settings changed',
     'settings5': 'section 5 settings changed',
+    'calibration': 'combination calibration settings changed',
     'samples': 'sample selection changed',
     'output': 'output folder changed',
     'debarcode': 'debarcoding unmix changed',
@@ -338,6 +347,7 @@ class FlowCodeState:
             inputs['combo_names'] = _digest([[row['name'], sorted(row['tags'])]
                                              for row in self.included_combos()])
             inputs['settings5'] = _digest({k: self.settings.get(k) for k in SECTION5_SETTINGS})
+            inputs['calibration'] = _digest({k: self.settings.get(k) for k in CALIBRATION_SETTINGS})
             inputs['samples'] = _digest(self.export_samples) if not self.settings.get('export_include_controls') \
                 else _digest([self.export_samples, 'controls'])
             inputs['output'] = _digest(self.output_folder)
@@ -373,7 +383,8 @@ class FlowCodeState:
         changed = [key for key in current if recorded.get(key) != current[key]]
         if not changed:
             return 'done', ''
-        return 'stale', ', '.join(_REASONS.get(key, key) for key in changed)
+        return 'stale', ', '.join('combination calibration added' if key == 'calibration' and key not in recorded
+                                  else _REASONS.get(key, key) for key in changed)
 
 
 # ---------------------------------------------------------------------------

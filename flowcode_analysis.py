@@ -134,7 +134,7 @@ ANALYSIS_DEFAULTS = {
     'run_markers': False,
     'marker_reference': 'tags',
     'marker_spillover': True,
-    'marker_spillover_limit': 0.03,
+    'marker_spillover_k': 'auto',
     'marker_channels': None,
     'marker_min_events': 10,
     'marker_threshold': 0.03,
@@ -152,6 +152,9 @@ def analysis_settings(stored: dict | None) -> dict:
         out['source'] = SOURCE_EXPORTED
     if out['source'] not in SOURCES:
         out['source'] = SOURCE_LIVE
+    k = out['marker_spillover_k']
+    if k != 'auto' and not (isinstance(k, (int, float)) and not isinstance(k, bool) and k >= 0):
+        out['marker_spillover_k'] = 'auto'
     return out
 
 
