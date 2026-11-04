@@ -34,7 +34,7 @@ from pathlib import Path
 
 import numpy as np
 
-PLUGIN_VERSION = '0.4.1'
+PLUGIN_VERSION = '0.7.0'
 PROCESS_KEY = 'flowcode_unmix'
 
 SINGLETS_GATE = 'FlowCode Singlets'

@@ -21,7 +21,7 @@ Everything is installed in a folder called `Honeychrome` in your home folder. Yo
 2. Copy this whole line, paste it into the Terminal window (Cmd + V) and press Return:
 
    ```bash
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install/install_honeychrome.sh)"
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install_honeychrome.sh)"
    ```
 
 3. Answer the prompts that appear:
@@ -35,7 +35,7 @@ Everything is installed in a folder called `Honeychrome` in your home folder. Yo
 2. Copy this whole line, paste it into the PowerShell window (right-click pastes) and press Enter:
 
    ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install/install_honeychrome.ps1 | iex"
+   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install_honeychrome.ps1 | iex"
    ```
 
 3. Windows will ask several times **"Do you want to allow this app to make changes to your device?"** Click **Yes** each time.
@@ -87,19 +87,21 @@ Before asking for help, note which step failed (the last blue `==>` line), and h
 | `Visual Studio Build Tools are installed without the C++ tools` | Open **Visual Studio Installer**, click **Modify** on Build Tools 2022, tick **Desktop development with C++**, install, and run the command again. |
 | `a kernel did not load` | Run the installer once more with a full rebuild (below). If it fails again, send the log. |
 | No FlowCode tab after enabling it | Look for `ImportError` in `Experiments/honeychrome.log`, then run the update again. |
+| An Analysis note starting `Pathways:` that says `No such file or directory` | The plugin's data tables were not copied. Run the update again. |
+| `has no attribute` in `Experiments/honeychrome.log` when running statistics | The plugin is newer than Honeychrome. Run the update again; if the message stays, send the log. |
 
 A full rebuild reinstalls every Python package and recompiles every kernel:
 
 - Mac (Terminal):
 
   ```bash
-  HONEYCHROME_FULL=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install/install_honeychrome.sh)"
+  HONEYCHROME_FULL=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install_honeychrome.sh)"
   ```
 
 - Windows (PowerShell):
 
   ```powershell
-  $env:HONEYCHROME_FULL = '1'; irm https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install/install_honeychrome.ps1 | iex
+  $env:HONEYCHROME_FULL = '1'; irm https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install_honeychrome.ps1 | iex
   ```
 
 ---
@@ -112,7 +114,7 @@ A full rebuild reinstalls every Python package and recompiles every kernel:
 | `~/Honeychrome/FlowCode_plugin` | FlowCode plugin source code |
 | `~/Honeychrome/venv` | The Python environment Honeychrome runs in |
 | `~/Honeychrome/vcpkg` | Windows only: the C++ library builder used for the kernels |
-| `~/Experiments/plugins` | The copy of the plugin that Honeychrome loads |
+| `~/Experiments/plugins` | The copy of the plugin that Honeychrome loads: its Python files and data tables (phenotypes, gene groups, the Gene Ontology pathways and MGI gene names) |
 | `~/Experiments` | Your experiments and the app log |
 | Mac: Homebrew (`/opt/homebrew`) | Git, Python 3.12, CMake, Armadillo, libomp |
 | Windows: Program Files | Git, CMake, Visual Studio 2022 Build Tools; Python 3.12 in your user folder |

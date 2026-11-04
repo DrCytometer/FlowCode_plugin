@@ -2,7 +2,7 @@
 #
 # Open PowerShell (Start menu > type "PowerShell") and run:
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install/install_honeychrome.ps1 | iex"
+#   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install_honeychrome.ps1 | iex"
 #
 # The same command installs on the first run and updates on every later run.
 # After the first run, the "Update Honeychrome" icon on the Desktop runs it.
@@ -19,7 +19,8 @@
 #      installs Honeychrome's requirements when they have changed.
 #   5. Compiles the speed-up kernels (SOM, AutoSpectral optimisation,
 #      noise-model GLS, Fix My Unmix) and checks that each one loads.
-#   6. Copies the FlowCode plugin files into %USERPROFILE%\Experiments\plugins.
+#   6. Copies the FlowCode plugin files (Python modules and the data tables
+#      read beside them) into %USERPROFILE%\Experiments\plugins.
 #   7. Puts "Honeychrome" and "Update Honeychrome" icons on the Desktop.
 #
 # Everything is logged to %USERPROFILE%\Honeychrome\install.log.
@@ -38,7 +39,7 @@ $HoneychromeRepo   = Get-Setting 'HONEYCHROME_REPO'   'https://github.com/Cytkit
 $HoneychromeBranch = Get-Setting 'HONEYCHROME_BRANCH' 'autospectral'
 $FlowcodeRepo      = Get-Setting 'FLOWCODE_REPO'      'https://github.com/DrCytometer/FlowCode_plugin.git'
 $FlowcodeBranch    = Get-Setting 'FLOWCODE_BRANCH'    'main'
-$ScriptUrl         = Get-Setting 'SCRIPT_URL'         'https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install/install_honeychrome.ps1'
+$ScriptUrl         = Get-Setting 'SCRIPT_URL'         'https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install_honeychrome.ps1'
 $Full              = (Get-Setting 'HONEYCHROME_FULL' '0') -eq '1'
 
 $InstallDir  = Join-Path $HOME 'Honeychrome'
@@ -363,8 +364,9 @@ sys.exit(0 if all(status.values()) else 1)
     # ---------------------------------------------------------------------
     Write-Step "Installing the FlowCode plugin into $PluginsDir"
     New-Item -ItemType Directory -Force -Path $PluginsDir | Out-Null
-    $files = Get-ChildItem -Path $PluginSrc -Filter '*.py' -File |
-        Where-Object { ($PluginSkip -notcontains $_.Name) -and ($_.Name -notlike '*_test.py') }
+    $files = Get-ChildItem -Path $PluginSrc -File |
+        Where-Object { ($_.Name -like '*.py' -or $_.Name -like '*.csv' -or $_.Name -like '*.csv.gz') -and
+            ($PluginSkip -notcontains $_.Name) -and ($_.Name -notlike '*_test.py') }
     if (-not $files) { throw "No plugin files were found in $PluginSrc." }
     foreach ($f in $files) { Copy-Item -Force $f.FullName (Join-Path $PluginsDir $f.Name) }
     Write-Note "$(@($files).Count) plugin files copied"

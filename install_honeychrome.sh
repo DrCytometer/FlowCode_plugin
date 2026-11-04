@@ -3,7 +3,7 @@
 #
 # Open Terminal and run:
 #
-#   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install/install_honeychrome.sh)"
+#   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install_honeychrome.sh)"
 #
 # The same command installs on the first run and updates on every later run.
 # After the first run, the "Update Honeychrome" icon on the Desktop runs it.
@@ -18,7 +18,8 @@
 #      Honeychrome's requirements when they have changed.
 #   5. Compiles the speed-up kernels (SOM, AutoSpectral optimisation,
 #      noise-model GLS, Fix My Unmix) and checks that each one loads.
-#   6. Copies the FlowCode plugin files into ~/Experiments/plugins.
+#   6. Copies the FlowCode plugin files (Python modules and the data tables
+#      read beside them) into ~/Experiments/plugins.
 #   7. Puts "Honeychrome" and "Update Honeychrome" icons on the Desktop.
 #
 # Everything is logged to ~/Honeychrome/install.log.
@@ -33,7 +34,7 @@ HONEYCHROME_REPO="${HONEYCHROME_REPO:-https://github.com/Cytkit/honeychrome.git}
 HONEYCHROME_BRANCH="${HONEYCHROME_BRANCH:-autospectral}"
 FLOWCODE_REPO="${FLOWCODE_REPO:-https://github.com/DrCytometer/FlowCode_plugin.git}"
 FLOWCODE_BRANCH="${FLOWCODE_BRANCH:-main}"
-SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install/install_honeychrome.sh}"
+SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/DrCytometer/FlowCode_plugin/main/install_honeychrome.sh}"
 FULL="${HONEYCHROME_FULL:-0}"
 
 PYTHON_FORMULA="python@3.12"
@@ -241,7 +242,8 @@ PYCHECK
 step "Installing the FlowCode plugin into $PLUGINS_DIR"
 mkdir -p "$PLUGINS_DIR"
 copied=0
-for f in "$PLUGIN_SRC"/*.py; do
+for f in "$PLUGIN_SRC"/*.py "$PLUGIN_SRC"/*.csv "$PLUGIN_SRC"/*.csv.gz; do
+    [[ -f "$f" ]] || continue
     name="$(basename "$f")"
     [[ " ${PLUGIN_SKIP[*]} " == *" $name "* || "$name" == *_test.py ]] && continue
     cp -f "$f" "$PLUGINS_DIR/$name"
