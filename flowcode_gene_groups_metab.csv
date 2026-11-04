@@ -1,0 +1,187 @@
+gene,group,area,reference,pmid
+Hmgcs1,Sterol and lipoprotein,Lipid metabolism,,
+Hmgcr,Sterol and lipoprotein,Lipid metabolism,,
+Idi1,Sterol and lipoprotein,Lipid metabolism,,
+Fdft1,Sterol and lipoprotein,Lipid metabolism,,
+Sqle,Sterol and lipoprotein,Lipid metabolism,,
+Cyp51,Sterol and lipoprotein,Lipid metabolism,,
+Insig1,Sterol and lipoprotein,Lipid metabolism,"Ouyang et al. 2020, Clin Chim Acta. Emerging role of Insig-1 in lipid metabolism and lipid disorders.",32461046
+Soat2,Sterol and lipoprotein,Lipid metabolism,"Lopez et al. 2014, Biochem Biophys Res Commun. Deletion of sterol O-acyltransferase 2 (SOAT2) function in mice deficient in lysosomal acid lipase (LAL) dramatically reduces esterified cholesterol sequestration in the small intestine and liver.",25450374
+Npc1l1,Sterol and lipoprotein,Lipid metabolism,"Betters et al. 2010, FEBS Lett. NPC1L1 and cholesterol transport.",20307540
+Ldlr,Sterol and lipoprotein,Lipid metabolism,"Jeon et al. 2005, Annu Rev Biochem. Structure and physiologic function of the low-density lipoprotein receptor.",15952897
+Lsr,Sterol and lipoprotein,Lipid metabolism,"Kawabata et al. 2024, Gastric Cancer. Lipolysis-stimulated lipoprotein receptor promote lipid uptake and fatty acid oxidation in gastric cancer.",39294388
+Apoa1,Sterol and lipoprotein,Lipid metabolism,"van et al. 2020, Subcell Biochem. High-Density Lipoproteins and Apolipoprotein A1.",32189309
+Mttp,Sterol and lipoprotein,Lipid metabolism,"Walsh et al. 2017, Crit Rev Clin Lab Sci. Targeting microsomal triglyceride transfer protein and lipoprotein assembly to treat homozygous familial hypercholesterolemia.",27690713
+Sult2b1,Sterol and lipoprotein,Lipid metabolism,"Falany et al. 2013, Drug Metab Rev. SULT2B1: unique properties and characteristics of a hydroxysteroid sulfotransferase family.",24020383
+Gm5897,Sterol and lipoprotein,Lipid metabolism,"Falany et al. 2013, Drug Metab Rev. SULT2B1: unique properties and characteristics of a hydroxysteroid sulfotransferase family.",24020383
+Elovl6,Fatty acid and acyl-CoA,Lipid metabolism,"Matsuzaka et al. 2009, J Mol Med (Berl). Elovl6: a new player in fatty acid metabolism and insulin sensitivity.",19259639
+Fads2,Fatty acid and acyl-CoA,Lipid metabolism,"Koletzko et al. 2019, Annu Rev Nutr. FADS1 and FADS2 Polymorphisms Modulate Fatty Acid Metabolism and Dietary Impact on Health.",31433740
+Far2,Fatty acid and acyl-CoA,Lipid metabolism,"Otsuka et al. 2022, FASEB J. Formation of fatty alcohols-components of meibum lipids-by the fatty acyl-CoA reductase FAR2 is essential for dry eye prevention.",35238077
+Acsbg1,Fatty acid and acyl-CoA,Lipid metabolism,"Ye et al. 2024, Cells. Role of ACSBG1 in Brain Lipid Metabolism and X-Linked Adrenoleukodystrophy Pathogenesis: Insights from a Knockout Mouse Model.",39451204
+Acsf2,Fatty acid and acyl-CoA,Lipid metabolism,,
+Acss1,Fatty acid and acyl-CoA,Lipid metabolism,,
+Acss2,Fatty acid and acyl-CoA,Lipid metabolism,"Ling et al. 2022, Discov Oncol. Acetyl-CoA synthetase 2(ACSS2): a review with a focus on metabolism and tumor development.",35798917
+Acot11,Fatty acid and acyl-CoA,Lipid metabolism,,
+Acoxl,Fatty acid and acyl-CoA,Lipid metabolism,,
+ACADS,Fatty acid and acyl-CoA,Lipid metabolism,"Pedersen et al. 2008, Hum Genet. The ACADS gene variation spectrum in 114 patients with short-chain acyl-CoA dehydrogenase (SCAD) deficiency is dominated by missense variations leading to protein misfolding at the cellular level.",18523805
+ACADSb,Fatty acid and acyl-CoA,Lipid metabolism,,
+Crat,Fatty acid and acyl-CoA,Lipid metabolism,"Volpicella et al. 2025, Biomolecules. Carnitine O-Acetyltransferase as a Central Player in Lipid and Branched-Chain Amino Acid Metabolism, Epigenetics, Cell Plasticity, and Organelle Function.",40001519
+CROT,Fatty acid and acyl-CoA,Lipid metabolism,"Okui et al. 2024, Front Mol Biosci. Carnitine O-octanoyltransferase (CROT) deficiency in mice leads to an increase of omega-3 fatty acids.",39076376
+Cyp4b1,Fatty acid and acyl-CoA,Lipid metabolism,,
+Gpat3,Glycerolipid and lipid storage,Lipid metabolism,"Gao et al. 2020, Hum Mol Genet. GPAT3 deficiency alleviates insulin resistance and hepatic steatosis in a mouse model of severe congenital generalized lipodystrophy.",31873720
+Agpat4,Glycerolipid and lipid storage,Lipid metabolism,"Zhukovsky et al. 2019, Front Cell Dev Biol. The Structure and Function of Acylglycerophosphate Acyltransferase 4/ Lysophosphatidic Acid Acyltransferase Delta (AGPAT4/LPAATδ).",31428612
+Lpin3,Glycerolipid and lipid storage,Lipid metabolism,"Csaki et al. 2014, Mol Metab. Lipin-1 and lipin-3 together determine adiposity in vivo.",24634820
+Dgat1,Glycerolipid and lipid storage,Lipid metabolism,"Moorey et al. 2022, Cell Surf. The role of triacylglycerols and repurposing DGAT1 inhibitors for the treatment of Mycobacterium tuberculosis.",36277080
+Lipe,Glycerolipid and lipid storage,Lipid metabolism,"Zhang et al. 2019, Cells. An Epistatic Interaction between Pnpla2 and Lipe Reveals New Pathways of Adipose Tissue Lipolysis.",31035700
+Hilpda,Glycerolipid and lipid storage,Lipid metabolism,"de et al. 2020, Biochim Biophys Acta Mol Cell Biol Lipids. Regulation of lipid droplet homeostasis by hypoxia inducible lipid droplet associated HILPDA.",32417386
+Pcyt1a,Phospholipid and sphingolipid,Lipid metabolism,,
+Chdh,Phospholipid and sphingolipid,Lipid metabolism,"Salvi et al. 2013, Arch Biochem Biophys. Human choline dehydrogenase: medical promises and biochemical challenges.",23906661
+Etnk2,Phospholipid and sphingolipid,Lipid metabolism,"Tian et al. 2006, J Biol Chem. Placental thrombosis and spontaneous fetal death in mice deficient in ethanolamine kinase 2.",16861741
+Slc44a3,Phospholipid and sphingolipid,Lipid metabolism,,
+Pld1,Phospholipid and sphingolipid,Lipid metabolism,,
+Pla2g6,Phospholipid and sphingolipid,Lipid metabolism,,
+Pla2g7,Phospholipid and sphingolipid,Lipid metabolism,"Casas et al. 2010, Circulation. PLA2G7 genotype, lipoprotein-associated phospholipase A2 activity, and coronary heart disease risk in 10 494 cases and 15 624 controls of European Ancestry.",20479152
+Gdpd1,Phospholipid and sphingolipid,Lipid metabolism,,
+Gdpd5,Phospholipid and sphingolipid,Lipid metabolism,,
+Enpp5,Phospholipid and sphingolipid,Lipid metabolism,,
+Atp8a2,Phospholipid and sphingolipid,Lipid metabolism,"Mogensen et al. 2024, Biochim Biophys Acta Mol Cell Res. On the track of the lipid transport pathway of the phospholipid flippase ATP8A2 - Mutation analysis of residues of the transmembrane segments M1, M2, M3 and M4.",37678495
+Atp8b1,Phospholipid and sphingolipid,Lipid metabolism,"Prince et al. 2025, Cell Cycle. Enigmatic functions of ATP8B1: cholestasis, inflammation, phosphoinositide flipping, and cellular homeostasis.",41084973
+Mfsd2a,Phospholipid and sphingolipid,Lipid metabolism,"Wong et al. 2020, Adv Exp Med Biol. Mfsd2a: A Physiologically Important Lysolipid Transporter in the Brain and Eye.",32705603
+Degs2,Phospholipid and sphingolipid,Lipid metabolism,"Song et al. 2023, Dis Model Mech. The dual lipid desaturase/hydroxylase DEGS2 controls phytoceramide levels necessary to counter intestinal inflammation.",37589563
+Smpdl3b,Phospholipid and sphingolipid,Lipid metabolism,"Wang et al. 2025, Immunity. Membrane integrity changes upon viral infection activate sphingomyelinase SMPDL3B to restrict cGAS-STING signaling via cGAMP degradation.",41175872
+Galc,Phospholipid and sphingolipid,Lipid metabolism,"Belleri et al. 2022, Biochim Biophys Acta Rev Cancer. Oncosuppressive and oncogenic activity of the sphingolipid-metabolizing enzyme β-galactosylceramidase.",34974112
+Fut8,Glycan synthesis and degradation,Glycans,"Liao et al. 2021, J Cancer. FUT8 and Protein Core Fucosylation in Tumours: From Diagnosis to Treatment.",34093814
+St6galnac3,Glycan synthesis and degradation,Glycans,"Fuseya et al. 2023, Sci Rep. Reduction in disialyl-T antigen levels in mice deficient for both St6galnac3 and St6galnac4 results in blood filling of lymph nodes.",37386100
+St6galnac6,Glycan synthesis and degradation,Glycans,,
+St3gal3,Glycan synthesis and degradation,Glycans,,
+St3gal5,Glycan synthesis and degradation,Glycans,"Nishihara et al. 2021, . Enzyme assay of GM3 synthase (lactosylceramide α2,3-sialyltransferase, GM3S, ST3GAL5).",37590607
+Gcnt2,Glycan synthesis and degradation,Glycans,"Perez et al. 2021, Br J Dermatol. Melanoma-associated glycosyltransferase GCNT2 as an emerging biomarker and therapeutic target.",33660254
+B3galt5,Glycan synthesis and degradation,Glycans,"Trinchera et al. 2014, Biology (Basel). Control of Glycosylation-Related Genes by DNA Methylation: the Intriguing Case of the B3GALT5 Gene and Its Distinct Promoters.",25256425
+B3gnt7,Glycan synthesis and degradation,Glycans,"Burns et al. 2026, bioRxiv. B3GNT7 regulates mucin glycosylation and protects against colitis and infection.",42239473
+B4galt4,Glycan synthesis and degradation,Glycans,,
+B4galt6,Glycan synthesis and degradation,Glycans,,
+B4galnt4,Glycan synthesis and degradation,Glycans,"Jiang et al. 2026, Adv Sci (Weinh). B4GALNT4-Mediated Glycosylation of PDK1 Activates the PI3K-AKT Signaling Pathway to Promote Prostate Cancer Progression.",41698153
+Galnt2,Glycan synthesis and degradation,Glycans,,
+Galnt6,Glycan synthesis and degradation,Glycans,,
+Chst11,Glycan synthesis and degradation,Glycans,"Bhattacharyya et al. 2015, Biochim Biophys Acta. Regulation of chondroitin-4-sulfotransferase (CHST11) expression by opposing effects of arylsulfatase B on BMP4 and Wnt9A.",25511584
+Pmm1,Glycan synthesis and degradation,Glycans,"Veiga-da-Cunha et al. 2008, J Biol Chem. Mammalian phosphomannomutase PMM1 is the brain IMP-sensitive glucose-1,6-bisphosphatase.",18927083
+Renbp,Glycan synthesis and degradation,Glycans,"Takahashi et al. 1999, J Biochem. Human renin-binding protein is the enzyme N-acetyl-D-glucosamine 2-epimerase.",9990133
+Npl,Glycan synthesis and degradation,Glycans,"Da et al. 2023, Sci Adv. N-acetylneuraminate pyruvate lyase controls sialylation of muscle glycoproteins essential for muscle regeneration and function.",37390204
+Naga,Glycan synthesis and degradation,Glycans,,
+Hpse,Glycan synthesis and degradation,Glycans,"Yuan et al. 2022, Front Chem. Heparanase in cancer progression: Structure, substrate recognition and therapeutic potential.",36157032
+Got1,"Amino acid, nucleotide and cofactor",Small-molecule metabolism,"Peng et al. 2024, Front Oncol. The role of GOT1 in cancer metabolism.",39777342
+Cps1,"Amino acid, nucleotide and cofactor",Small-molecule metabolism,"Nitzahn et al. 2020, Mol Genet Metab. CPS1: Looking at an ancient enzyme in a modern light.",33317798
+Aldh7a1,"Amino acid, nucleotide and cofactor",Small-molecule metabolism,,
+Tph1,"Amino acid, nucleotide and cofactor",Small-molecule metabolism,,
+Maoa,"Amino acid, nucleotide and cofactor",Small-molecule metabolism,,
+Scly,"Amino acid, nucleotide and cofactor",Small-molecule metabolism,"Ogawa-Wong et al. 2018, Nutrients. Sexual Dimorphism in the Selenocysteine Lyase Knockout Mouse.",29385050
+Mthfr,"Amino acid, nucleotide and cofactor",Small-molecule metabolism,"Raghubeer et al. 2021, Nutrients. Methylenetetrahydrofolate (MTHFR), the One-Carbon Cycle, and Cardiovascular Risks.",34960114
+Ada,"Amino acid, nucleotide and cofactor",Small-molecule metabolism,,
+Mocos,"Amino acid, nucleotide and cofactor",Small-molecule metabolism,"Sedda et al. 2021, Kidney360. Deletion of Mocos Induces Xanthinuria with Obstructive Nephropathy and Major Metabolic Disorders in Mice.",35372998
+Naprt,"Amino acid, nucleotide and cofactor",Small-molecule metabolism,"Audrito et al. 2020, Front Oncol. NAMPT and NAPRT: Two Metabolic Enzymes With Key Roles in Inflammation.",32266141
+Nmrk1,"Amino acid, nucleotide and cofactor",Small-molecule metabolism,"Cercillieux et al. 2022, Mol Metab. Nicotinamide riboside kinase 1 protects against diet and age-induced pancreatic β-cell failure.",36165811
+Coq10b,"Amino acid, nucleotide and cofactor",Small-molecule metabolism,,
+Hk2,Carbohydrate and energy,Small-molecule metabolism,"Ciscato et al. 2021, Int J Mol Sci. Hexokinase 2 in Cancer: A Prima Donna Playing Multiple Characters.",33946854
+Aldob,Carbohydrate and energy,Small-molecule metabolism,,
+Pygl,Carbohydrate and energy,Small-molecule metabolism,,
+Sord,Carbohydrate and energy,Small-molecule metabolism,"Jeffery et al. 1988, Adv Enzymol Relat Areas Mol Biol. Sorbitol dehydrogenase.",3281420
+Ckb,Carbohydrate and energy,Small-molecule metabolism,"Nagpal et al. 2021, Proc Natl Acad Sci U S A. Inositol hexakisphosphate kinase-2 determines cellular energy dynamics by regulating creatine kinase-B.",33547244
+Ckmt1,Carbohydrate and energy,Small-molecule metabolism,,
+Slc3a2,Amino acid and peptide transport,Transport,"Kahlhofer et al. 2023, Basic Clin Pharmacol Toxicol. The human LAT1-4F2hc (SLC7A5-SLC3A2) transporter complex: Physiological and pathophysiological implications.",36460306
+Slc7a7,Amino acid and peptide transport,Transport,"Sperandeo et al. 2008, Hum Mutat. Lysinuric protein intolerance: update and extended mutation analysis of the SLC7A7 gene.",17764084
+Slc7a8,Amino acid and peptide transport,Transport,,
+Slc7a10,Amino acid and peptide transport,Transport,"Jersin et al. 2022, Front Cell Dev Biol. The neutral amino acid transporter SLC7A10 in adipose tissue, obesity and insulin resistance.",36172277
+Slc38a2,Amino acid and peptide transport,Transport,"Menchini et al. 2019, Neuropharmacology. Multifaceted regulation of the system A transporter Slc38a2 suggests nanoscale regulation of amino acid metabolism and cellular signaling.",31574264
+Slc36a1,Amino acid and peptide transport,Transport,"Thwaites et al. 2007, Biochim Biophys Acta. Deciphering the mechanisms of intestinal imino (and amino) acid transport: the redemption of SLC36A1.",17123464
+Slc43a1,Amino acid and peptide transport,Transport,"Pawar et al. 2025, bioRxiv. A whole genomic CRISPR-Cas9 screen identifies the amino acid transporter SLC43A1 (LAT3) as a major determinant of oxaliplatin sensitivity in colorectal cancer cells.",40568133
+slc15a2,Amino acid and peptide transport,Transport,"Hu et al. 2018, J Immunol. SLC15A2 and SLC15A4 Mediate the Transport of Bacterially Derived Di/Tripeptides To Enhance the Nucleotide-Binding Oligomerization Domain-Dependent Immune Response in Mouse Bone Marrow-Derived Macrophages.",29784761
+Slc15a3,Amino acid and peptide transport,Transport,"Yang et al. 2026, J Clin Invest. SLC15A3-mediated dipeptide metabolism confers antimetabolite resistance in lymphoma via mTORC1 activation.",42454485
+Slc6a8,Amino acid and peptide transport,Transport,"Mejdahl et al. 2023, Mol Genet Metab. X-linked creatine transporter (SLC6A8) deficiency in females: Difficult to recognize, but a potentially treatable disease.",37708665
+Tfrc,Iron and metal transport,Transport,"Kawabata et al. 2019, Free Radic Biol Med. Transferrin and transferrin receptors update.",29969719
+Trf,Iron and metal transport,Transport,"Kawabata et al. 2019, Free Radic Biol Med. Transferrin and transferrin receptors update.",29969719
+Sfxn4,Iron and metal transport,Transport,,
+Slc31a1,Iron and metal transport,Transport,"Tu et al. 2025, Eur Heart J. SLC31A1 loss depletes mitochondrial copper and promotes cardiac fibrosis.",40048660
+Slc30a2,Iron and metal transport,Transport,"Golan et al. 2017, Metallomics. The role of the zinc transporter SLC30A2/ZnT2 in transient neonatal zinc deficiency.",28665435
+Slc39a4,Iron and metal transport,Transport,"Schmitt et al. 2009, Hum Mutat. An update on mutations of the SLC39A4 gene in acrodermatitis enteropathica.",19370757
+Slc39a5,Iron and metal transport,Transport,"Wang et al. 2019, Protein Cell. The zinc transporter Slc39a5 controls glucose sensing and insulin secretion in pancreatic β-cells via Sirt1- and Pgc-1α-mediated regulation of Glut2.",30324491
+Slc41a1,Iron and metal transport,Transport,"Goytain et al. 2005, Physiol Genomics. Functional characterization of human SLC41A1, a Mg2+ transporter with similarity to prokaryotic MgtE Mg2+ transporters.",15713785
+Slc22a17,Iron and metal transport,Transport,"Thévenod et al. 2023, Am J Physiol Renal Physiol. Role of the SLC22A17/lipocalin-2 receptor in renal endocytosis of proteins/metalloproteins: a focus on iron- and cadmium-binding proteins.",37589051
+Slc16a1,Other solute and drug transport,Transport,,
+Slc16a3,Other solute and drug transport,Transport,,
+Slc16a6,Other solute and drug transport,Transport,"Higuchi et al. 2022, J Biol Chem. Mammalian monocarboxylate transporter 7 (MCT7/Slc16a6) is a novel facilitative taurine transporter.",35257743
+Slc16a11,Other solute and drug transport,Transport,,
+Slc22a15,Other solute and drug transport,Transport,"Yee et al. 2020, FASEB J. Deorphaning a solute carrier 22 family member, SLC22A15, through functional genomic studies.",33124720
+Slco2b1,Other solute and drug transport,Transport,"Lehtisalo et al. 2023, Br J Clin Pharmacol. A comprehensive pharmacogenomic study indicates roles for SLCO1B1, ABCG2 and SLCO2B1 in rosuvastatin pharmacokinetics.",35942816
+Slco4a1,Other solute and drug transport,Transport,"Thomas et al. 2026, Front Syst Biol. Phosphorylation dynamics of sodium-independent organic anion transporter SLCO4A1 and its role in diseases: a review.",42601857
+Slc26a6,Other solute and drug transport,Transport,,
+Slc26a11,Other solute and drug transport,Transport,"Xu et al. 2011, Kidney Int. Slc26a11, a chloride transporter, localizes with the vacuolar H(+)-ATPase of A-intercalated cells of the kidney.",21716257
+Slc43a3,Other solute and drug transport,Transport,"Ruel et al. 2022, J Pharmacol Exp Ther. Impact of SLC43A3/ENBT1 Expression and Function on 6-Mercaptopurine Transport and Cytotoxicity in Human Acute Lymphoblastic Leukemia Cells.",35798387
+Slc2a6,Other solute and drug transport,Transport,,
+Slc45a4,Other solute and drug transport,Transport,"Middleton et al. 2024, bioRxiv. Identification of SLC45A4 as a pain gene encoding a neuronal polyamine transporter.",41031034
+Slc17a5,Other solute and drug transport,Transport,"Cappozzo et al. 2025, Mol Genet Metab Rep. A novel SLC17A5 variant in infantile sialic acid storage disease with hyporegenerative anemia: Neuroimaging insights and literature review.",41459346
+Slc35f2,Other solute and drug transport,Transport,,
+Slc35f5,Other solute and drug transport,Transport,,
+Slc25a53,Other solute and drug transport,Transport,,
+Abcb1a,Other solute and drug transport,Transport,,
+Abcc3,Other solute and drug transport,Transport,"Ghanem et al. 2019, Curr Med Chem. Modulation of Hepatic MRP3/ABCC3 by Xenobiotics and Pathophysiological Conditions: Role in Drug Pharmacokinetics.",29473496
+Abcb8,Other solute and drug transport,Transport,"Menon et al. 2022, Front Pharmacol. Iron Promotes Cardiac Doxorubicin Retention and Toxicity Through Downregulation of the Mitochondrial Exporter ABCB8.",35359834
+Abcb10,Other solute and drug transport,Transport,,
+Ryr1,"Ion channels, pumps and pH",Transport,,
+Tpcn2,"Ion channels, pumps and pH",Transport,,
+Trpm4,"Ion channels, pumps and pH",Transport,"Mathar et al. 2014, Handb Exp Pharmacol. TRPM4.",24756717
+P2rx7,"Ion channels, pumps and pH",Transport,,
+Mcoln2,"Ion channels, pumps and pH",Transport,"Yu et al. 2021, Br J Cancer. Endolysosomal ion channel MCOLN2 (Mucolipin-2) promotes prostate cancer progression via IL-1β/NF-κB pathway.",34548638
+Kcnj15,"Ion channels, pumps and pH",Transport,"Yuan et al. 2015, Am J Physiol Cell Physiol. Potassium channel KCNJ15 is required for histamine-stimulated gastric acid secretion.",26108660
+Kcnk5,"Ion channels, pumps and pH",Transport,"Göb et al. 2015, Pflugers Arch. The two-pore domain potassium channel KCNK5 deteriorates outcome in ischemic neurodegeneration.",25315980
+Clcn6,"Ion channels, pumps and pH",Transport,,
+Clic5,"Ion channels, pumps and pH",Transport,,
+Ttyh2,"Ion channels, pumps and pH",Transport,,
+Chrnb1,"Ion channels, pumps and pH",Transport,,
+Aqp1,"Ion channels, pumps and pH",Transport,,
+Atp1a3,"Ion channels, pumps and pH",Transport,,
+Atp2b4,"Ion channels, pumps and pH",Transport,,
+Atp6v0d2,"Ion channels, pumps and pH",Transport,"Xia et al. 2019, Autophagy. The macrophage-specific V-ATPase subunit ATP6V0D2 restricts inflammasome activation and bacterial infection by facilitating autophagosome-lysosome fusion.",30681394
+Tcirg1,"Ion channels, pumps and pH",Transport,,
+Car2,"Ion channels, pumps and pH",Transport,"Pan et al. 2006, J Physiol. Carbonic anhydrase gene expression in CA II-deficient (Car2-/-) and CA IX-deficient (Car9-/-) mice.",16396925
+Car7,"Ion channels, pumps and pH",Transport,"Lakkis et al. 1997, J Histochem Cytochem. Differential expression of the carbonic anhydrase genes for CA VII (Car7) and CA-RP VIII (Car8) in mouse brain.",9154152
+Car9,"Ion channels, pumps and pH",Transport,"Pan et al. 2006, J Physiol. Carbonic anhydrase gene expression in CA II-deficient (Car2-/-) and CA IX-deficient (Car9-/-) mice.",16396925
+Pde1b,Lipid mediator and second-messenger signalling,Signalling and redox,,
+Pde3b,Lipid mediator and second-messenger signalling,Signalling and redox,"Degerman et al. 2011, Curr Opin Pharmacol. From PDE3B to the regulation of energy homeostasis.",22001403
+Pde4a,Lipid mediator and second-messenger signalling,Signalling and redox,,
+Pi4k2b,Lipid mediator and second-messenger signalling,Signalling and redox,,
+Ipmk,Lipid mediator and second-messenger signalling,Signalling and redox,"Lee et al. 2021, Mol Cells. Inositol Polyphosphate Multikinase Signaling: Multifaceted Functions in Health and Disease.",33935040
+Inpp5d,Lipid mediator and second-messenger signalling,Signalling and redox,"Olufunmilayo et al. 2023, Genes (Basel). INPP5D/SHIP1: Expression, Regulation and Roles in Alzheimer's Disease Pathophysiology.",37895194
+Inppl1,Lipid mediator and second-messenger signalling,Signalling and redox,,
+Plcxd1,Lipid mediator and second-messenger signalling,Signalling and redox,"Frendo-Cumbo et al. 2026, Nat Commun. Functional annotation of insulin-responsive genes in human adipocytes reveals PLCXD1 as a lipid storage regulator.",42693141
+Plcxd2,Lipid mediator and second-messenger signalling,Signalling and redox,,
+Hpgds,Lipid mediator and second-messenger signalling,Signalling and redox,"Kanaoka et al. 2003, Prostaglandins Leukot Essent Fatty Acids. Hematopoietic prostaglandin D synthase.",12895599
+Ptgr1,Lipid mediator and second-messenger signalling,Signalling and redox,"Wang et al. 2021, Front Pharmacol. Prostaglandin Reductase 1 as a Potential Therapeutic Target for Cancer Therapy.",34421612
+Ffar2,Lipid mediator and second-messenger signalling,Signalling and redox,"Mohammad et al. 2015, Curr Drug Targets. Role of Free Fatty Acid Receptor 2 (FFAR2) in the Regulation of Metabolic Homeostasis.",25850624
+Gstm1,Redox and detoxification,Signalling and redox,,
+Gstm2,Redox and detoxification,Signalling and redox,"Chanas et al. 2002, Biochem J. Loss of the Nrf2 transcription factor causes a marked reduction in constitutive and inducible expression of the glutathione S-transferase Gsta1, Gsta2, Gstm1, Gstm2, Gstm3 and Gstm4 genes in the livers of male and female mice.",11991805
+Srxn1,Redox and detoxification,Signalling and redox,"Kim et al. 2025, Exp Mol Med. Redox regulation by sulfiredoxin-1: bridging cysteine oxidation and liver disease therapeutics.",41131335
+Hmox1,Redox and detoxification,Signalling and redox,"Alonso-Piñeiro et al. 2021, Antioxidants (Basel). Nrf2 and Heme Oxygenase-1 Involvement in Atherosclerosis Related Oxidative Stress.",34573095
+Cybb,Redox and detoxification,Signalling and redox,"Sweeney et al. 2017, Hum Gene Ther. CRISPR-Mediated Knockout of Cybb in NSG Mice Establishes a Model of Chronic Granulomatous Disease for Human Stem-Cell Gene Therapy Transplants.",28264583
+Cyp3a11,Redox and detoxification,Signalling and redox,"Zhang et al. 2024, PeerJ. CYP3A4 and CYP3A5: the crucial roles in clinical drug metabolism and the significant implications of genetic polymorphisms.",39650550
+Aldh1b1,Redox and detoxification,Signalling and redox,,
+Dhrs3,Redox and detoxification,Signalling and redox,"Billings et al. 2013, FASEB J. The retinaldehyde reductase DHRS3 is essential for preventing the formation of excess retinoic acid during embryonic development.",24005908
+Dhrs11,Redox and detoxification,Signalling and redox,"Endo et al. 2020, J Steroid Biochem Mol Biol. Human dehydrogenase/reductase SDR family member 11 (DHRS11) and aldo-keto reductase 1C isoforms in comparison: Substrate and reaction specificity in the reduction of 11-keto-C(19)-steroids.",31926269
+Papss2,Redox and detoxification,Signalling and redox,,
+Mical1,Redox and detoxification,Signalling and redox,"Haikazian et al. 2022, Genes (Basel). MICAL1 Monooxygenase in Autosomal Dominant Lateral Temporal Epilepsy: Role in Cytoskeletal Regulation and Relation to Cancer.",35627100
+Mical2,Redox and detoxification,Signalling and redox,,
+Sccpdh,Other and regulatory,Other,,
+Egln3,Other and regulatory,Other,,
+Nrip1,Other and regulatory,Other,,
+Hnf4a,Other and regulatory,Other,,
+Tnf,Other and regulatory,Other,,
+Zc3h12a,Other and regulatory,Other,"Habacher et al. 2017, Bioessays. ZC3H12A/MCPIP1/Regnase-1-related endonucleases: An evolutionary perspective on molecular mechanisms and biological functions.",28719000
+Kdm8,Other and regulatory,Other,"Amendola et al. 2017, PLoS Genet. JMJD-5/KDM8 regulates H3K36me2 and is required for late steps of homologous recombination and genome integrity.",28207814
+Uty,Other and regulatory,Other,,
+Ehd1,Other and regulatory,Other,,
+Uevld,Other and regulatory,Other,,
+Pcyox1,Other and regulatory,Other,"Herrera-Marcos et al. 2018, Front Biosci (Landmark Ed). Prenylcysteine oxidase 1, a pro-oxidant enzyme of low density lipoproteins.",28930587
+Apol9a,Other and regulatory,Other,,
+Kctd7,Other and regulatory,Other,,
+Kctd9,Other and regulatory,Other,"Zhang et al. 2019, Front Immunol. Kctd9 Deficiency Impairs Natural Killer Cell Development and Effector Function.",31024568
+Kctd11,Other and regulatory,Other,"Lospinoso et al. 2024, Cell Death Differ. SALL4 is a CRL3(REN/KCTD11) substrate that drives Sonic Hedgehog-dependent medulloblastoma.",38062245
+Kctd12,Other and regulatory,Other,"Booker et al. 2017, Cereb Cortex. KCTD12 Auxiliary Proteins Modulate Kinetics of GABAB Receptor-Mediated Inhibition in Cholecystokinin-Containing Interneurons.",27073217

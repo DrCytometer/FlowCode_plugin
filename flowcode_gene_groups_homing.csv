@@ -1,0 +1,158 @@
+gene,group
+Ccr2,Chemokine receptor
+Ccr3,Chemokine receptor
+Ccr4,Chemokine receptor
+Ccr5,Chemokine receptor
+Ccr6,Chemokine receptor
+Ccr7,Chemokine receptor
+Ccr8,Chemokine receptor
+Ccr9,Chemokine receptor
+Cx3cr1,Chemokine receptor
+Cxcr3,Chemokine receptor
+Cxcr4,Chemokine receptor
+Cxcr5,Chemokine receptor
+Cxcr6,Chemokine receptor
+Xcr1,Chemokine receptor
+Ackr1,Chemokine receptor
+Ackr3,Chemokine receptor
+Ccr1,Chemokine receptor
+Ccr1l1,Chemokine receptor
+Ackr2,Chemokine receptor
+Ackr4,Chemokine receptor
+Ccr10,Chemokine receptor
+Ccrl2,Chemokine receptor
+Cxcr2,Chemokine receptor
+Cxcr1,Chemokine receptor
+Itga7,Integrin
+Itga10,Integrin
+Itga2,Integrin
+Itga3,Integrin
+Itga5,Integrin
+Itga9,Integrin
+Itgae,Integrin
+Itgam,Integrin
+Itgax,Integrin
+Itgb2,Integrin
+Itgb3,Integrin
+Itga1,Integrin
+Itga11,Integrin
+Itga2b,Integrin
+Itga4,Integrin
+Itga6,Integrin
+Itga8,Integrin
+Itgad,Integrin
+Itgal,Integrin
+Itgav,Integrin
+Itgb2l,Integrin
+Itgb4,Integrin
+Itgb5,Integrin
+Itgb7,Integrin
+Itgb6,Integrin
+Itgb8,Integrin
+Itgb1,Integrin
+Sell,Selectin
+Sele,Selectin
+Selp,Selectin
+Ctnnd2,Cadherin and cadherin-related genes
+Celsr1,Cadherin and cadherin-related genes
+Celsr3,Cadherin and cadherin-related genes
+Cped1,Cadherin and cadherin-related genes
+Ctnna2,Cadherin and cadherin-related genes
+Ctnnal1,Cadherin and cadherin-related genes
+Ctnnd1,Cadherin and cadherin-related genes
+Celsr2,Cadherin and cadherin-related genes
+Ctnna1,Cadherin and cadherin-related genes
+Ctnna3,Cadherin and cadherin-related genes
+Ctnnb1,Cadherin and cadherin-related genes
+Dsc1,Cadherin and cadherin-related genes
+Dsc3,Cadherin and cadherin-related genes
+Dsg2,Cadherin and cadherin-related genes
+Dsg4,Cadherin and cadherin-related genes
+Fat1,Cadherin and cadherin-related genes
+Fat3,Cadherin and cadherin-related genes
+Dsc2,Cadherin and cadherin-related genes
+Dsg1a,Cadherin and cadherin-related genes
+Dsg3,Cadherin and cadherin-related genes
+Fat2,Cadherin and cadherin-related genes
+Fat4,Cadherin and cadherin-related genes
+Jhy,Cadherin and cadherin-related genes
+Dchs1,Cadherin and cadherin-related genes
+Cd48,IgSF CAMs
+Siglecf,IgSF CAMs
+Siglech,IgSF CAMs
+Cd22,IgSF CAMs
+Cd33,IgSF CAMs
+Bcam,IgSF CAMs
+Cd2,IgSF CAMs
+Cd47,IgSF CAMs
+Alcam,IgSF CAMs
+Dscaml1,IgSF CAMs
+Hepacam2,IgSF CAMs
+Dscam,IgSF CAMs
+Hepacam,IgSF CAMs
+Icam1,IgSF CAMs
+Icam4,IgSF CAMs
+Icam5,IgSF CAMs
+Madcam1,IgSF CAMs
+Mcam,IgSF CAMs
+L1cam,IgSF CAMs
+Nrcam,IgSF CAMs
+Ncam1,IgSF CAMs
+Nectin1,IgSF CAMs
+Nectin3,IgSF CAMs
+Nfasc,IgSF CAMs
+Pecam1,IgSF CAMs
+Ptgfrn,IgSF CAMs
+Siglec15,IgSF CAMs
+Siglec1,IgSF CAMs
+Siglece,IgSF CAMs
+Siglecg,IgSF CAMs
+Vcam1,IgSF CAMs
+Tcam1,IgSF CAMs
+Mag,IgSF CAMs
+Ncam2,IgSF CAMs
+Nectin2,IgSF CAMs
+Nectin4,IgSF CAMs
+Cysltr2,Non-chemokine receptor G-coupled receptor
+Fpr1,Non-chemokine receptor G-coupled receptor
+Fpr3,Non-chemokine receptor G-coupled receptor
+Gpr183,Non-chemokine receptor G-coupled receptor
+Fpr2,Non-chemokine receptor G-coupled receptor
+Ltb4r1,Non-chemokine receptor G-coupled receptor
+Ltb4r2,Non-chemokine receptor G-coupled receptor
+Ptgdr2,Non-chemokine receptor G-coupled receptor
+Ptger2,Non-chemokine receptor G-coupled receptor
+Ptger4,Non-chemokine receptor G-coupled receptor
+Ptgdr,Non-chemokine receptor G-coupled receptor
+Ptger1,Non-chemokine receptor G-coupled receptor
+Ptger3,Non-chemokine receptor G-coupled receptor
+Ptgfr,Non-chemokine receptor G-coupled receptor
+Ptgir,Non-chemokine receptor G-coupled receptor
+S1pr1,Non-chemokine receptor G-coupled receptor
+S1pr3,Non-chemokine receptor G-coupled receptor
+S1pr5,Non-chemokine receptor G-coupled receptor
+Tbxa2r,Non-chemokine receptor G-coupled receptor
+S1pr2,Non-chemokine receptor G-coupled receptor
+S1pr4,Non-chemokine receptor G-coupled receptor
+Adra1a,Non-chemokine receptor G-coupled receptor
+Adra1b,Non-chemokine receptor G-coupled receptor
+Adra2a,Non-chemokine receptor G-coupled receptor
+Adra2b,Non-chemokine receptor G-coupled receptor
+Adra2c,Non-chemokine receptor G-coupled receptor
+Adrb1,Non-chemokine receptor G-coupled receptor
+Adrb2,Non-chemokine receptor G-coupled receptor
+Cysltr1,Non-chemokine receptor G-coupled receptor
+Cd24a,Other homing-associated genes
+Cd44,Other homing-associated genes
+Cd69,Other homing-associated genes
+Epcam,Other homing-associated genes
+APC,Other homing-associated genes
+Cd164,Other homing-associated genes
+Cercam,Other homing-associated genes
+Cr2,Other homing-associated genes
+Chl1,Other homing-associated genes
+Cr1l,Other homing-associated genes
+Icam2,Other homing-associated genes
+Glycam1,Other homing-associated genes
+Selplg,Other homing-associated genes
+Spn,Other homing-associated genes

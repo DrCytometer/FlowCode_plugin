@@ -1046,7 +1046,14 @@ def _restore_defaults_row(slot) -> tuple:
 
 
 class _SideTabWidget(QWidget):
-    """Vertical navigation list beside a page stack (as in Honeycluster)."""
+    """
+    Vertical navigation list beside a page stack (as in Honeycluster). Each
+    page sits in its own scroll area, so a page wider or taller than the
+    window scrolls instead of setting a minimum size for the main window's
+    whole tab area (which would stop the sample panel's splitter widening
+    once the plugin has been shown). ``currentWidget`` and ``widget`` return
+    the pages themselves.
+    """
 
     currentChanged = Signal(int)
 
@@ -1055,6 +1062,8 @@ class _SideTabWidget(QWidget):
         from PySide6.QtCore import QSize
         from PySide6.QtWidgets import QStackedWidget
 
+        # The pages in stack order; the stack holds the scroll area around each.
+        self._pages: list[QWidget] = []
         self._nav = QListWidget()
         self._nav.setIconSize(QSize(20, 20))
         self._nav.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -1077,7 +1086,14 @@ class _SideTabWidget(QWidget):
         self._nav.currentRowChanged.connect(self._on_row_changed)
 
     def addTab(self, widget: QWidget, label: str, icon_name: str | None = None) -> int:
-        index = self._stack.addWidget(widget)
+        holder = QScrollArea()
+        holder.setWidgetResizable(True)
+        holder.setFrameShape(QFrame.NoFrame)
+        holder.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        holder.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        holder.setWidget(widget)
+        index = self._stack.addWidget(holder)
+        self._pages.append(widget)
         item = QListWidgetItem(label)
         if icon_name:
             item.setIcon(icon(icon_name))
@@ -1100,10 +1116,10 @@ class _SideTabWidget(QWidget):
         self._nav.setCurrentRow(index)
 
     def currentWidget(self):
-        return self._stack.currentWidget()
+        return self.widget(self._stack.currentIndex())
 
     def widget(self, index: int):
-        return self._stack.widget(index)
+        return self._pages[index] if 0 <= index < len(self._pages) else None
 
     def count(self) -> int:
         return self._stack.count()
@@ -2683,7 +2699,7 @@ class GatesPage(_Page):
         grp = QGroupBox('Backbone and matched unstained')
         lay = QHBoxLayout(grp)
         self.load_btn = QPushButton('Load events')
-        self.load_btn.clicked.connect(lambda: self.plugin.load_backbone())
+        self.load_btn.clicked.connect(lambda: self.plugin.load_events())
         self.load_status = QLabel('')
         self.load_status.setWordWrap(True)
         lay.addWidget(self.load_btn)
@@ -2826,7 +2842,8 @@ class GatesPage(_Page):
         if busy:
             pass
         elif data is None:
-            self.load_status.setText('' if ready else 'Complete sections 1 and 2 first.')
+            self.load_status.setText('Load events reads the backbone and matched unstained to show the gates and '
+                                     'thresholds.' if ready else 'Complete sections 1 and 2 first.')
         else:
             names = ', '.join(_sample_name(plugin.controller, key) for key in data.backbone_keys)
             self.load_status.setText(
@@ -2902,9 +2919,14 @@ class CharacterisePage(_Page):
         row = QHBoxLayout()
         self.run_btn = QPushButton('Debarcode and identify FRET spillover')
         self.run_btn.clicked.connect(lambda: self.plugin.characterise())
+        self.figures_btn = QPushButton('Show event figures')
+        self.figures_btn.setToolTip('Reload and unmix the gated backbone to rebuild the panel expression and the '
+                                    'biplots of the saved run. Nothing is saved or changed.')
+        self.figures_btn.clicked.connect(lambda: self.plugin.characterise(restore=True))
         self.run_status = QLabel('')
         self.run_status.setWordWrap(True)
         row.addWidget(self.run_btn)
+        row.addWidget(self.figures_btn)
         row.addWidget(self.run_status, stretch=1)
         lay.addLayout(row)
         self.summary = QLabel('')
@@ -3072,6 +3094,8 @@ class CharacterisePage(_Page):
         self.run_btn.setText('Debarcode (no FRET correction)' if plugin.state.no_fret
                              else 'Debarcode and identify FRET spillover')
         self.run_btn.setEnabled(ready and not busy)
+        self.figures_btn.setVisible(plugin.can_show_event_figures())
+        self.figures_btn.setEnabled(not busy)
         if not ready and not busy:
             self.run_status.setText('Confirm the gates and thresholds in section 3 first.')
         elif ready and not busy and self.run_status.text() == 'Confirm the gates and thresholds in section 3 first.':
@@ -3141,12 +3165,14 @@ class CharacterisePage(_Page):
                 self.heatmap.set_figure(fcp.message_figure(str(exc), is_dark), exportable=False)
 
         busy = output is None and self.plugin.characterise_busy()
-        if (key, busy) != self._expression_key:
-            self._expression_key = (key, busy)
+        offer = output is None and self.plugin.can_show_event_figures()
+        if (key, busy, offer) != self._expression_key:
+            self._expression_key = (key, busy, offer)
             if not fc.fret_corrected:
                 self.expression.set_figure(fcp.message_figure(NO_FRET_NOT_PERFORMED, is_dark), exportable=False)
             elif output is None:
                 text = ('Reloading the backbone to show the panel expression…' if busy
+                        else 'Click Show event figures to show the panel expression of the saved run.' if offer
                         else 'Run the characterisation to show the panel expression.')
                 self.expression.set_figure(fcp.message_figure(text, is_dark), exportable=False)
             else:
@@ -3164,7 +3190,9 @@ class CharacterisePage(_Page):
         if output is None:
             for plot in plots:
                 plot.clear()
-            self.biplot_msg.setText('Run the characterisation to show the biplots.')
+            self.biplot_msg.setText('Click Show event figures to show the biplots of the saved run.'
+                                    if self.plugin.can_show_event_figures()
+                                    else 'Run the characterisation to show the biplots.')
             return
         before, after, channels, labels, barcoded = self.plugin.biplot_data(output)
         if before is None or len(channels) < 2:
@@ -3817,10 +3845,8 @@ class PluginWidget(QWidget):
         page = self.tabs.currentWidget()
         if page is self.pages[1]:
             self.start_matching()
-        elif page is self.pages[3]:
-            self._restore_session()
         elif page is self.pages[4]:
-            self._restore_characterisation()
+            self._drop_outdated_characterisation()
         elif page is self.pages[6] and page.gating_view.is_shown():
             page.gating_view.on_shown()
 
@@ -4026,7 +4052,7 @@ class PluginWidget(QWidget):
         source = state.csv_source()
         csv_picked, csv_map = [], {}
         if source:
-            csv_picked, csv_map, _unmatched = fcs.csv_tag_channels(source, channels, antigens, recognise)
+            csv_picked, csv_map, _unmatched = self._csv_tag_channels(source, channels, antigens)
         if state.tag_selection is None:
             state.tag_selection = csv_picked if source else fcs.auto_tag_channels(channels, antigens, recognise)
         state.tag_selection = [ch for ch in channels if ch in set(state.tag_selection)]
@@ -4047,11 +4073,21 @@ class PluginWidget(QWidget):
         source = state.csv_source()
         if source:
             channels = _tag_channel_options(self.controller)
-            _p, _m, unmatched = fcs.csv_tag_channels(source, channels, _antigens(self.controller),
-                                                     fcc.recognise_tag)
+            _p, _m, unmatched = self._csv_tag_channels(source, channels, _antigens(self.controller))
             if unmatched:
                 errors.append('Tags in the combinations CSV that match no channel: ' + ', '.join(unmatched))
         return errors, warnings
+
+    def _csv_tag_channels(self, source, channels, antigens: dict) -> tuple:
+        """``fcs.csv_tag_channels`` of the CSV combos *source*, kept until the
+        CSV, the channels or their antigens change."""
+        key = (repr(source), tuple(channels), tuple(sorted(antigens.items())))
+        cached = getattr(self, '_csv_tag_cache', None)
+        if cached is None or cached[0] != key:
+            cached = (key, fcs.csv_tag_channels(source, channels, antigens, fcc.recognise_tag))
+            self._csv_tag_cache = cached
+        picked, by_tag, unmatched = cached[1]
+        return list(picked), dict(by_tag), list(unmatched)
 
     def combo_problems(self) -> list:
         unmixed = self.controller.experiment.settings.get('unmixed', {}).get('event_channels_pnn') or []
@@ -4236,6 +4272,16 @@ class PluginWidget(QWidget):
         self.pages[3].thresholds.clear()
         state = self.state
         layout = pending['layout']
+        if pending['restore'] and any(self._usable_record(state.gates.get(name)) is None
+                                      for name in fcs.GATE_NAMES):
+            # Viewing the saved run never replaces its gates.
+            message = ('The saved FlowCode gates do not fit the loaded events: nothing was changed. Set the gates '
+                       'again in section 3 (Auto or Use experiment gate) and confirm them.')
+            self._after_space = None
+            self.pages[3].confirm_status.setText(message)
+            self.pages[4].run_status.setText(message)
+            self.refresh()
+            return
         singlets = self._usable_record(state.gates.get(fcs.SINGLETS_GATE))
         if singlets is None:
             fallback = self._usable_record(pending['fallbacks'].get(fcs.SINGLETS_GATE))
@@ -4420,16 +4466,18 @@ class PluginWidget(QWidget):
         self._space_inputs = pending['inputs']
         self._space_tags = pending['tags']
         self._space_ceiling = pending['ceiling']
-        for (tag, _ch), item in zip(pending['tags'], auto):
-            old = state.thresholds.get(tag)
-            if pending['confirm'] or old is None:
+        tags = {t for t, _ in pending['tags']}
+        # Only confirming the gates sets thresholds; a reload to view the
+        # saved run keeps them exactly as they were.
+        if pending['confirm']:
+            for (tag, _ch), item in zip(pending['tags'], auto):
+                old = state.thresholds.get(tag)
                 if old is not None and old.get('method') in fcs.USER_THRESHOLD_METHODS:
                     state.thresholds[tag] = fcs.threshold_record(old['raw'], old['method'], item['delta_bic'],
                                                                  item['raw'], item['method'])
                 else:
                     state.thresholds[tag] = fcs.threshold_record(item['raw'], item['method'], item['delta_bic'])
-        tags = {t for t, _ in pending['tags']}
-        state.thresholds = {t: v for t, v in state.thresholds.items() if t in tags}
+            state.thresholds = {t: v for t, v in state.thresholds.items() if t in tags}
         partners = self.tag_partners()
         tag_map = state.tag_map()
         for tag in tags:
@@ -4549,16 +4597,15 @@ class PluginWidget(QWidget):
         self.pages[3].thresholds.update_table()
         self.state_changed()
 
-    def _restore_session(self):
-        """Reload session data for section 3 when its saved gates exist but the
-        events are not in memory."""
+    def load_events(self):
+        """Read the backbone and matched unstained (section 3's Load events).
+        When section 3 is complete, its debarcoding space is rebuilt too, so
+        the saved gates and thresholds can be viewed and edited; neither is
+        changed by the reload."""
         state = self.state
-        if self.backbone_data is not None or not self.section_ready(3):
-            return
-        if self.task_running('load'):
-            return
-        if all(name in state.gates for name in fcs.GATE_NAMES):
-            self.load_backbone(then_restore=state.run_status(3, self.fingerprint())[0] == 'done')
+        restore = (all(name in state.gates for name in fcs.GATE_NAMES)
+                   and state.run_status(3, self.fingerprint())[0] == 'done')
+        self.load_backbone(then_restore=restore)
 
     # -- section 4 ---------------------------------------------------------------
 
@@ -4733,8 +4780,8 @@ class PluginWidget(QWidget):
                          f'correction, against the reference spectra; {_fmt_beta(ref.get("beta"))} after it '
                          f'(the reference for samples).')
         if self.characterisation is None:
-            lines.append('<i>Saved run: the tag expression and biplots need the gated backbone and are '
-                         'rebuilt when it is loaded.</i>')
+            lines.append('<i>Saved run: the panel expression and biplots need the gated backbone; Show event '
+                         'figures reloads it and rebuilds them.</i>')
         return '<br>'.join(lines)
 
     def biplot_data(self, output: CharacteriseOutput) -> tuple:
@@ -4765,19 +4812,24 @@ class PluginWidget(QWidget):
         barcoded = (ids >= 1) & (ids <= output.result.spectra.design.n_combos)
         return before, after, channels, labels, barcoded
 
-    def _restore_characterisation(self):
-        """Rebuild the event figures of a completed run when page 4 is shown,
-        or when they were drawn with another final unmix."""
+    def _drop_outdated_characterisation(self):
+        """Forget the session run's event figures when they were drawn with
+        another final unmix; page 4 then shows the saved run, whose event
+        figures Show event figures rebuilds."""
         if self.characterise_busy():
             return
         output = self.characterisation
-        if output is not None:
-            if output.engine == self.method_summary().get('label') or self.section_status(4)[0] != 'done':
-                return
-            self.characterisation = None
-            self.pages[4].clear()
-        if self.section_status(4)[0] == 'done':
-            self.characterise(restore=True)
+        if output is None or output.engine == self.method_summary().get('label') \
+                or self.section_status(4)[0] != 'done':
+            return
+        self.characterisation = None
+        self.pages[4].clear()
+
+    def can_show_event_figures(self) -> bool:
+        """Whether page 4 offers Show event figures: a completed, FRET-corrected
+        run whose event figures are not in this session."""
+        return (self.characterisation is None and not self.state.no_fret
+                and self.section_status(4)[0] == 'done')
 
     # -- section 5 ---------------------------------------------------------------
 
@@ -5347,7 +5399,8 @@ class PluginWidget(QWidget):
         if self._active and self._available():
             self.refresh()
             if self.tabs.currentWidget() is self.pages[4]:
-                self._restore_characterisation()
+                self._drop_outdated_characterisation()
+                self.pages[4].refresh()
 
     def export_spectra(self):
         """The saved characterisation with the current combo names, checked
@@ -5852,3 +5905,4 @@ class PluginWidget(QWidget):
         if self.bus is not None:
             self.bus.statusMessage.emit(f'FlowCode: {message}')
         self.refresh()
+

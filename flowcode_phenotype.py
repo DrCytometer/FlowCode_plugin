@@ -177,10 +177,29 @@ class Panel:
     viability: tuple                        # fluorophores that are viability dyes
 
 
+_panel_cache: dict = {}
+
+
 def panel_from_spectral_model(spectral_model, fluor_names=None, marker_db=None) -> Panel:
     """*spectral_model* is the experiment's list of ``{'label', 'antigen'}``;
     *fluor_names* restricts it to the fluorophores with a reference spectrum
-    (spectral-model order is kept)."""
+    (spectral-model order is kept). With the bundled marker database, the
+    panel is kept for the same labels, antigens and fluorophores."""
+    key = None
+    if marker_db is None:
+        key = (tuple((entry.get('label'), str(entry.get('antigen') or '').strip()) for entry in spectral_model or []),
+               None if fluor_names is None else tuple(fluor_names))
+        if key in _panel_cache:
+            return _panel_cache[key]
+    panel = _build_panel(spectral_model, fluor_names, marker_db)
+    if key is not None:
+        if len(_panel_cache) >= 16:
+            _panel_cache.clear()
+        _panel_cache[key] = panel
+    return panel
+
+
+def _build_panel(spectral_model, fluor_names, marker_db) -> Panel:
     keep = None if fluor_names is None else set(fluor_names)
     fluorophores, antigens, markers, unmatched = [], {}, {}, []
     from honeychrome.controller_components.label_matching import get_marker_db, match_marker

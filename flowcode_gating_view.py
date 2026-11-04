@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 TASK = 'analysis_gating'
 MODE = 'flowcode_gating'
 COLUMNS = 4
-HIGHLIGHT_COLOUR = (255, 0, 123)
+HIGHLIGHT_COLOUR = (255, 209, 220)
 INTRO = ('The experiment\'s Unmixed Data plots and gates over the FlowCode-unmixed events of the sample selected '
          'in the sample browser, gated exactly as the Analysis counts them (the sample\'s own gate overrides '
          'included). <i>Uncorrected</i> is the experiment\'s own unmix of the raw file; <i>FlowCode standard</i> '

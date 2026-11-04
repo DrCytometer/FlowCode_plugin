@@ -59,6 +59,14 @@ group where the library has fewer than ``MIN_SAMPLES_PER_GROUP`` samples
 (a guide shared by several libraries counts the samples of all of them).
 Library is never an adjustment covariate: it is confounded with the mice.
 Split by library to compare within each library on its own.
+
+Leave-one-out check (optional, on demand): the statistics are run again
+without each mouse in turn (each sample when unpaired), with library sizes
+and expanded clones worked out again, and every significant result is
+re-judged in each refit at the current thresholds (``leave_one_out``,
+``leave_one_out_summary``). A result is flagged when it loses significance
+or changes sign without some mouse; the mouse whose removal moves its
+log2FC most is reported and drawn in red in the combination plot.
 """
 
 from __future__ import annotations
@@ -197,7 +205,7 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
                    clone_groups: dict | None = None, clone_reference: str | None = None,
                    population_contrasts: str | None = None, allow_no_comparisons: bool = False,
                    libraries: dict | None = None, feature_libraries: dict | None = None,
-                   library_labels: dict | None = None) -> dict:
+                   library_labels: dict | None = None, fit_log: list | None = None) -> dict:
     """
     Test every combination between sample groups.
 
@@ -238,6 +246,10 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
                   library's guides out of a group where it has fewer than
                   MIN_SAMPLES_PER_GROUP samples.
     library_labels : {library: name shown in the notes}.
+    fit_log     : a list, or None. Each counts fit that runs appends the
+                  exact inputs it was given (``fit_record``), so the
+                  pathway analysis (``flowcode_pathways``) can rebuild the
+                  same fits.
 
     Returns {'samples', 'group_vec', 'split', 'pairing', 'comparisons'
     (labels), 'pairs' ([(base, other, level)]), 'counts', 'counts_values',
@@ -307,10 +319,15 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
         size = library.loc[used]
         try:
             if run_counts:
+                offset_df = _offsets(sub, size)
                 res = ds.run_glm_counts(sub, group_vec, contrasts, contrast_mode, pval_threshold,
-                                        fc_threshold, offset_df=_offsets(sub, size), method=counts_method,
+                                        fc_threshold, offset_df=offset_df, method=counts_method,
                                         **common)
                 frames['counts'].append(_relabel(res, level))
+                if fit_log is not None:
+                    fit_log.append(fit_record(sub, group_vec, contrasts, contrast_mode, pair_vec, cov, offset_df,
+                                              {f'{o} vs {b}': comparison_label(b, o, level) for b, o in contrasts},
+                                              counts_method))
             if run_freq:
                 res = ds.run_moderated(log2_all.loc[used], group_vec, contrasts, contrast_mode,
                                        pval_threshold, fc_threshold, **common)
@@ -327,7 +344,7 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
             analysed, log2_all, library, samples, groups, order, reference, pairing, covariates, split_by,
             strata, population_contrasts, run_counts, run_freq, counts_method, frames, pairs, notes,
             dict(pval_threshold=pval_threshold, fc_threshold=fc_threshold, fdr_scope=fdr_scope,
-                 use_treat=use_treat))
+                 use_treat=use_treat), fit_log)
 
     if not pairs and not allow_no_comparisons:
         raise RuntimeError(' '.join(notes) or 'No comparison could be made.')
@@ -433,9 +450,19 @@ def _offsets(sub: pd.DataFrame, size: pd.Series) -> pd.DataFrame:
                         columns=sub.columns)
 
 
+def fit_record(counts: pd.DataFrame, group_vec: list, contrasts: list, mode: str, pairing_vec: list | None,
+               covariates: pd.DataFrame | None, offset_df: pd.DataFrame, labels: dict, method: str) -> dict:
+    """The inputs of one ``differential_stats.run_glm_counts`` call, with
+    *labels* mapping its comparison names (``other vs base``) to the names
+    in the results table."""
+    return {'counts': counts, 'group_vec': list(group_vec), 'contrasts': list(contrasts), 'mode': mode,
+            'pairing_vec': None if pairing_vec is None else list(pairing_vec), 'covariates': covariates,
+            'offset_df': offset_df, 'labels': dict(labels), 'method': method}
+
+
 def _population_contrasts(analysed, log2_all, library, samples, groups, order, reference, pairing,
                           covariates, split_by, strata, ref_pop, run_counts, run_freq, counts_method,
-                          frames, pairs, notes, thresholds) -> dict:
+                          frames, pairs, notes, thresholds, fit_log=None) -> dict:
     """
     Population contrasts: for every population P other than *ref_pop* and
     every group g other than the reference group, does g's change against
@@ -506,10 +533,14 @@ def _population_contrasts(analysed, log2_all, library, samples, groups, order, r
             sub = analysed.loc[used]
             try:
                 if run_counts:
+                    offset_df = _offsets(sub, library.loc[used])
                     res = ds.run_glm_counts(sub, cells, contrasts, 'reference',
-                                            offset_df=_offsets(sub, library.loc[used]), method=counts_method,
+                                            offset_df=offset_df, method=counts_method,
                                             **common)
                     frames['counts'].append(res.assign(comparison=res['comparison'].map(labels)))
+                    if fit_log is not None:
+                        fit_log.append(fit_record(sub, cells, contrasts, 'reference', pair_vec, cov, offset_df,
+                                                  labels, counts_method))
                 if run_freq:
                     res = ds.run_moderated(log2_all.loc[used], cells, contrasts, 'reference', **common)
                     frames['freq'].append(res.assign(comparison=res['comparison'].map(labels)))
@@ -627,13 +658,137 @@ def _relabel(results: pd.DataFrame, level: str | None) -> pd.DataFrame:
 def reapply_thresholds(stats: dict, pval_threshold: float, fc_threshold: float, fdr_scope: str,
                        use_treat: bool) -> dict:
     """*stats* with p-values, FDR and significance recomputed for new
-    thresholds, without refitting."""
+    thresholds, without refitting (the leave-one-out check too)."""
     out = dict(stats)
     for key in ('counts', 'freq'):
         if out.get(key) is not None:
             out[key] = ds.apply_significance(out[key], pval_threshold, fc_threshold,
                                              fdr_scope=fdr_scope, use_treat=use_treat)
+    if out.get('leave_one_out'):
+        loo = dict(out['leave_one_out'])
+        loo['summary'] = leave_one_out_summary(out, loo, pval_threshold, fc_threshold, fdr_scope, use_treat)
+        out['leave_one_out'] = loo
     return out
+
+
+# ---------------------------------------------------------------------------
+# Leave-one-out check
+# ---------------------------------------------------------------------------
+
+LOO_KEEP = ('comparison', 'feature', 'logFC', 'SE', 'df.total', 'P.Value')
+
+
+def leave_one_out(counts: pd.DataFrame, denominator: pd.Series, groups: dict, levels: dict, kwargs: dict,
+                  progress=None) -> dict:
+    """
+    Whether each result still stands without any one mouse: the statistics
+    are run again once per level of *levels* ({sample: level}: the mouse
+    when samples are paired, otherwise the sample itself), with that
+    level's samples left out and every other argument of ``run_statistics``
+    (*kwargs*) unchanged, so library sizes and expanded clones are worked
+    out again without it. A refit that cannot be made (e.g. a group left
+    with too few samples) is recorded as failed.
+
+    Each refit keeps, per test, the columns of ``LOO_KEEP``; significance is
+    decided later for the current thresholds (``leave_one_out_summary``).
+    *progress* (n, total, text) is called before each refit, and with
+    (total, total, '') when all are done.
+
+    Returns {'levels': [level], 'level_of': {sample: level},
+    'refits': {level: {'counts': table or None, 'freq': table or None}},
+    'failed': {level: reason}}.
+    """
+    kw = dict(kwargs, allow_no_comparisons=True)
+    kw.pop('fit_log', None)
+    order = list(dict.fromkeys(levels[s] for s in counts.index if groups.get(s) and levels.get(s) not in (None, '')))
+    refits, failed = {}, {}
+    for i, level in enumerate(order):
+        if progress is not None:
+            progress(i, len(order), str(level))
+        kept = [s for s in counts.index if levels.get(s) != level]
+        try:
+            refit = run_statistics(counts.loc[kept], denominator.loc[kept], groups, **kw)
+        except RuntimeError as exc:
+            failed[level] = str(exc)
+            continue
+        tables = {key: (refit[key][list(LOO_KEEP)].copy() if refit.get(key) is not None else None)
+                  for key in ('counts', 'freq')}
+        if all(t is None or t.empty for t in tables.values()):
+            failed[level] = ' '.join(refit.get('notes') or []) or 'no comparison could be made'
+            continue
+        refits[level] = tables
+    if progress is not None:
+        progress(len(order), len(order), '')
+    level_of = {s: levels[s] for s in counts.index if levels.get(s) in order}
+    return {'levels': order, 'level_of': level_of, 'refits': refits, 'failed': failed}
+
+
+def leave_one_out_summary(stats: dict, loo: dict, pval_threshold: float, fc_threshold: float, fdr_scope: str,
+                          use_treat: bool) -> pd.DataFrame:
+    """
+    The leave-one-out check of every significant result of *stats* at
+    these thresholds: one row per test ('counts' or 'freq'), comparison
+    and combination, with the refits in which it was tested
+    (``loo_refits``), those in which it stayed significant
+    (``loo_significant``), the range of its log2FC across them, how many
+    changed its sign, the level whose removal moved the log2FC most
+    (``loo_influential``, with that refit's log2FC) and the levels without
+    which it was not significant (``loo_lost_without``, '; '-joined).
+    ``loo_flag`` is '⚠' when it lost significance or changed sign in any
+    refit. Each refit's significance uses its own FDR, as a full run would.
+    """
+    columns = ['key', 'comparison', 'feature', 'loo_refits', 'loo_significant', 'loo_logFC_min',
+               'loo_logFC_max', 'loo_sign_changes', 'loo_influential', 'loo_influential_logFC',
+               'loo_lost_without', 'loo_flag']
+    rows = []
+    for key in ('counts', 'freq'):
+        full = stats.get(key)
+        if full is None or full.empty:
+            continue
+        refit = {}
+        for level, tables in (loo.get('refits') or {}).items():
+            table = tables.get(key)
+            if table is None or table.empty:
+                continue
+            judged = ds.apply_significance(table, pval_threshold, fc_threshold, fdr_scope=fdr_scope,
+                                           use_treat=use_treat)
+            refit[level] = judged.set_index(['comparison', 'feature'])[['logFC', 'significant']]
+        for _i, hit in full[full['significant'].astype(bool)].iterrows():
+            index = (hit['comparison'], hit['feature'])
+            found = {lv: r.loc[index] for lv, r in refit.items()
+                     if index in r.index and np.isfinite(float(r.loc[index, 'logFC']))}
+            lfc = np.array([float(v['logFC']) for v in found.values()])
+            lost = [str(lv) for lv, v in found.items() if not bool(v['significant'])]
+            sign_changes = int(np.sum(np.sign(lfc) != np.sign(float(hit['logFC'])))) if lfc.size else 0
+            if found:
+                influential = max(found, key=lambda lv: abs(float(found[lv]['logFC']) - float(hit['logFC'])))
+                influential_lfc = float(found[influential]['logFC'])
+            else:
+                influential, influential_lfc = '', np.nan
+            rows.append({'key': key, 'comparison': hit['comparison'], 'feature': hit['feature'],
+                         'loo_refits': len(found), 'loo_significant': len(found) - len(lost),
+                         'loo_logFC_min': float(lfc.min()) if lfc.size else np.nan,
+                         'loo_logFC_max': float(lfc.max()) if lfc.size else np.nan,
+                         'loo_sign_changes': sign_changes, 'loo_influential': str(influential),
+                         'loo_influential_logFC': influential_lfc, 'loo_lost_without': '; '.join(lost),
+                         'loo_flag': '⚠' if lost or sign_changes else ''})
+    return pd.DataFrame(rows, columns=columns)
+
+
+def leave_one_out_columns(stats: dict, key: str) -> pd.DataFrame | None:
+    """The leave-one-out columns of test *key* indexed by (comparison,
+    feature), with levels shown by their labels (``loo['labels']``); None
+    without a check."""
+    loo = stats.get('leave_one_out') or {}
+    summary = loo.get('summary')
+    if summary is None or summary.empty:
+        return None
+    labels = loo.get('labels') or {}
+    part = summary[summary['key'] == key].drop(columns='key').copy()
+    part['loo_influential'] = [labels.get(v, v) for v in part['loo_influential']]
+    part['loo_lost_without'] = ['; '.join(labels.get(v, v) for v in text.split('; ')) if text else ''
+                                for text in part['loo_lost_without']]
+    return part.set_index(['comparison', 'feature'])
 
 
 def primary_results(stats: dict) -> tuple:
@@ -658,12 +813,17 @@ def comparison_samples(stats: dict, pair: tuple) -> list:
 
 
 def results_table(stats: dict) -> pd.DataFrame | None:
-    """Every test's results in one long table, with a 'test' column."""
+    """Every test's results in one long table, with a 'test' column and,
+    after a leave-one-out check, its columns on the significant rows."""
     frames = []
     counts_name = f"Counts (NB GLM, {COUNT_TEST_NAMES.get(stats.get('counts_method') or 'wald')})"
     for key, name in (('counts', counts_name), ('freq', 'Frequencies (moderated LM)')):
         if stats.get(key) is not None:
-            frames.append(stats[key].assign(test=name))
+            table = stats[key].assign(test=name)
+            loo = leave_one_out_columns(stats, key)
+            if loo is not None:
+                table = table.join(loo, on=['comparison', 'feature'])
+            frames.append(table)
     return pd.concat(frames, ignore_index=True) if frames else None
 
 
@@ -866,6 +1026,7 @@ def summary_figures(stats: dict, is_dark: bool, population: str, heatmap_order: 
 
 
 NO_GROUP_COLOUR = '#7f7f7f'
+LOO_COLOUR = '#d62728'
 P_NAMES = {'stagewise.adj.P.Val': 'stage-wise adj. P', 'adj.P.Val.global': 'adj. P (pooled)',
            'adj.P.Val': 'adj. P', 'P.Value': 'P'}
 
@@ -1036,6 +1197,9 @@ def combination_figure(stats: dict, combination: str, pair: tuple, fdr_scope: st
     the same pairing level (mouse) are joined by lines, darker between the
     two groups of *pair*. Counts left out as expanded clones are hollow.
     The title gives each test's log2FC, CI and adjusted p-value for *pair*.
+    After a leave-one-out check of a significant result, a further line
+    gives how it fared and the most influential mouse (or sample) is drawn
+    in red.
     """
     from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
@@ -1101,8 +1265,23 @@ def combination_figure(stats: dict, combination: str, pair: tuple, fdr_scope: st
             text += f" [{float(row['CI.L']):+.2f}, {float(row['CI.R']):+.2f}]"
         text += f", {P_NAMES.get(p_col, p_col)} = {float(row[p_col]):.3g}"
         lines.append(text)
+    influential = _leave_one_out_line(stats, label, combination, lines)
+    if influential is not None:
+        level_of = stats['leave_one_out'].get('level_of') or {}
+        mask = np.array([level_of.get(s) == influential for s in table['sample']])
+        if mask.any():
+            rows = table[mask].sort_values('x')
+            if len(rows) > 1:
+                ax.plot(rows['x'], rows['percent'], color=LOO_COLOUR, linewidth=1.2, zorder=5)
+            ax.scatter(rows['x'], rows['percent'], s=70, facecolors='none', edgecolors=LOO_COLOUR,
+                       linewidths=1.4, zorder=5)
+        else:
+            influential = None
     ax.set_title('\n'.join(lines), fontsize=9)
     handles = []
+    if influential is not None:
+        handles.append(Line2D([], [], marker='o', color=LOO_COLOUR, markerfacecolor='none',
+                              label='most influential (leave one out)'))
     if len(paired):
         handles.append(Line2D([], [], color='#9a9a9a', linewidth=0.8, label='same pairing level'))
     if table['removed'].any():
@@ -1116,6 +1295,36 @@ def combination_figure(stats: dict, combination: str, pair: tuple, fdr_scope: st
         fig, ax, overlay, [f'{n}: {v:.3g}%' for n, v in zip(names, table['percent'])], is_dark)
     dp.style_figure_theme(fig, is_dark)
     return fig
+
+
+def _leave_one_out_line(stats: dict, label: str, combination: str, lines: list):
+    """Append the leave-one-out result of *combination* in comparison
+    *label* to the title *lines* (counts before frequencies) and return its
+    most influential level, or None when it was not checked."""
+    loo = stats.get('leave_one_out') or {}
+    summary = loo.get('summary')
+    if summary is None or summary.empty:
+        return None
+    rows = summary[(summary['comparison'] == label) & (summary['feature'] == combination)]
+    if rows.empty:
+        return None
+    row = rows.sort_values('key', key=lambda col: col.map({'counts': 0, 'freq': 1})).iloc[0]
+    labels = loo.get('labels') or {}
+    level = row['loo_influential']
+    text = (f"Leave one out ({TEST_NAMES[row['key']]}): significant in {int(row['loo_significant'])} "
+            f"of {int(row['loo_refits'])} refits")
+    if row['loo_flag']:
+        text += f" {row['loo_flag']}"
+    lines.append(text)
+    parts = []
+    if int(row['loo_refits']):
+        parts.append(f"log2FC {float(row['loo_logFC_min']):+.2f} to {float(row['loo_logFC_max']):+.2f}")
+    if level:
+        parts.append(f"most influential {labels.get(level, level)} "
+                     f"({float(row['loo_influential_logFC']):+.2f} without it)")
+    if parts:
+        lines.append('; '.join(parts))
+    return level or None
 
 
 # ---------------------------------------------------------------------------
@@ -1933,7 +2142,7 @@ def default_export_folder(root, population: str, when: datetime | None = None) -
 def write_analysis_folder(folder, *, population: str, raw_counts: pd.DataFrame, meta: pd.DataFrame,
                           qc: pd.DataFrame, filtered, stats: dict | None, sample_table: pd.DataFrame,
                           settings_text: str, figures: list, sample_labels: dict | None = None,
-                          progress=None, no_fret: bool = False) -> list:
+                          progress=None, no_fret: bool = False, fdr_threshold: float = 0.05) -> list:
     """
     Write one analysis into *folder*:
 
@@ -1949,6 +2158,15 @@ def write_analysis_folder(folder, *, population: str, raw_counts: pd.DataFrame, 
     * ``clones.csv`` — expanded clones found, and whether each was removed
       (when the clone filter was on);
     * ``markers.csv`` — the marker test of every group (when run);
+    * ``pathways.csv`` (one row per pathway and comparison),
+      ``pathway_libraries.csv``, ``pathway_members.csv``,
+      ``pathway_controls.csv`` (the NON-Targetting check) and
+      ``pathway_gene_names.csv`` — the pathway analysis (when run);
+    * ``gene_groups.csv`` (one row per group and comparison),
+      ``gene_group_libraries.csv``, ``gene_group_members.csv``,
+      ``gene_group_assignment.csv`` (each combination's group),
+      ``gene_group_table.csv`` (the table used) and
+      ``guide_allocation.csv`` — the gene-group analysis (when run);
     * ``settings.txt`` — population, gates, rules, test settings, notes;
     * ``figures/`` — a PNG per figure, and ``<population> report.pdf`` with
       a title page, the settings, the QC table, every figure and the
@@ -1957,8 +2175,10 @@ def write_analysis_folder(folder, *, population: str, raw_counts: pd.DataFrame, 
     *figures* is a list of (name, zero-argument callable returning a
     canvas-less Figure). With *no_fret* (samples debarcoded without FRET
     correction) every figure and report page carries ``stamp_invalid`` and
-    the title page leads with the warning. Returns the list of files
-    written.
+    the title page leads with the warning. The report lists the pathways
+    with either FDR at or below *fdr_threshold*, and the gene groups with
+    the competitive or the any-change FDR at or below it. Returns the list
+    of files written.
     """
     from matplotlib.backends.backend_pdf import PdfPages
 
@@ -2002,6 +2222,28 @@ def write_analysis_folder(folder, *, population: str, raw_counts: pd.DataFrame, 
         csv(clones, 'clones.csv', index=False)
     if stats and stats.get('markers') is not None:
         csv(stats['markers']['results'], 'markers.csv', index=False)
+    pathways = (stats or {}).get('pathways')
+    pathway_rows = None
+    if pathways:
+        import flowcode_pathways as fpw
+
+        pathway_rows = fpw.pathway_table(pathways)
+        csv(pathway_rows, 'pathways.csv', index=False)
+        for key, name in (('libraries', 'pathway_libraries.csv'), ('members', 'pathway_members.csv'),
+                          ('qc', 'pathway_controls.csv'), ('matches', 'pathway_gene_names.csv')):
+            csv(pathways[key], name, index=False)
+    gene_groups = (stats or {}).get('gene_groups')
+    group_rows = None
+    if gene_groups:
+        import flowcode_gene_groups as fgg
+
+        group_rows = fgg.group_table(gene_groups)
+        csv(group_rows, 'gene_groups.csv', index=False)
+        for key, name in (('libraries', 'gene_group_libraries.csv'), ('members', 'gene_group_members.csv'),
+                          ('assignment', 'gene_group_assignment.csv'), ('table', 'gene_group_table.csv'),
+                          ('allocation', 'guide_allocation.csv')):
+            if gene_groups.get(key) is not None:
+                csv(gene_groups[key], name, index=False)
     settings_path = folder / 'settings.txt'
     settings_path.write_text(settings_text, encoding='utf-8')
     written.append(settings_path)
@@ -2045,6 +2287,23 @@ def write_analysis_folder(folder, *, population: str, raw_counts: pd.DataFrame, 
                                 'stagewise.adj.P.Val') if c in sig.columns]
             drc_report.add_dataframe_pages(pdf, sig[cols].rename(columns={'logFC': 'delta'}),
                                            'Significant marker differences')
+        if pathway_rows is not None:
+            sig = pathway_rows[(pathway_rows['competitive_FDR'] <= fdr_threshold)
+                               | (pathway_rows['FDR'] <= fdr_threshold)]
+            cols = ['comparison', 'set_name', 'members', 'score', 'concordance', 'competitive_FDR', 'FDR', 'leading']
+            drc_report.add_dataframe_pages(pdf, sig[cols].rename(columns={'set_name': 'pathway',
+                                                                          'concordance': 'agreement'}),
+                                           f'Pathways with an FDR at or below {fdr_threshold:g}')
+        if group_rows is not None:
+            sig = group_rows[(group_rows['competitive_FDR'] <= fdr_threshold)
+                             | (group_rows['mixed_FDR'] <= fdr_threshold)]
+            cols = ['comparison', 'set_name', 'members', 'score', 'concordance', 'competitive_FDR', 'mixed_FDR',
+                    'leading']
+            drc_report.add_dataframe_pages(pdf, sig[cols].rename(columns={'set_name': 'group', 'members': 'guides',
+                                                                          'concordance': 'agreement',
+                                                                          'mixed_FDR': 'any-change FDR'}),
+                                           f'Gene groups with the competitive or any-change FDR at or below '
+                                           f'{fdr_threshold:g}')
     written.append(pdf_path)
     return written
 

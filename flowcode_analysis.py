@@ -148,7 +148,20 @@ ANALYSIS_DEFAULTS = {
     'marker_channels': None,
     'marker_min_events': 10,
     'marker_threshold': 0.03,
+    'run_pathways': False,
+    'pathway_min_size': 3,
+    'pathway_rotations': 9999,
+    'pathway_evidence': 'all',
+    'pathway_names': {},
+    'run_gene_groups': False,
+    'gene_group_table': [],
+    'gene_group_file': '',
+    'gene_group_areas': {},
+    'gene_group_colours': {},
+    'gene_group_order': [],
+    'gene_group_comparisons': [],
 }
+PATHWAY_EVIDENCE = ('all', 'experimental')
 
 
 def analysis_settings(stored: dict | None) -> dict:
@@ -165,6 +178,19 @@ def analysis_settings(stored: dict | None) -> dict:
     k = out['marker_spillover_k']
     if k != 'auto' and not (isinstance(k, (int, float)) and not isinstance(k, bool) and k >= 0):
         out['marker_spillover_k'] = 'auto'
+    if out['pathway_evidence'] not in PATHWAY_EVIDENCE:
+        out['pathway_evidence'] = ANALYSIS_DEFAULTS['pathway_evidence']
+    if not isinstance(out['pathway_names'], dict):
+        out['pathway_names'] = {}
+    rows = out['gene_group_table']
+    out['gene_group_table'] = ([[str(r[0]), str(r[1])] for r in rows if isinstance(r, (list, tuple)) and len(r) >= 2]
+                               if isinstance(rows, list) else [])
+    for key in ('gene_group_areas', 'gene_group_colours'):
+        if not isinstance(out[key], dict):
+            out[key] = {}
+    for key in ('gene_group_order', 'gene_group_comparisons'):
+        if not isinstance(out[key], list):
+            out[key] = []
     return out
 
 
@@ -459,13 +485,14 @@ def count_table(records: dict, combo_order: list | None = None) -> tuple:
         for name in rec['counts']:
             if name not in names:
                 names.append(name)
-    counts = pd.DataFrame(0.0, index=pd.Index(keys, name='sample'), columns=names, dtype=np.float64)
-    meta = pd.DataFrame(index=pd.Index(keys, name='sample'), columns=list(COUNT_COLUMNS), dtype=object)
-    for key, rec in records.items():
+    position = {name: j for j, name in enumerate(names)}
+    values = np.zeros((len(keys), len(names)), dtype=np.float64)
+    for i, rec in enumerate(records.values()):
         for name, n in rec['counts'].items():
-            counts.loc[key, name] = float(n)
-        for col in COUNT_COLUMNS:
-            meta.loc[key, col] = rec.get(col)
+            values[i, position[name]] = float(n)
+    counts = pd.DataFrame(values, index=pd.Index(keys, name='sample'), columns=names)
+    meta = pd.DataFrame([[rec.get(col) for col in COUNT_COLUMNS] for rec in records.values()],
+                        index=pd.Index(keys, name='sample'), columns=list(COUNT_COLUMNS), dtype=object)
     if np.all(np.mod(counts.values, 1.0) == 0):
         counts = counts.astype(np.int64)
     return counts, meta
@@ -678,29 +705,40 @@ def library_features(counts: pd.DataFrame, meta: pd.DataFrame, sample_library: d
     unassigned, or a library since removed), which are left out.
     """
     features = list(dict.fromkeys(f for fmap in feature_map.values() for f in fmap.values()))
+    sample_of = meta['sample'].to_dict()
     keep, left_out = [], {}
     for unit in counts.index:
-        sample = meta.loc[unit, 'sample']
+        sample = sample_of[unit]
         lib = sample_library.get(sample)
         if lib in feature_map:
             keep.append(unit)
         else:
             left_out[sample] = lib or ''
-    out = pd.DataFrame(np.nan, index=pd.Index(keep, name=counts.index.name), columns=features)
-    new_meta = meta.loc[keep].copy()
-    new_meta['library'] = ''
-    new_meta['out_of_library'] = pd.Series(0, index=new_meta.index, dtype=object)
-    for unit in keep:
-        lib = sample_library[meta.loc[unit, 'sample']]
-        row = counts.loc[unit]
+    feature_col = {f: j for j, f in enumerate(features)}
+    triplet_col = {t: j for j, t in enumerate(counts.columns)}
+    row_of = {u: i for i, u in enumerate(counts.index)}
+    raw = counts.to_numpy(dtype=np.float64)
+    values_out = np.full((len(keep), len(features)), np.nan)
+    libraries, outside, barcoded = [], [], []
+    for r, unit in enumerate(keep):
+        lib = sample_library[sample_of[unit]]
+        row = raw[row_of[unit]]
         values = {}
         for triplet, feature in feature_map[lib].items():
-            values[feature] = values.get(feature, 0.0) + (float(row[triplet]) if triplet in row.index else 0.0)
-        out.loc[unit, list(values)] = list(values.values())
+            j = triplet_col.get(triplet)
+            values[feature] = values.get(feature, 0.0) + (float(row[j]) if j is not None else 0.0)
+        for feature, value in values.items():
+            values_out[r, feature_col[feature]] = value
         inside = whole_or_float(sum(values.values()))
-        new_meta.loc[unit, 'library'] = lib
-        new_meta.loc[unit, 'out_of_library'] = whole_or_float(row.sum() - inside)
-        new_meta.loc[unit, 'barcoded'] = inside
+        libraries.append(lib)
+        outside.append(whole_or_float(row.sum() - inside))
+        barcoded.append(inside)
+    out = pd.DataFrame(values_out, index=pd.Index(keep, name=counts.index.name), columns=features)
+    new_meta = meta.loc[keep].copy()
+    new_meta['library'] = ''
+    new_meta.loc[:, 'library'] = libraries
+    new_meta['out_of_library'] = pd.Series(outside, index=new_meta.index, dtype=object)
+    new_meta['barcoded'] = pd.Series(barcoded, index=new_meta.index, dtype=object)
     return out, new_meta, left_out
 
 

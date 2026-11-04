@@ -63,10 +63,10 @@ import pandas as pd
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGroupBox,
-    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
-    QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-    QWidget,
+    QAbstractItemView, QButtonGroup, QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QListWidget,
+    QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem,
+    QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 import honeychrome.settings as hc_settings
@@ -78,7 +78,10 @@ from honeychrome.view_components.help_toggle_widget import WheelBlocker
 import flowcode_analysis as fa
 import flowcode_figure_panel as fcfp
 import flowcode_gating_view as fcgv
+import flowcode_gene_groups as fgg
+import flowcode_pathways as fpw
 import flowcode_stats as fst
+import flowcode_view_stack as fvs
 from flowcode_state import NO_FRET_WARNING, OTHER_LIBRARY, library_label
 
 logger = logging.getLogger(__name__)
@@ -98,7 +101,7 @@ COMPARE = {'groups': 'Sample groups (within each population)', 'populations': 'P
 MARKER_REFERENCES = {'tags': 'Tag model (other combinations, same tags)', 'controls': 'Control combinations',
                      'all': 'All other barcoded cells'}
 FDR_SCOPES = {'per_comparison': 'Within each comparison', 'global': 'Pooled over all comparisons'}
-COUNT_TESTS = {'ql': 'Quasi-likelihood F test (recommended)', 'wald': 'Wald test (per-combination dispersion)'}
+COUNT_TESTS = {'ql': 'Quasi-likelihood F test (default)', 'wald': 'Wald test (not recommended)'}
 NORMALISATIONS = {'robust': 'Robust (trimmed; clones cannot shift it)', 'total': 'Total barcoded events',
                   'control': 'Control combinations'}
 SAMPLE_COLUMN_MAX_WIDTH = 280
@@ -108,12 +111,22 @@ HEATMAP_ORDERS = {'effect': 'By effect', 'alphabetical': 'Alphabetical'}
 SUMMARY_FIGURES = ('comparison_heatmap', 'sample_pca', 'qc')
 # Marker test tabs, drawn for the chosen marker group.
 MARKER_FIGURES = ('marker_table', 'marker_heatmap', 'marker_volcano', 'marker_combination')
+# Pathway tabs, after the marker tabs: the dot plot over every comparison,
+# and the chosen comparison's table and chosen pathway's members.
+PATHWAY_FIGURES = ('pathway_dot_plot', 'pathway_table', 'pathway_members')
+PATHWAY_EVIDENCE = {'all': 'All annotations (IEA included)', 'experimental': 'Experimental evidence only'}
+# Gene-group tabs, after the pathway tabs: the guide allocation and the
+# spider over every comparison, the chosen comparison's table and the chosen
+# group's guides.
+GENE_GROUP_FIGURES = ('guide_allocation', 'gene_group_spider', 'gene_group_table', 'gene_group_members')
 # Settings put back by the Restore defaults buttons. The design (groups,
-# reference, pairing, covariates, split, chosen markers and controls) is kept.
+# reference, pairing, covariates, split, chosen markers and controls), the
+# pathway gene names set by hand and the gene-group table are kept.
 STATS_DEFAULT_KEYS = ('run_counts', 'run_freq', 'run_markers', 'counts_method', 'normalisation', 'remove_clones',
                       'clone_min_count', 'clone_min_pct', 'clone_max_levels', 'marker_reference',
                       'marker_spillover', 'marker_spillover_k', 'marker_min_events', 'marker_threshold',
-                      'pval_threshold', 'fc_threshold', 'use_treat', 'fdr_scope')
+                      'pval_threshold', 'fc_threshold', 'use_treat', 'fdr_scope', 'run_pathways',
+                      'pathway_min_size', 'pathway_rotations', 'pathway_evidence', 'run_gene_groups')
 # Statistics settings applied to stored results without running them again.
 THRESHOLD_KEYS = ('pval_threshold', 'fc_threshold', 'use_treat', 'fdr_scope', 'marker_threshold',
                   'marker_spillover_k')
@@ -124,13 +137,35 @@ RESTORE_TOOLTIP = 'Put these settings back to their default values.'
 # folder, group colours and patterns, and the thresholds, which are applied
 # again to saved results.
 STATS_INPUT_EXCLUDED = ('heatmap_order', 'heatmap_rows', 'n_loadings', 'export_root', 'group_colors',
-                        'group_patterns', 'counts') + THRESHOLD_KEYS
+                        'group_patterns', 'counts', 'gene_group_file', 'gene_group_areas', 'gene_group_colours',
+                        'gene_group_order', 'gene_group_comparisons') + THRESHOLD_KEYS
+RESTORING_TEXT = 'Reading the saved results.'
 STALE_TEXT = ('Out of date: these saved results were made with other counts or settings. Run statistics again '
               'to update them.')
+LOO_TOOLTIP = ('Run the statistics again without each mouse in turn (each sample when unpaired) and show, for every '
+               'significant result, in how many of these refits it stays significant and which mouse moves its '
+               'log2FC most. Takes about one statistics run per mouse.')
+LOO_COLUMNS = ('leave one out', 'LOO log2FC', 'LOO most influential')
+
+
+def _loo_display(loo: pd.DataFrame) -> pd.DataFrame:
+    """The leave-one-out columns of the results table as text
+    (``LOO_COLUMNS``): the flag with significant refits / refits, the
+    log2FC range over the refits and the most influential level with the
+    log2FC without it."""
+    out = pd.DataFrame(index=loo.index)
+    out[LOO_COLUMNS[0]] = [f'{flag} {int(sig)}/{int(n)}'.strip()
+                           for flag, sig, n in zip(loo['loo_flag'], loo['loo_significant'], loo['loo_refits'])]
+    out[LOO_COLUMNS[1]] = [f'{a:+.2f} to {b:+.2f}' if np.isfinite(a) else ''
+                           for a, b in zip(loo['loo_logFC_min'], loo['loo_logFC_max'])]
+    out[LOO_COLUMNS[2]] = [f'{name} ({v:+.2f})' if name else ''
+                           for name, v in zip(loo['loo_influential'], loo['loo_influential_logFC'])]
+    return out
 
 
 def _figure_set(key: str) -> str:
-    if key in SUMMARY_FIGURES or str(key).startswith('sample_pca '):
+    if (key in SUMMARY_FIGURES or str(key).startswith('sample_pca ')
+            or key in ('pathway_dot_plot', 'guide_allocation', 'gene_group_spider')):
         return 'summary'
     if key in MARKER_FIGURES:
         return 'markers'
@@ -138,11 +173,25 @@ def _figure_set(key: str) -> str:
 
 
 def _figure_rank(key) -> int:
-    """Tab order: the comparison's figures, its combination plot, the
-    figures over every comparison, then the marker tabs."""
+    """View order: the comparison's figures, its combination plot, the
+    figures over every comparison, the marker views, the pathway views, then
+    the gene-group views."""
     if key == 'combination':
         return 1
+    if key in PATHWAY_FIGURES:
+        return 4 + PATHWAY_FIGURES.index(key)
+    if key in GENE_GROUP_FIGURES:
+        return 4 + len(PATHWAY_FIGURES) + GENE_GROUP_FIGURES.index(key)
     return {'comparison': 0, 'summary': 2, 'markers': 3}[_figure_set(key)] if key else 0
+
+
+def _figure_section(key) -> str:
+    """The heading a view is listed under in the results drop-down."""
+    if key in PATHWAY_FIGURES:
+        return 'Pathways'
+    if key in GENE_GROUP_FIGURES:
+        return 'Gene groups'
+    return ('This comparison', 'This comparison', 'All comparisons', 'Markers')[_figure_rank(key)]
 
 HELP = (
     '<p>Tests whether FlowCode combinations (barcodes, i.e. guides) are distributed differently '
@@ -188,9 +237,15 @@ HELP = (
     'in every figure.</p>'
     '<p><b>Statistics.</b> <i>Counts</i>: a negative-binomial GLM per combination with the sample\'s '
     'library size as offset; each sample is weighted by its cell number, so small samples count for '
-    'less. The <i>quasi-likelihood F test</i> (default) shrinks the dispersions towards a common value and '
-    'holds its false-positive rate with few mice; the <i>Wald test</i> uses each combination\'s own '
-    'dispersion and finds too many hits in paired designs with few mice. <i>Frequencies</i>: a moderated '
+    'less. The <i>quasi-likelihood F test</i> (default) shrinks the dispersions towards a common value. On '
+    'random splits of inbred mice with plenty of events (BATF chimeras, where nothing differed) it found 3–7 % '
+    'false positives at p < 0.05 instead of 5 %; on gated populations of a human cohort it found 7–11 % for '
+    'populations under 100 events, because donors vary more than the model allows for. The <i>Wald test</i> '
+    'uses each combination\'s own dispersion and is not recommended: 21–31 % on the same mice and 10–13 % on '
+    'the human cohort. With few barcoded cells per sample '
+    '(about 100, e.g. brain) the quasi-likelihood test corrects for the low counts but stays slightly liberal '
+    '(about 6–7 % false positives at p < 0.05 instead of 5 %); a fold-change threshold with TREAT keeps the hits '
+    'reliable. <i>Frequencies</i>: a moderated '
     'linear model on log2 % of the library size (half an event added to every count). '
     '<i>Normalisation</i> sets the library size: <i>Robust</i> (default) rescales the barcoded events by a '
     'trimmed ratio of sums, so a few expanded clones do not push every other combination down; '
@@ -204,6 +259,18 @@ HELP = (
     'comparisons within each level of a covariate (e.g. COPD vs healthy within each tissue). FDR is '
     'Benjamini-Hochberg within each comparison by default, as in the lab\'s R scripts; with <i>TREAT</i> '
     'the p-value tests |log2FC| above the threshold rather than a non-zero change.</p>'
+    '<p><b>Check hits: leave one out</b> (after a run with significant results) asks whether a hit rests on '
+    'one mouse. The statistics are run again once without each mouse (each sample when there is no pairing), '
+    'with library sizes and expanded clones worked out again, and every significant result is judged again in '
+    'each refit at the current thresholds. The results table gains three columns: <i>leave one out</i> '
+    '(e.g. ⚠ 4/6: significant in 4 of 6 refits), the range of log2FC over the refits, and the <i>most '
+    'influential</i> mouse, the one whose removal moves the log2FC most, with the log2FC without it; that mouse '
+    'is drawn in red when the combination is plotted. ⚠ means the hit lost significance, or changed direction, '
+    'without some mouse. A hit that changes direction, or shrinks towards zero, without one mouse rests on that '
+    'mouse: check its samples. A borderline hit lost without any of several mice mostly reflects the loss of '
+    'power with one mouse fewer, not one animal driving it. Changing the thresholds judges the refits again '
+    'without running them; running statistics again clears the check. It takes about one statistics run per '
+    'mouse.</p>'
     '<p><b>Several populations.</b> <i>Compare: sample groups</i> runs the group comparisons within each '
     'population (labelled e.g. <i>Pancreas vs Spleen [CD8]</i>). <i>Population contrasts</i> also test, for '
     'each population against the <i>reference population</i>, whether a group\'s change against the reference '
@@ -227,6 +294,56 @@ HELP = (
     'population; untick it to set k yourself. Features whose uncertainty is mostly spillover (k × spillover '
     'above the moderated SE) are hatched in the heatmap. Combinations are families (cluster-first FDR). '
     'Expanded clones removed from the counts are also left out here.</p>'
+    '<p><b>Pathways.</b> Asks whether the knockouts of a biological process, taken together, change the '
+    'readout, so that small effects of several guides add up. Each GO Biological Process term (mouse, MGI '
+    'annotations, bundled with the plugin) is a pathway whose genes carry a sign: <i>+1</i> when the gene is part '
+    'of the process or drives it, <i>−1</i> when it holds the process back. Knocking out a +1 gene lowers the '
+    'process and knocking out a −1 gene raises it, so if the process matters the two kinds of guide move in '
+    'opposite directions, and the pathway adds them up instead of letting them cancel. Each guide\'s Counts '
+    'result (the QL test, which Pathways needs) is turned into a z-score with the same p-value, and the '
+    '<i>score</i> is the mean of −sign × z over the pathway\'s guides: for <i>Gut vs Spleen</i>, a positive score '
+    'means the process promotes accumulation in the gut (knockouts that lower it are depleted there, knockouts '
+    'that raise it are enriched). For example, an enhancer knockout at z = −2 and an inhibitor knockout at '
+    'z = +1.5 give a score of +1.75. Two tests per pathway: the <i>self-contained</i> test asks whether anything '
+    'is changing in the pathway\'s guides at all (a rotation test: many "nothing happening" versions of the data '
+    'are made by re-mixing each guide\'s mouse-to-mouse noise the same way for every guide, so guides that vary '
+    'together keep doing so); the <i>competitive</i> test (signed CAMERA) asks whether the pathway stands out '
+    'from the other guides of its library, allowing for correlation between its guides. A pathway whose guides '
+    'change strongly but in directions that contradict their signs can pass the self-contained test with a '
+    'score near 0 and low <i>agreement</i> (the share of guides moving the way the score says), so read the score, '
+    'the agreement and the competitive FDR together. Several libraries are tested one by one (their mice are '
+    'different) and combined; each library\'s result is listed. Guide names are matched to MGI symbols, then to '
+    'MGI synonyms (e.g. Gm5897 is Sult2b1); <b>Gene names…</b> lists the matches and lets you set a gene by '
+    'hand. Non-targeting guides are never in a pathway; together they form a check that should not score. '
+    '<i>Pathway dot plot</i>: pathways × comparisons, colour the score, size the competitive FDR, ringed when the '
+    'self-contained FDR passes. Double-click a dot, or a row of the <i>Pathway table</i>, to show that pathway\'s '
+    'guides in <i>Pathway members</i>; double-click a guide there to plot it in every sample.</p>'
+    '<p><b>Gene groups.</b> Asks whether a family of knockouts, taken together, changes the readout: for '
+    'example whether integrin knockouts as a whole are lost from the gut. In <b>Gene groups…</b>, tick one of the '
+    'built-in tables of the lab\'s libraries (Homing, Treg transcription factors OTB01, Metabolism) or load a CSV '
+    'of your own with a <i>gene</i> and a <i>group</i> column (optional <i>colour</i>, #rrggbb, and <i>area</i>, '
+    'which gives more than eight groups shades of one colour per area); the dialog shows the group of every '
+    'combination, and there you can change the order and colours of the groups. With no table loaded, ticking '
+    '<b>Gene groups</b> picks the built-in table that covers at least 80% of the guides, when there is one. The '
+    'table is kept with the experiment, so a newer built-in table in a later plugin version changes nothing until '
+    'you tick it again. Combinations are matched by their own name, then by MGI gene '
+    'symbol (a gene set by hand in <b>Gene names…</b> is used first); the others are unassigned and not tested. '
+    'Every guide counts the same way, so a group\'s <i>score</i> is the mean of −z over its guides: for <i>Gut vs '
+    'Spleen</i>, a positive score means the group\'s knockouts are depleted in the gut, so the family is needed '
+    'for the cells to be there. Three tests per group: the <i>competitive</i> test (CAMERA) asks whether the '
+    'family moves one way more than the rest of its library, and is the test of direction; the <i>any-change</i> '
+    'test asks whether anything happens in the family in either direction (opposite changes add up, so a family '
+    'whose members are needed in different tissues still shows up; one strongly changed guide is enough, and a '
+    'shift of the whole library, such as the other guides gaining share when many are lost, can pass it too); the '
+    '<i>self-contained</i> test of the score (as for pathways) is listed in the table. Groups need the same minimum '
+    'number of tested guides as pathways and use the same rotations; a group may hold more than half of a library. '
+    'Mice never carry two libraries, so when a family sits mostly in one library its result comes from that '
+    'library\'s mice. <i>Guide allocation</i>: the libraries\' guides per group, pooled (shown as soon as a table '
+    'is loaded). <i>Gene group spider</i>: one spoke per group, one line per comparison (the comparisons against '
+    'the reference group, at most six; <b>Spider comparisons…</b> chooses others), coloured as the comparison\'s '
+    'first group; outside the dashed ring the knockouts are depleted; a filled point passes the competitive FDR, a '
+    'ringed one the any-change FDR. Double-click a point, or a row of the <i>Gene group table</i>, to show that '
+    'group\'s guides in <i>Gene group members</i>.</p>'
     '<p><b>Gating</b> (first tab, view only): the experiment\'s Unmixed Data plots and gates over the '
     'FlowCode-unmixed events of the sample picked in the sample browser, gated exactly as the counts (sample '
     'overrides included), in three views: <i>Uncorrected</i> (the experiment\'s own unmix of the raw file), '
@@ -236,10 +353,12 @@ HELP = (
     'comparison (both are cached). Gates are edited in the main window.</p>'
     '<p><b>Results.</b> Each statistics run is saved when it finishes and shown again when the experiment is '
     'reopened, with the current thresholds. It is marked <i>Out of date</i> (and cannot be exported) when the counts '
-    'or other settings have changed since; run statistics again to update it. With the marker test, the <i>Markers</i> menu chooses the group whose combination × '
+    'or other settings have changed since; run statistics again to update it. <i>View</i> chooses the table or '
+    'figure shown, listed under the comparison, all comparisons, markers, pathways and gene groups; the arrows '
+    'step to the previous or next one. With the marker test, the <i>Markers</i> menu chooses the group whose combination × '
     'marker heatmap, volcano and table are shown (independent of the <i>Comparison</i> menu). Double-click a '
     'marker volcano point or a marker table row to plot that combination and marker in every sample '
-    '(<i>Marker</i> tab: each sample\'s reference and combination means joined by a line).</p>'
+    '(<i>Marker</i> view: each sample\'s reference and combination means joined by a line).</p>'
     '<p><b>Export</b> writes a folder named after the populations with the counts, frequencies (also as '
     'an R-style <tt>pct_matrix.csv</tt>), QC, samples, results, marker results, settings, a PNG per figure and '
     'one PDF report.</p>'
@@ -284,6 +403,13 @@ def _item(text, editable: bool = False, data=None) -> QTableWidgetItem:
     if data is not None:
         item.setData(Qt.UserRole, data)
     return item
+
+
+def _gene_group_state(table: pd.DataFrame, file_name: str) -> dict:
+    """The Gene groups dialog's state for a table read from *file_name*."""
+    return {'rows': [[g, grp] for g, grp in zip(table['gene'], table['group'])], 'file': file_name,
+            'areas': {g: a for g, a in fgg.group_areas(table).items() if a},
+            'colours': fgg.table_colours(table), 'order': fgg.group_order(table)}
 
 
 def _swatch_icon(colour: str) -> QIcon:
@@ -336,6 +462,9 @@ class AnalysisPage(QWidget):
         self._cov_start = 2
         self._stats_checked = False
         self._stats_stale = False
+        self._loo_inputs, self._loo_labels = None, {}
+        self._pathway_set = None
+        self._group_set = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -401,7 +530,11 @@ class AnalysisPage(QWidget):
         self._left_out = {}
         self._needing = None
         self._stats_checked = False
+        self._pathway_set = None
+        self._group_set = None
         self._set_stats_stale(False)
+        self._loo_inputs, self._loo_labels = None, {}
+        self.loo_status.setText('')
         self._clear_figure_tabs()
         self._show_auto_note(None)
 
@@ -2011,9 +2144,9 @@ class AnalysisPage(QWidget):
             self.cb_count_test.addItem(text, key)
         self.cb_count_test.setToolTip(
             'Quasi-likelihood F: negative-binomial dispersions shrunk towards a common value, then a '
-            'moderated quasi-dispersion per combination; holds its false-positive rate with few mice. '
-            'Wald: each combination\'s own dispersion and a z test; finds too many hits in paired designs '
-            'with few mice.')
+            'moderated quasi-dispersion per combination; 3–7 % false positives at p < 0.05 on inbred mice with '
+            'plenty of events, more on varied donors and small populations. Wald: each combination\'s own '
+            'dispersion and a z test; not recommended (21–31 % on the same mice).')
         self.cb_norm = QComboBox()
         for key, text in NORMALISATIONS.items():
             self.cb_norm.addItem(text, key)
@@ -2099,6 +2232,62 @@ class AnalysisPage(QWidget):
         self.lbl_marker_k = _label('')
         form.addRow(self.lbl_marker_k)
         form.addRow(self.lbl_markers)
+        self.chk_pathways = QCheckBox('Pathways (signed GO Biological Process sets, from the Counts test)')
+        self.chk_pathways.setToolTip(
+            'Tests whether the knockouts of a process, taken together and with their signs (+1 part of or driving '
+            'the process, -1 holding it back), change the counts. Needs the Counts test with the quasi-likelihood '
+            'F test.')
+        self.sb_pathway_size = _int_spin(fpw.MIN_SIZE_FLOOR, 50)
+        self.sb_pathway_size.setToolTip('A pathway or gene group needs at least this many tested guides, over all '
+                                        'libraries.')
+        self.sb_pathway_rotations = _int_spin(999, 99999)
+        self.sb_pathway_rotations.setSingleStep(1000)
+        self.sb_pathway_rotations.setToolTip(
+            'Number of "nothing happening" versions of the data per library. The smallest p-value is '
+            '1/(rotations + 1).')
+        self.cb_pathway_evidence = QComboBox()
+        for key, text in PATHWAY_EVIDENCE.items():
+            self.cb_pathway_evidence.addItem(text, key)
+        self.cb_pathway_evidence.setToolTip(
+            'Which GO annotations make a gene a member: all of them (electronic annotations, IEA, included), or '
+            'only those with experimental evidence.')
+        self.btn_pathway_names = QPushButton('Gene names…')
+        self.btn_pathway_names.setToolTip('The MGI gene matched to each combination name; set a gene by hand.')
+        self.btn_pathway_names.clicked.connect(self._on_pathway_names)
+        pathway_row = QHBoxLayout()
+        for text, w in (('min. members', self.sb_pathway_size), ('rotations', self.sb_pathway_rotations)):
+            pathway_row.addWidget(QLabel(text))
+            pathway_row.addWidget(w)
+        pathway_row.addWidget(self.btn_pathway_names)
+        pathway_row.addStretch()
+        self.pathway_widgets = [self.sb_pathway_size, self.sb_pathway_rotations, self.cb_pathway_evidence]
+        self.lbl_pathways = _label('')
+        form.addRow(self.chk_pathways)
+        form.addRow(pathway_row)
+        form.addRow('GO evidence:', self.cb_pathway_evidence)
+        form.addRow(self.lbl_pathways)
+        self.chk_gene_groups = QCheckBox('Gene groups (families of guides from a table, from the Counts test)')
+        self.chk_gene_groups.setToolTip(
+            'Tests whether the knockouts of each gene group (e.g. integrins, AP-1 factors), taken together, change '
+            'the counts. Uses the min. members and rotations above. Needs the Counts test with the quasi-likelihood '
+            'F test and a gene-group table.')
+        self.btn_gene_groups = QPushButton('Gene groups…')
+        self.btn_gene_groups.setToolTip('Load the gene-group table; see each combination\'s group; order and colour '
+                                        'the groups.')
+        self.btn_gene_groups.clicked.connect(self._on_gene_groups)
+        self.btn_spider_comparisons = QPushButton('Spider comparisons…')
+        self.btn_spider_comparisons.setToolTip(
+            f'The comparisons drawn on the gene group spider (at most {fgg.SPIDER_COMPARISONS}); by default those '
+            'against the reference group.')
+        self.btn_spider_comparisons.clicked.connect(self._on_spider_comparisons)
+        group_row = QHBoxLayout()
+        group_row.addWidget(self.btn_gene_groups)
+        group_row.addWidget(self.btn_spider_comparisons)
+        group_row.addStretch()
+        self.lbl_gene_groups = _label('')
+        form.addRow(self.chk_gene_groups)
+        form.addRow(group_row)
+        form.addRow(self.lbl_gene_groups)
         self.cb_compare = QComboBox()
         for key, text in COMPARE.items():
             self.cb_compare.addItem(text, key)
@@ -2145,7 +2334,7 @@ class AnalysisPage(QWidget):
         for w in (self.cb_mode, self.cb_reference, self.cb_pairing, self.cb_split, self.cb_fdr,
                   self.cb_count_test, self.cb_norm, self.sb_clone_count, self.sb_clone_pct,
                   self.sb_clone_levels, self.cb_compare, self.cb_ref_pop, self.cb_marker_ref,
-                  self.sb_marker_events, self.sb_marker_delta, self.sb_marker_spill):
+                  self.sb_marker_events, self.sb_marker_delta, self.sb_marker_spill, self.cb_pathway_evidence):
             _no_wheel(w)
         row.addWidget(left)
         right = QVBoxLayout()
@@ -2154,6 +2343,13 @@ class AnalysisPage(QWidget):
         right.addWidget(self.run_btn)
         self.stats_status = _label('')
         right.addWidget(self.stats_status)
+        self.loo_btn = QPushButton('Check hits: leave one out')
+        self.loo_btn.setToolTip(LOO_TOOLTIP)
+        self.loo_btn.setEnabled(False)
+        self.loo_btn.clicked.connect(self.start_leave_one_out)
+        right.addWidget(self.loo_btn)
+        self.loo_status = _label('')
+        right.addWidget(self.loo_status)
         right.addStretch()
         row.addLayout(right, stretch=1)
         lay.addLayout(row)
@@ -2202,6 +2398,14 @@ class AnalysisPage(QWidget):
             lambda v: self._on_stat_setting('marker_spillover_k', 'auto' if v else float(self.sb_marker_spill.value())))
         self.sb_marker_spill.valueChanged.connect(
             lambda v: self._on_stat_setting('marker_spillover_k', float(v)))
+        self.chk_pathways.toggled.connect(lambda v: self._on_stat_setting('run_pathways', bool(v), refit=True))
+        self.sb_pathway_size.valueChanged.connect(
+            lambda v: self._on_stat_setting('pathway_min_size', int(v), refit=True))
+        self.sb_pathway_rotations.valueChanged.connect(
+            lambda v: self._on_stat_setting('pathway_rotations', int(v), refit=True))
+        self.cb_pathway_evidence.currentIndexChanged.connect(
+            lambda _i: self._on_stat_setting('pathway_evidence', self.cb_pathway_evidence.currentData(), refit=True))
+        self.chk_gene_groups.toggled.connect(self._on_gene_groups_ticked)
         self.list_adjust.itemChanged.connect(self._on_adjust_changed)
         self.sb_p.valueChanged.connect(lambda v: self._on_stat_setting('pval_threshold', float(v)))
         self.sb_fc.valueChanged.connect(lambda v: self._on_stat_setting('fc_threshold', float(v)))
@@ -2259,6 +2463,11 @@ class AnalysisPage(QWidget):
             self.sb_clone_pct.setValue(float(s['clone_min_pct']))
             self.sb_clone_levels.setValue(int(s['clone_max_levels']))
             self._fill_markers()
+            self.chk_pathways.setChecked(bool(s['run_pathways']))
+            self.sb_pathway_size.setValue(int(s['pathway_min_size']))
+            self.sb_pathway_rotations.setValue(int(s['pathway_rotations']))
+            self.cb_pathway_evidence.setCurrentIndex(max(self.cb_pathway_evidence.findData(s['pathway_evidence']), 0))
+            self.chk_gene_groups.setChecked(bool(s['run_gene_groups']))
             self._update_count_controls()
             pops = self.counted_populations()
             several = len(pops) > 1
@@ -2332,11 +2541,13 @@ class AnalysisPage(QWidget):
         data = self._marker_data()
         channels = list(data['channels']) if data is not None else []
         chosen = s.get('marker_channels')
+        labels = self.plugin.channel_labels()
         filling, self._filling = self._filling, True
         try:
             self.list_markers.clear()
             for c in channels:
-                it = QListWidgetItem(c)
+                it = QListWidgetItem(labels.get(c, c))
+                it.setData(Qt.UserRole, c)
                 it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
                 it.setCheckState(Qt.Checked if chosen is None or c in chosen else Qt.Unchecked)
                 self.list_markers.addItem(it)
@@ -2368,7 +2579,7 @@ class AnalysisPage(QWidget):
     def _on_markers_changed(self, _item):
         if self._filling:
             return
-        ticked = [self.list_markers.item(i).text() for i in range(self.list_markers.count())
+        ticked = [self.list_markers.item(i).data(Qt.UserRole) for i in range(self.list_markers.count())
                   if self.list_markers.item(i).checkState() == Qt.Checked]
         self.settings['marker_channels'] = (None if len(ticked) == self.list_markers.count() else ticked)
         self._changed()
@@ -2404,6 +2615,401 @@ class AnalysisPage(QWidget):
         spill = bool(s['run_markers']) and bool(s['marker_spillover'])
         self.chk_marker_k_auto.setEnabled(spill)
         self.sb_marker_spill.setEnabled(spill and s['marker_spillover_k'] != 'auto')
+        blocked = self.pathways_blocked()
+        either = bool(s['run_pathways'] or s['run_gene_groups']) and blocked is None
+        self.sb_pathway_size.setEnabled(either)
+        self.sb_pathway_rotations.setEnabled(either)
+        self.cb_pathway_evidence.setEnabled(bool(s['run_pathways']) and blocked is None)
+        self.lbl_pathways.setText(f'Pathways need {blocked}.' if s['run_pathways'] and blocked else '')
+        self.lbl_gene_groups.setText(self.gene_group_status())
+
+    def pathways_blocked(self) -> str | None:
+        """What the pathway analysis is missing (the Counts test with the
+        quasi-likelihood F test), or None."""
+        if not self.run_counts():
+            return 'the Counts test (whole events, Counts ticked)'
+        if self.settings['counts_method'] != 'ql':
+            return 'the quasi-likelihood F test (Counts test)'
+        return None
+
+    def pathway_matches(self, overrides: dict | None = None) -> pd.DataFrame:
+        """The MGI gene of each analysed combination (``flowcode_pathways.match_features``)."""
+        symbols, synonyms, _meta = fpw.bundled_names()
+        combos = list(self.filtered.counts.columns) if self.filtered is not None else []
+        names = self.settings.get('pathway_names') if overrides is None else overrides
+        return fpw.match_features(combos, symbols, synonyms, names)
+
+    def _on_pathway_names(self):
+        """A table of the combinations, the gene each is matched to and how,
+        with a column to set the gene by hand."""
+        try:
+            matches = self.pathway_matches(overrides={})
+        except Exception as exc:
+            QMessageBox.warning(self, 'Gene names', f'The bundled MGI gene names could not be read: {exc}')
+            return
+        overrides = dict(self.settings.get('pathway_names') or {})
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Pathway gene names')
+        lay = QVBoxLayout(dialog)
+        lay.addWidget(_label('Each combination is matched to an MGI symbol (ignoring case), then to an MGI synonym '
+                             'that belongs to one gene only. Type a gene symbol in the last column to set it by hand '
+                             '(leave it empty to use the match). Non-targeting combinations are never in a pathway.'))
+        table = QTableWidget(len(matches), 4)
+        table.setHorizontalHeaderLabels(['Combination', 'Matched gene', 'How', 'Set by hand'])
+        for r, (_i, row) in enumerate(matches.iterrows()):
+            table.setItem(r, 0, _item(row['feature']))
+            table.setItem(r, 1, _item(row['gene']))
+            table.setItem(r, 2, _item(row['match']))
+            table.setItem(r, 3, _item(overrides.get(str(row['feature']), ''), editable=True))
+        table.resizeColumnsToContents()
+        table.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(table)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        lay.addWidget(buttons)
+        dialog.resize(620, 520)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        chosen = {table.item(r, 0).text(): table.item(r, 3).text().strip() for r in range(table.rowCount())}
+        chosen = {k: v for k, v in chosen.items() if v}
+        if chosen != overrides:
+            self.settings['pathway_names'] = chosen
+            self._changed()
+            self._invalidate_stats()
+
+    # -- gene groups ----------------------------------------------------------
+
+    def gene_groups_blocked(self) -> str | None:
+        """What the gene-group analysis is missing, or None."""
+        if not self.settings.get('gene_group_table'):
+            return 'a gene-group table (Gene groups…)'
+        return self.pathways_blocked()
+
+    def gene_group_frame(self) -> pd.DataFrame | None:
+        """The loaded gene-group table (gene, group, colour, area), or None."""
+        s = self.settings
+        rows = s.get('gene_group_table') or []
+        if not rows:
+            return None
+        areas = s.get('gene_group_areas') or {}
+        return pd.DataFrame([(str(g), str(grp), '', str(areas.get(grp, ''))) for g, grp in rows],
+                            columns=list(fgg.GROUP_COLUMNS))
+
+    def gene_group_order(self) -> list:
+        """The groups in the order chosen in the Gene groups dialog, then any
+        others in table order."""
+        table = self.gene_group_frame()
+        if table is None:
+            return []
+        groups = fgg.group_order(table)
+        chosen = [g for g in self.settings.get('gene_group_order') or [] if g in groups]
+        return chosen + [g for g in groups if g not in chosen]
+
+    def gene_group_colours(self) -> dict:
+        """{group: colour}: set by hand or in the table, else ``fgg.group_colours``."""
+        return fgg.group_colours(self.gene_group_order(), self.settings.get('gene_group_areas') or {},
+                                 self.settings.get('gene_group_colours') or {})
+
+    def library_guides(self) -> dict:
+        """{library label: its combination names} with several libraries,
+        else {'': the design's combinations}."""
+        if self.multi_library():
+            return {library_label(lib): [str(c[0]) for c in lib.get('combos') or []]
+                    for lib in self.plugin.state.libraries}
+        design = self._current_design()
+        if design is not None:
+            return {'': [str(n) for n in design.combo_names]}
+        return {'': [str(c) for c in self.filtered.counts.columns] if self.filtered is not None else []}
+
+    def gene_group_allocation(self) -> pd.DataFrame | None:
+        """Guides per group from the library setup (``fgg.allocation``), or None."""
+        table = self.gene_group_frame()
+        if table is None:
+            return None
+        symbols, synonyms, _meta = fpw.bundled_names()
+        return fgg.allocation(self.library_guides(), table, symbols, synonyms,
+                              self.settings.get('pathway_names') or {}, self.gene_group_order())
+
+    def gene_group_status(self) -> str:
+        """The line under the gene-group controls."""
+        s = self.settings
+        rows = s.get('gene_group_table') or []
+        text = (f"Table: {self.gene_group_source()} ({len(rows)} genes, "
+                f"{len(dict.fromkeys(r[1] for r in rows))} groups)." if rows else 'No gene-group table loaded.')
+        if s['run_gene_groups']:
+            blocked = self.gene_groups_blocked()
+            if blocked:
+                text += f' Gene groups need {blocked}.'
+        return text
+
+    def gene_group_source(self, file_name: str | None = None, rows: list | None = None) -> str:
+        """The table's file name, with the built-in table's name when it is
+        one (and a note when the installed built-in table has changed since
+        it was picked)."""
+        s = self.settings
+        file_name = s.get('gene_group_file') if file_name is None else file_name
+        rows = s.get('gene_group_table') if rows is None else rows
+        names = dict((f, n) for n, f in fgg.builtin_tables())
+        table = (pd.DataFrame([(g, grp, '', '') for g, grp in rows], columns=list(fgg.GROUP_COLUMNS))
+                 if rows else None)
+        try:
+            kind = fgg.builtin_of(file_name or '', table)
+        except (fgg.GroupTableError, OSError, UnicodeDecodeError):
+            kind = None
+        if kind == 'same':
+            return f'{names[file_name]} (built in)'
+        if kind == 'older':
+            return f'{names[file_name]} (built in, an earlier version)'
+        return file_name or 'loaded'
+
+    def best_builtin_table(self) -> tuple | None:
+        """``fgg.best_builtin`` over the experiment's guides, or None."""
+        names = list(dict.fromkeys(n for guides in self.library_guides().values() for n in guides))
+        if not names:
+            return None
+        try:
+            symbols, synonyms, _meta = fpw.bundled_names()
+            return fgg.best_builtin(names, symbols, synonyms, self.settings.get('pathway_names') or {})
+        except (fgg.GroupTableError, OSError, UnicodeDecodeError):
+            return None
+
+    def _on_gene_groups_ticked(self, value: bool):
+        """Gene groups ticked with no table loaded: pick the built-in table
+        that covers the experiment's guides (``fgg.best_builtin``)."""
+        if value and not self._filling and not self.settings.get('gene_group_table'):
+            best = self.best_builtin_table()
+            if best is not None:
+                self.apply_gene_groups(_gene_group_state(fgg.builtin_table(best[1]), best[1]))
+        self._on_stat_setting('run_gene_groups', bool(value), refit=True)
+
+    def _on_gene_groups(self):
+        """Pick a built-in gene-group table or load one, see each
+        combination's group and how it was matched, and order and colour the
+        groups."""
+        s = self.settings
+        state = {'rows': [list(r) for r in s.get('gene_group_table') or []],
+                 'file': s.get('gene_group_file') or '',
+                 'areas': dict(s.get('gene_group_areas') or {}),
+                 'colours': dict(s.get('gene_group_colours') or {}),
+                 'order': self.gene_group_order()}
+        if not state['rows']:
+            best = self.best_builtin_table()
+            if best is not None:
+                state.update(_gene_group_state(fgg.builtin_table(best[1]), best[1]))
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Gene groups')
+        lay = QVBoxLayout(dialog)
+        lay.addWidget(_label('Tick a built-in table, or load a CSV with a gene and a group column (optional colour, '
+                             '#rrggbb, and area). Each combination is matched by its own name, then by MGI gene '
+                             'symbol; a gene set by hand in Gene names… is used first. Double-click a colour to '
+                             'change it; Up and Down set the order of the spokes and slices.'))
+        builtin_row = QHBoxLayout()
+        builtin_row.addWidget(QLabel('Built-in tables:'))
+        builtin_group = QButtonGroup(dialog)
+        for name, file_name in fgg.builtin_tables():
+            radio = QRadioButton(name)
+            radio.setProperty('table_file', file_name)
+            radio.setToolTip(f'The lab\'s {name} gene groups ({file_name}, installed with the plugin).')
+            builtin_group.addButton(radio)
+            builtin_row.addWidget(radio)
+        builtin_row.addStretch()
+        lay.addLayout(builtin_row)
+        top = QHBoxLayout()
+        load_btn = QPushButton('Load CSV…')
+        clear_btn = QPushButton('Remove table')
+        file_lbl = _label('')
+        top.addWidget(load_btn)
+        top.addWidget(clear_btn)
+        top.addWidget(file_lbl, stretch=1)
+        lay.addLayout(top)
+        groups_table = QTableWidget(0, 4)
+        groups_table.setHorizontalHeaderLabels(['Group', 'Guides', 'Colour', 'Area'])
+        groups_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        groups_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        move = QHBoxLayout()
+        up_btn, down_btn = QPushButton('Up'), QPushButton('Down')
+        move.addWidget(up_btn)
+        move.addWidget(down_btn)
+        move.addStretch()
+        combos_table = QTableWidget(0, 4)
+        combos_table.setHorizontalHeaderLabels(['Combination', 'Gene', 'Group', 'How'])
+        lay.addWidget(groups_table, stretch=1)
+        lay.addLayout(move)
+        lay.addWidget(combos_table, stretch=2)
+
+        def frame():
+            if not state['rows']:
+                return None
+            return pd.DataFrame([(g, grp, '', state['areas'].get(grp, '')) for g, grp in state['rows']],
+                                columns=list(fgg.GROUP_COLUMNS))
+
+        def fill():
+            table = frame()
+            source = self.gene_group_source(state['file'], state['rows'])
+            file_lbl.setText(f"{source}: {len(state['rows'])} genes, {len(state['order'])} groups"
+                             if table is not None else 'No table loaded.')
+            builtin_group.setExclusive(False)
+            for radio in builtin_group.buttons():
+                radio.setChecked(table is not None and radio.property('table_file') == state['file']
+                                 and source.endswith('(built in)'))
+            builtin_group.setExclusive(True)
+            colours = fgg.group_colours(state['order'], state['areas'], state['colours'])
+            counts = {}
+            assignment = pd.DataFrame(columns=['feature', 'gene', 'group', 'match'])
+            if table is not None:
+                try:
+                    symbols, synonyms, _meta = fpw.bundled_names()
+                    alloc = fgg.allocation(self.library_guides(), table, symbols, synonyms,
+                                           s.get('pathway_names') or {}, state['order'])
+                    counts = dict(zip(alloc['group'], alloc['guides']))
+                    names = list(dict.fromkeys(n for guides in self.library_guides().values() for n in guides))
+                    assignment = fgg.assign_groups(names, table, symbols, synonyms, s.get('pathway_names') or {})
+                except Exception as exc:
+                    file_lbl.setText(f'The bundled MGI gene names could not be read: {exc}')
+            groups_table.setRowCount(len(state['order']))
+            for r, g in enumerate(state['order']):
+                groups_table.setItem(r, 0, _item(g))
+                groups_table.setItem(r, 1, _item(str(int(counts.get(g, 0)))))
+                swatch = _item(colours.get(g, ''))
+                swatch.setBackground(QColor(colours.get(g, '#ffffff')))
+                groups_table.setItem(r, 2, swatch)
+                groups_table.setItem(r, 3, _item(state['areas'].get(g, '')))
+            groups_table.resizeColumnsToContents()
+            combos_table.setRowCount(len(assignment))
+            for r, (_i, row) in enumerate(assignment.iterrows()):
+                for j, c in enumerate(('feature', 'gene', 'group', 'match')):
+                    combos_table.setItem(r, j, _item(row[c]))
+            combos_table.resizeColumnsToContents()
+
+        def load():
+            path, _f = QFileDialog.getOpenFileName(dialog, 'Gene-group table', str(self.analysis_root()),
+                                                   'CSV files (*.csv);;All files (*)')
+            if not path:
+                return
+            try:
+                table = fgg.read_group_table(path)
+            except (fgg.GroupTableError, OSError, UnicodeDecodeError) as exc:
+                QMessageBox.warning(dialog, 'Gene groups', str(exc))
+                return
+            state.update(_gene_group_state(table, Path(path).name))
+            fill()
+
+        def pick_builtin(radio):
+            file_name = str(radio.property('table_file'))
+            try:
+                table = fgg.builtin_table(file_name)
+            except (fgg.GroupTableError, OSError, UnicodeDecodeError) as exc:
+                QMessageBox.warning(dialog, 'Gene groups', str(exc))
+                fill()
+                return
+            state.update(_gene_group_state(table, file_name))
+            fill()
+
+        def clear():
+            state.update(rows=[], file='', areas={}, colours={}, order=[])
+            fill()
+
+        def shift(step):
+            r = groups_table.currentRow()
+            if r < 0 or not 0 <= r + step < len(state['order']):
+                return
+            order = state['order']
+            order[r], order[r + step] = order[r + step], order[r]
+            fill()
+            groups_table.selectRow(r + step)
+
+        def pick_colour(row, col):
+            if col != 2 or not 0 <= row < len(state['order']):
+                return
+            group = state['order'][row]
+            current = fgg.group_colours(state['order'], state['areas'], state['colours']).get(group, '#999999')
+            colour = QColorDialog.getColor(QColor(current), dialog, f'Colour of {group}')
+            if colour.isValid():
+                state['colours'][group] = colour.name()
+                fill()
+
+        load_btn.clicked.connect(load)
+        builtin_group.buttonClicked.connect(pick_builtin)
+        clear_btn.clicked.connect(clear)
+        up_btn.clicked.connect(lambda: shift(-1))
+        down_btn.clicked.connect(lambda: shift(1))
+        groups_table.cellDoubleClicked.connect(pick_colour)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        lay.addWidget(buttons)
+        fill()
+        dialog.resize(720, 640)
+        self._gene_group_dialog = dialog
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self.apply_gene_groups(state)
+
+    def apply_gene_groups(self, state: dict):
+        """Keep the gene groups chosen in the dialog: a new table (genes or
+        groups) invalidates the statistics; order and colours only redraw."""
+        s = self.settings
+        rows_changed = [list(r) for r in state['rows']] != [list(r) for r in s.get('gene_group_table') or []]
+        s['gene_group_table'] = [list(r) for r in state['rows']]
+        s['gene_group_file'] = state['file']
+        s['gene_group_areas'] = dict(state['areas'])
+        s['gene_group_colours'] = {g: c for g, c in state['colours'].items() if g in state['order']}
+        s['gene_group_order'] = list(state['order'])
+        self._changed()
+        self._update_count_controls()
+        if rows_changed and self.stats is not None and s['run_gene_groups']:
+            self._invalidate_stats()
+        else:
+            self._show_results()
+
+    def _on_spider_comparisons(self):
+        """Choose the comparisons drawn on the gene group spider."""
+        result = (self.stats or {}).get('gene_groups')
+        if not result:
+            QMessageBox.information(self, 'Spider comparisons', 'Run statistics with Gene groups ticked first.')
+            return
+        comparisons = list(self.stats['comparisons'])
+        shown = set(self.spider_comparisons())
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Spider comparisons')
+        lay = QVBoxLayout(dialog)
+        lay.addWidget(_label(f'Tick the comparisons to draw (at most {fgg.SPIDER_COMPARISONS}; the first ones ticked '
+                             'are drawn). Untick all to go back to those against the reference group.'))
+        listing = QListWidget()
+        for c in comparisons:
+            item = QListWidgetItem(c)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if c in shown else Qt.Unchecked)
+            listing.addItem(item)
+        lay.addWidget(listing)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        lay.addWidget(buttons)
+        self._spider_dialog = dialog
+        if dialog.exec() != QDialog.Accepted:
+            return
+        chosen = [listing.item(i).text() for i in range(listing.count())
+                  if listing.item(i).checkState() == Qt.Checked]
+        self.set_spider_comparisons(chosen)
+
+    def set_spider_comparisons(self, chosen: list):
+        """Keep *chosen* as the spider's comparisons (empty: the default) and
+        redraw the figures over every comparison."""
+        self.settings['gene_group_comparisons'] = list(chosen)
+        self._changed()
+        if self.stats is not None:
+            self._shown_figure = self.figure_tabs.tabText(self.figure_tabs.currentIndex())
+            self._clear_figure_tabs(tuple(k for k in self.figures if _figure_set(k) != 'summary'))
+            self.start_figures(summary=True, comparison=False, markers=False)
+
+    def spider_comparisons(self) -> list:
+        """The comparisons drawn on the spider (``fgg.spider_comparisons``)."""
+        if self.stats is None:
+            return []
+        return fgg.spider_comparisons(list(self.stats['comparisons']), self.settings.get('gene_group_comparisons'),
+                                      self.stats.get('pairs'), self.settings.get('reference'))
 
     def _on_controls_changed(self, _item):
         if self._filling:
@@ -2431,7 +3037,8 @@ class AnalysisPage(QWidget):
         self._changed()
         if key in ('contrast_mode', 'population_contrasts'):
             self._update_design_controls()
-        if key in ('normalisation', 'remove_clones', 'run_markers', 'marker_spillover', 'marker_spillover_k'):
+        if key in ('normalisation', 'remove_clones', 'run_markers', 'marker_spillover', 'marker_spillover_k',
+                   'run_counts', 'counts_method', 'run_pathways', 'run_gene_groups'):
             self._update_count_controls()
         if key in ('pairing', 'split_by', 'population_pairing', 'population_split', 'compare'):
             s = self.settings
@@ -2444,18 +3051,34 @@ class AnalysisPage(QWidget):
             self._reapply_thresholds()
         self._update_run_button()
 
+    def _threshold_settings(self) -> dict:
+        """The settings ``_thresholded`` applies."""
+        return {k: self.settings.get(k) for k in THRESHOLD_KEYS + ('marker_spillover',)}
+
+    @staticmethod
+    def _thresholded(stats: dict, s: dict) -> dict:
+        """*stats* with the thresholds in *s* applied (no refit)."""
+        stats = fst.reapply_thresholds(stats, s['pval_threshold'], s['fc_threshold'], s['fdr_scope'], s['use_treat'])
+        if stats.get('markers') is not None:
+            stats['markers'] = fst.reapply_marker_thresholds(
+                stats['markers'], s['pval_threshold'], s['marker_threshold'], s['fdr_scope'],
+                s['use_treat'], s['marker_spillover_k'] if s['marker_spillover'] else None)
+        return stats
+
     def _reapply_thresholds(self):
         """Apply the current thresholds to the stored results and redraw."""
         if self.stats is None:
             return
-        s = self.settings
-        self.stats = fst.reapply_thresholds(self.stats, s['pval_threshold'], s['fc_threshold'],
-                                            s['fdr_scope'], s['use_treat'])
+        self.stats = self._thresholded(self.stats, self._threshold_settings())
+        self._after_thresholds()
+
+    def _after_thresholds(self):
+        """Show thresholded results: the marker k, the leave-one-out line and the figures."""
         if self.stats.get('markers') is not None:
-            self.stats['markers'] = fst.reapply_marker_thresholds(
-                self.stats['markers'], s['pval_threshold'], s['marker_threshold'], s['fdr_scope'],
-                s['use_treat'], s['marker_spillover_k'] if s['marker_spillover'] else None)
             self._show_marker_k()
+        if not self.plugin.task_running('analysis_loo'):
+            self.loo_status.setText(self.leave_one_out_text())
+        self._update_loo_button()
         self._show_results()
 
     def marker_k_text(self) -> str:
@@ -2498,6 +3121,16 @@ class AnalysisPage(QWidget):
         self.run_btn.setEnabled(problem is None and not self.plugin.task_running('analysis_stats'))
         if problem and self.stats is None:
             self.stats_status.setText(problem)
+        self._update_loo_button()
+
+    def _update_loo_button(self):
+        """The leave-one-out check is offered for current (not out of date)
+        results with at least one significant counts or frequency result."""
+        stats = self.stats or {}
+        hits = any(stats.get(k) is not None and bool(stats[k]['significant'].astype(bool).any())
+                   for k in ('counts', 'freq'))
+        busy = self.plugin.task_running('analysis_stats') or self.plugin.task_running('analysis_loo')
+        self.loo_btn.setEnabled(hits and not self._stats_stale and self.filtered is not None and not busy)
 
     def _invalidate_stats(self):
         if self.stats is not None:
@@ -2505,6 +3138,7 @@ class AnalysisPage(QWidget):
             self.figures = {}
             self._set_stats_stale(False)
             self.stats_status.setText('Settings changed: run statistics again.')
+            self.loo_status.setText('')
             self._show_results()
         self._show_marker_k()
         self._update_run_button()
@@ -2535,23 +3169,49 @@ class AnalysisPage(QWidget):
         if self.stats is not None or self.filtered is None:
             return
         path = fst.stats_path(self._controller().experiment_dir)
-        try:
+        settings = self._threshold_settings()
+        thresholded = self._thresholded
+
+        def work(_progress):
             saved = fst.load_stats(path)
-        except Exception:
-            logger.exception('FlowCode analysis: could not read the saved statistics in %s', path)
+            if saved is None:
+                return None
+            stats, inputs, when = saved
+            return {'stats': thresholded(stats, settings), 'inputs': inputs, 'when': when, 'settings': settings}
+
+        if self.plugin._start_task('analysis_restore', work):
+            self.stats_status.setText(RESTORING_TEXT)
+        else:
+            self._stats_checked = False
+
+    def on_restore_finished(self, result):
+        """The saved run, read and thresholded on a worker, is shown unless
+        statistics were run meanwhile; it is marked out of date when the
+        counts or settings it was run with have changed since."""
+        if self.stats_status.text() == RESTORING_TEXT:
+            self.stats_status.setText('')
+        if result is None or self.stats is not None or self.filtered is None:
             return
-        if saved is None:
-            return
-        stats, inputs, when = saved
+        stats = result['stats']
         self.stats = stats
-        self._set_stats_stale(inputs != self._stats_inputs())
+        self._set_stats_stale(result['inputs'] != self._stats_inputs())
         n_comparisons = len(stats.get('comparisons') or [])
-        text = f'Saved results ({when}): {n_comparisons} comparison(s), {len(stats.get("samples") or [])} sample(s).'
+        text = (f"Saved results ({result['when']}): {n_comparisons} comparison(s), "
+                f"{len(stats.get('samples') or [])} sample(s).")
         if self._stats_stale:
             text += f'<br><span style="{_WARN_STYLE}">{STALE_TEXT}</span>'
         self.stats_status.setText(text)
         self._show_marker_k()
-        self._reapply_thresholds()
+        if result['settings'] != self._threshold_settings():
+            self._reapply_thresholds()
+        else:
+            self._after_thresholds()
+
+    def on_restore_error(self, message):
+        logger.warning('FlowCode analysis: could not read the saved statistics: %s', message)
+        if self.stats_status.text() == RESTORING_TEXT:
+            self.stats_status.setText('')
+        self._update_loo_button()
 
     def _covariate_frame(self, names: list) -> pd.DataFrame | None:
         covs = self.settings.get('covariates') or {}
@@ -2586,9 +3246,15 @@ class AnalysisPage(QWidget):
             out = {u: f'{self.library_of(self.unit_sample(u))}·{v}' if v else '' for u, v in out.items()}
         return out
 
-    def start_stats(self):
-        if self.filtered is None:
-            return
+    def _stats_call(self) -> dict:
+        """
+        The arguments of a statistics run from the current settings:
+        {'counts', 'denominator', 'groups', 'kwargs'} for
+        ``fst.run_statistics``, with the 'pairing', 'split', 'split_key',
+        'sample_groups', 'population', 'several' and 'unit_library' they
+        were built from. Raises RuntimeError when adjustment covariate values
+        are missing.
+        """
         s = self.settings
         units = list(self.filtered.counts.index)
         several = self.several_populations()
@@ -2613,26 +3279,19 @@ class AnalysisPage(QWidget):
                           population_contrasts=(s.get('reference_population') or None)
                           if several and s['population_contrasts'] else None)
         grouped = [u for u in units if groups.get(u)]
-        try:
-            covariates = self._covariate_frame(adjust)
-            if covariates is not None:
-                missing = ds.missing_covariate_values(covariates, grouped, list(covariates.columns))
-                if missing:
-                    labels = self.unit_labels()
-                    raise RuntimeError('Covariate values are missing: '
-                                       + '; '.join(f"{c}: {', '.join(labels.get(k, k) for k in ks[:5])}"
-                                                   for c, ks in missing.items()))
-        except RuntimeError as exc:
-            self.stats_status.setText(str(exc))
-            return
-        counts, denom = self.filtered.counts, self.filtered.denominator
-        run_counts = self.run_counts()
-        markers_only = bool(s['run_markers']) and not (run_counts or s['run_freq'])
+        covariates = self._covariate_frame(adjust)
+        if covariates is not None:
+            missing = ds.missing_covariate_values(covariates, grouped, list(covariates.columns))
+            if missing:
+                labels = self.unit_labels()
+                raise RuntimeError('Covariate values are missing: '
+                                   + '; '.join(f"{c}: {', '.join(labels.get(k, k) for k in ks[:5])}"
+                                               for c, ks in missing.items()))
         kwargs = dict(group_order=order, contrast_mode=s['contrast_mode'],
                       reference=reference, pairing=pairing, covariates=covariates, split_by=split,
                       pval_threshold=float(s['pval_threshold']), fc_threshold=float(s['fc_threshold']),
                       use_treat=bool(s['use_treat']), fdr_scope=s['fdr_scope'],
-                      run_counts=run_counts, run_freq=bool(s['run_freq']),
+                      run_counts=self.run_counts(), run_freq=bool(s['run_freq']),
                       counts_method=s['counts_method'], normalisation=s['normalisation'],
                       control_combos=list(s.get('control_combos') or []),
                       clone_filter=({'min_count': int(s['clone_min_count']),
@@ -2640,6 +3299,25 @@ class AnalysisPage(QWidget):
                                      'max_levels': int(s['clone_max_levels'])}
                                     if s['remove_clones'] else None),
                       allow_no_comparisons=bool(s['run_markers']), **design, **design_libraries)
+        return dict(counts=self.filtered.counts, denominator=self.filtered.denominator, groups=groups,
+                    kwargs=kwargs, pairing=pairing, split=split, split_key=split_key,
+                    sample_groups=sample_groups, population=population, several=several,
+                    unit_library=unit_library)
+
+    def start_stats(self):
+        if self.filtered is None:
+            return
+        s = self.settings
+        try:
+            call = self._stats_call()
+        except RuntimeError as exc:
+            self.stats_status.setText(str(exc))
+            return
+        counts, denom, groups, kwargs = call['counts'], call['denominator'], call['groups'], call['kwargs']
+        split, split_key, sample_groups = call['split'], call['split_key'], call['sample_groups']
+        population, several, unit_library = call['population'], call['several'], call['unit_library']
+        run_counts = kwargs['run_counts']
+        markers_only = bool(s['run_markers']) and not (run_counts or s['run_freq'])
         marker_job = None
         if s['run_markers']:
             marker_split = split if split_key not in ('', None, fa.SPLIT_BY_GROUP) else None
@@ -2655,15 +3333,41 @@ class AnalysisPage(QWidget):
                               strata=population if several else None, split_by=marker_split,
                               threshold=float(s['marker_threshold']), clones=bool(s['remove_clones']),
                               unit_library=unit_library, feature_map=self.feature_map())
+        pathway_job, pathway_note = None, None
+        if s['run_pathways']:
+            blocked = self.pathways_blocked()
+            if blocked is None and not markers_only:
+                pathway_job = dict(evidence=s['pathway_evidence'], overrides=dict(s.get('pathway_names') or {}),
+                                   rotations=int(s['pathway_rotations']), min_size=int(s['pathway_min_size']))
+            else:
+                pathway_note = f"Pathways: not run; they need {blocked or 'the Counts test'}."
+        group_job, group_note = None, None
+        if s['run_gene_groups']:
+            blocked = self.gene_groups_blocked()
+            if blocked is None and not markers_only:
+                group_job = dict(table=self.gene_group_frame(), overrides=dict(s.get('pathway_names') or {}),
+                                 rotations=int(s['pathway_rotations']), min_size=int(s['pathway_min_size']),
+                                 library_guides=self.library_guides())
+            else:
+                group_note = f"Gene groups: not run; they need {blocked or 'the Counts test'}."
 
         inputs, path = self._stats_inputs(), fst.stats_path(self._controller().experiment_dir)
 
         def work(_progress):
             if markers_only:
                 kwargs.update(run_counts=False, run_freq=False)
-            stats = fst.run_statistics(counts, denom, groups, **kwargs)
+            fit_log = [] if pathway_job is not None or group_job is not None else None
+            stats = fst.run_statistics(counts, denom, groups, fit_log=fit_log, **kwargs)
             if marker_job is not None:
                 stats['markers'] = self._run_markers(stats, counts, marker_job, kwargs)
+            if pathway_job is not None:
+                stats['pathways'] = self._run_pathways(stats, fit_log, pathway_job)
+            elif pathway_note:
+                stats['notes'].append(pathway_note)
+            if group_job is not None:
+                stats['gene_groups'] = self._run_gene_groups(stats, fit_log, group_job)
+            elif group_note:
+                stats['notes'].append(group_note)
             try:
                 fst.save_stats(path, stats, inputs)
             except Exception as exc:
@@ -2673,6 +3377,7 @@ class AnalysisPage(QWidget):
 
         if self.plugin._start_task('analysis_stats', work):
             self.run_btn.setEnabled(False)
+            self.loo_btn.setEnabled(False)
             self.stats_status.setText('Running statistics…')
 
     def _marker_tag_inputs(self, spillover: bool) -> tuple:
@@ -2759,6 +3464,52 @@ class AnalysisPage(QWidget):
         stats['notes'].extend(f'Markers: {n}' if not n.startswith('Markers') else n for n in markers['notes'])
         return markers
 
+    @staticmethod
+    def _run_pathways(stats: dict, fit_log: list, job: dict) -> dict | None:
+        """The pathway analysis of a statistics run (worker thread), from the
+        fits the run recorded; notes go into *stats*."""
+        try:
+            result = fpw.run_from_bundle(stats, fit_log, **job)
+        except (fpw.PathwayError, OSError, ValueError) as exc:
+            stats['notes'].append(f'Pathways: {exc}')
+            return None
+        stats['notes'].extend(f'Pathways: {n}' for n in result['notes'])
+        return result
+
+    def pathway_summary(self) -> str:
+        """e.g. 'Pathways: 412 tested in 2 comparison(s); 5 with competitive FDR <= 0.05, 9 self-contained.'"""
+        result = (self.stats or {}).get('pathways')
+        if not result:
+            return ''
+        table = result['pathways']
+        t = float(self.settings['pval_threshold'])
+        return (f" Pathways: {table['set_key'].nunique()} tested in {table['comparison'].nunique()} comparison(s); "
+                f"{int((table['competitive_FDR'] <= t).sum())} with competitive FDR <= {t:g}, "
+                f"{int((table['FDR'] <= t).sum())} self-contained.")
+
+    @staticmethod
+    def _run_gene_groups(stats: dict, fit_log: list, job: dict) -> dict | None:
+        """The gene-group analysis of a statistics run (worker thread), from
+        the fits the run recorded; notes go into *stats*."""
+        try:
+            result = fgg.run_gene_groups(stats, fit_log, **job)
+        except (fpw.PathwayError, OSError, ValueError) as exc:
+            stats['notes'].append(f'Gene groups: {exc}')
+            return None
+        stats['notes'].extend(f'Gene groups: {n}' for n in result['notes'])
+        return result
+
+    def gene_group_summary(self) -> str:
+        """e.g. 'Gene groups: 7 tested in 3 comparison(s); 2 with competitive FDR <= 0.05, 4 any change.'"""
+        result = (self.stats or {}).get('gene_groups')
+        if not result:
+            return ''
+        table = result['pathways']
+        t = float(self.settings['pval_threshold'])
+        return (f" Gene groups: {table['set_key'].nunique()} tested in {table['comparison'].nunique()} "
+                f"comparison(s); {int((table['competitive_FDR'] <= t).sum())} with competitive FDR <= {t:g}, "
+                f"{int((table['mixed_FDR'] <= t).sum())} any change.")
+
     def on_stats_finished(self, stats):
         self.stats = stats
         self._set_stats_stale(False)
@@ -2772,7 +3523,9 @@ class AnalysisPage(QWidget):
         if markers is not None:
             text += (f" Markers: {int(markers['results']['significant'].sum())} significant combination-marker "
                      f"difference(s) in {len(markers['comparisons'])} group(s).")
+        text += self.pathway_summary() + self.gene_group_summary()
         self.stats_status.setText(text + ('<br>' + '<br>'.join(notes) if notes else ''))
+        self.loo_status.setText('')
         self._update_run_button()
         self._show_results()
         self.section_tabs.setCurrentIndex(3)
@@ -2781,11 +3534,88 @@ class AnalysisPage(QWidget):
         self.stats_status.setText(f'Statistics failed: {message}')
         self._update_run_button()
 
+    def start_leave_one_out(self):
+        """Run the statistics again without each mouse in turn (each sample
+        when unpaired), with the arguments of the current run, on a worker
+        thread (``fst.leave_one_out``); the result is attached to the current
+        statistics when it finishes."""
+        if self.stats is None or self.filtered is None:
+            return
+        try:
+            call = self._stats_call()
+        except RuntimeError as exc:
+            self.loo_status.setText(str(exc))
+            return
+        pair_key = self.settings.get(self._design_key('pairing'))
+        if call['pairing']:
+            levels = dict(call['pairing'])
+            by_sample = pair_key == fa.PAIR_BY_SAMPLE
+            noun = 'sample' if by_sample else str(pair_key)
+        else:
+            levels = {u: self.unit_sample(u) for u in call['counts'].index}
+            by_sample, noun = True, 'sample'
+        labels = {v: self._name(v) for v in set(levels.values()) if v} if by_sample else {}
+        counts, denom, groups, kwargs = call['counts'], call['denominator'], call['groups'], call['kwargs']
+        inputs = self._stats_inputs()
+
+        def work(progress):
+            loo = fst.leave_one_out(counts, denom, groups, levels, kwargs, progress=progress)
+            loo.update(noun=noun, labels=labels)
+            return loo
+
+        if self.plugin._start_task('analysis_loo', work):
+            self._loo_inputs, self._loo_labels = inputs, labels
+            self.loo_btn.setEnabled(False)
+            self.loo_status.setText(f'Leave one out: running the statistics again without each {noun}.')
+
+    def leave_one_out_text(self) -> str:
+        """Status line of the leave-one-out check of the current results;
+        '' without one."""
+        loo = (self.stats or {}).get('leave_one_out')
+        if not loo:
+            return ''
+        labels = loo.get('labels') or {}
+        summary = loo.get('summary')
+        text = (f"Leave one out: {len(loo.get('refits') or {})} refit(s), one without each "
+                f"{loo.get('noun') or 'mouse'}")
+        if summary is None or summary.empty:
+            text += '; no significant results to check.'
+        else:
+            flagged = int((summary['loo_flag'] != '').sum())
+            text += (f'; {len(summary) - flagged} of {len(summary)} significant result(s) held in every refit, '
+                     f'{flagged} flagged ⚠ (results table).')
+        failed = loo.get('failed') or {}
+        if failed:
+            text += '<br>Could not refit without ' + '; '.join(f'{labels.get(k, k)} ({v})'
+                                                               for k, v in failed.items())
+        return text
+
+    def on_loo_finished(self, loo):
+        if self.stats is None or self._loo_inputs != self._stats_inputs():
+            self.loo_status.setText('Leave one out: discarded, as the counts or settings changed while it ran.')
+        else:
+            self.stats['leave_one_out'] = loo
+            self._reapply_thresholds()
+            path = fst.stats_path(self._controller().experiment_dir)
+            try:
+                fst.save_stats(path, self.stats, self._loo_inputs)
+            except Exception:
+                logger.exception('FlowCode analysis: could not save the leave-one-out check to %s', path)
+            self.loo_status.setText(self.leave_one_out_text())
+        self._loo_inputs = None
+        self._update_loo_button()
+
+    def on_loo_error(self, message):
+        self._loo_inputs = None
+        self.loo_status.setText(f'Leave one out failed: {message}')
+        self._update_loo_button()
+
     # =====================================================================
     # Results
     # =====================================================================
 
     def _build_results(self, lay):
+        self.figure_tabs = fvs.ViewStack(lambda widget: _figure_section(getattr(widget, 'figure_key', None)))
         row = QHBoxLayout()
         row.addWidget(QLabel('<b>Comparison:</b>'))
         self.cb_comparison = QComboBox()
@@ -2794,11 +3624,13 @@ class AnalysisPage(QWidget):
         row.addWidget(self.cb_comparison, stretch=1)
         self.lbl_marker_comparison = QLabel('<b>Markers:</b>')
         self.cb_marker_comparison = QComboBox()
-        self.cb_marker_comparison.setToolTip('The group whose marker differences the Marker tabs show.')
+        self.cb_marker_comparison.setToolTip('The group whose marker differences the Marker views show.')
         self.cb_marker_comparison.currentIndexChanged.connect(lambda _i: self._show_marker_results())
         _no_wheel(self.cb_marker_comparison)
         row.addWidget(self.lbl_marker_comparison)
         row.addWidget(self.cb_marker_comparison, stretch=1)
+        row.addWidget(QLabel('<b>View:</b>'))
+        row.addWidget(self.figure_tabs.selector, stretch=1)
         lay.addLayout(row)
         opts = QHBoxLayout()
         opts.addWidget(QLabel('Comparison heatmap order:'))
@@ -2829,7 +3661,6 @@ class AnalysisPage(QWidget):
         self.stale_label = _label(STALE_TEXT, _WARN_STYLE)
         self.stale_label.setVisible(False)
         lay.addWidget(self.stale_label)
-        self.figure_tabs = QTabWidget()
         self.figure_tabs.addTab(self.results_table, 'Table')
         lay.addWidget(self.figure_tabs, stretch=1)
         self.figure_msg = _label('')
@@ -2853,7 +3684,8 @@ class AnalysisPage(QWidget):
         pair = self.current_pair()
         if _figure_set(key) == 'markers':
             parts.append(f'markers {self.cb_marker_comparison.currentText()}')
-        elif pair is not None and key not in SUMMARY_FIGURES:
+        elif pair is not None and key not in SUMMARY_FIGURES + ('pathway_dot_plot', 'guide_allocation',
+                                                                'gene_group_spider'):
             parts.append(fst.comparison_label(*pair))
         parts.append(title)
         return ' - '.join(parts)
@@ -2902,11 +3734,35 @@ class AnalysisPage(QWidget):
         if self.stats is None:
             self._clear_figure_tabs()
             self.figure_msg.setText('Run statistics to see the results.')
+            self._show_guide_allocation()
             return
-        keep = () if redraw_summary else tuple(k for k in self.figures if _figure_set(k) != 'comparison')
         self._shown_figure = self.figure_tabs.tabText(self.figure_tabs.currentIndex())
-        self._clear_figure_tabs(keep)
+        # A new comparison leaves its old views in place until the new ones
+        # replace them (on_figures_finished), so the shown view does not fall
+        # through to a neighbouring one while the figures are drawn.
+        if redraw_summary:
+            self._clear_figure_tabs()
         self.start_figures(summary=redraw_summary, markers=redraw_summary)
+
+    def _show_guide_allocation(self):
+        """Before any statistics: the guide allocation tab, when a
+        gene-group table is loaded."""
+        if self.gene_group_frame() is None:
+            return
+        try:
+            alloc = self.gene_group_allocation()
+        except Exception as exc:
+            self.figure_msg.setText(f'Guide allocation: {exc}')
+            return
+        items = fgg.figures(None, alloc, self.gene_group_colours(), self.settings.get('gene_group_areas') or {},
+                            [], {}, None, None, None, float(self.settings['pval_threshold']), self.plugin.is_dark(),
+                            self.counted_population())
+        item = items.get('guide_allocation')
+        if item is None or item['fig'] is None:
+            self.figure_msg.setText(f"Guide allocation: {(item or {}).get('error', '')}")
+            return
+        self.figures['guide_allocation'] = item
+        self._insert_panel('guide_allocation', self._figure_panel('guide_allocation', item), item['title'])
 
     def _show_marker_results(self):
         """Redraw only the marker tabs (a different marker group chosen)."""
@@ -2928,11 +3784,17 @@ class AnalysisPage(QWidget):
         for key in ('counts', 'freq'):
             res = self.stats.get(key)
             if res is not None:
-                view = res[res['comparison'] == label]
-                frames.append(view.assign(test=fst.TEST_NAMES[key]))
+                view = res[res['comparison'] == label].assign(test=fst.TEST_NAMES[key])
+                loo = fst.leave_one_out_columns(self.stats, key)
+                if loo is not None:
+                    view = view.join(_loo_display(loo), on=['comparison', 'feature'])
+                frames.append(view)
         df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        for c in LOO_COLUMNS:
+            if c in df.columns:
+                df[c] = df[c].fillna('')
         cols = [c for c in ('test', 'feature', 'logFC', 'CI.L', 'CI.R', 'P.Value', 'adj.P.Val', 'adj.P.Val.global',
-                            'significant') if c in df.columns]
+                            'significant') + LOO_COLUMNS if c in df.columns]
         df = df[cols].sort_values(['test', 'P.Value']) if not df.empty else df
         # Sized once after filling: with ResizeToContents active, every
         # setItem re-measures its whole column.
@@ -2991,9 +3853,31 @@ class AnalysisPage(QWidget):
         marker_ref = fst.MARKER_REFERENCES.get((stats.get('markers') or {}).get('reference'), '')
         marker_feature = self._shown_marker_feature()
         marker_pairing = self._unit_factor(s.get('pairing'), pairing=True) if marker_feature else None
+        pathways = stats.get('pathways')
+        pathway_label = fst.comparison_label(*pair) if pair is not None else None
+        pathway_set = self._shown_pathway(pathway_label)
+        group_result = self._group_result()
+        group_set = self._shown_gene_group(pathway_label)
+        group_alloc = (group_result or {}).get('allocation')
+        group_colours = self.gene_group_colours()
+        group_areas = dict(s.get('gene_group_areas') or {})
+        spider = self.spider_comparisons()
+        spider_colours = fgg.comparison_colours(spider, stats.get('pairs'), colours)
 
         def work(_progress):
             out = {}
+            if pathways and ('summary' in wanted or 'comparison' in wanted):
+                label = pathway_label if 'comparison' in wanted else None
+                out.update(fpw.figures(pathways, stats['comparisons'], label, pathway_set,
+                                      self._pathway_ci(stats, label), s['pval_threshold'], is_dark, population,
+                                      dot_plot='summary' in wanted))
+            if group_result and ('summary' in wanted or 'comparison' in wanted):
+                label = pathway_label if 'comparison' in wanted else None
+                out.update(fgg.figures(group_result, group_alloc, group_colours, group_areas, spider,
+                                       spider_colours, label, group_set if label else None,
+                                       self._pathway_ci(stats, label), s['pval_threshold'], is_dark, population,
+                                       summary='summary' in wanted,
+                                       min_size=group_result['settings'].get('min_size')))
             if 'markers' in wanted and stats.get('markers') is not None and marker_label:
                 out.update(fst.marker_figures(stats['markers'], marker_label, s['pval_threshold'],
                                               s['marker_threshold'], s['fdr_scope'], is_dark, population,
@@ -3041,6 +3925,12 @@ class AnalysisPage(QWidget):
         if 'markers' in sets and (self.stats or {}).get('markers') is not None:
             self._insert_panel('marker_table', self._marker_table(), 'Marker table')
             self.figures['marker_table'] = {'fig': None, 'title': 'Marker table', 'error': None}
+        if 'comparison' in sets and (self.stats or {}).get('pathways') and self.current_pair() is not None:
+            self._insert_panel('pathway_table', self._pathway_table(), 'Pathway table')
+            self.figures['pathway_table'] = {'fig': None, 'title': 'Pathway table', 'error': None}
+        if 'comparison' in sets and (self.stats or {}).get('gene_groups') and self.current_pair() is not None:
+            self._insert_panel('gene_group_table', self._gene_group_table(), 'Gene group table')
+            self.figures['gene_group_table'] = {'fig': None, 'title': 'Gene group table', 'error': None}
         for i in range(self.figure_tabs.count()):
             if self.figure_tabs.tabText(i) == shown:
                 self.figure_tabs.setCurrentIndex(i)
@@ -3092,11 +3982,231 @@ class AnalysisPage(QWidget):
         if all(it is not None for it in items):
             self.show_marker_values(fst.marker_feature(items[0].text(), items[1].text()))
 
+    @staticmethod
+    def _pathway_ci(stats: dict, comparison: str | None) -> pd.DataFrame | None:
+        """CI.L and CI.R of each combination's Counts result in *comparison*."""
+        res = stats.get('counts')
+        if res is None or comparison is None:
+            return None
+        return res[res['comparison'] == comparison].set_index('feature')[['CI.L', 'CI.R']]
+
+    def _shown_pathway(self, comparison: str | None) -> str | None:
+        """The pathway of the Pathway members tab in *comparison*: the one
+        chosen last when it was tested there, else the first of the table."""
+        result = (self.stats or {}).get('pathways')
+        if not result or comparison is None:
+            return None
+        table = result['pathways']
+        if self._pathway_set in set(table.loc[table['comparison'] == comparison, 'set_key']):
+            return self._pathway_set
+        return fpw.top_set(result, comparison)
+
+    def _pathway_table(self):
+        """The chosen comparison's pathways, lowest competitive FDR first."""
+        result = self.stats['pathways']
+        view = fpw.pathway_table(result, fst.comparison_label(*self.current_pair()))
+        cols = (('set_name', 'pathway'), ('score', 'score'), ('concordance', 'agreement'), ('members', 'members'),
+                ('libraries', 'libraries'), ('competitive_FDR', 'competitive FDR'),
+                ('competitive_P.Value', 'competitive p'), ('FDR', 'self-contained FDR'),
+                ('P.Value', 'self-contained p'), ('leading', 'leading members'), ('per_library', 'per library'),
+                ('go_names', 'GO terms'), ('go_ids', 'GO ids'))
+        table = CopyableTableWidget([], [])
+        table.setSortingEnabled(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        table.setColumnCount(len(cols))
+        table.setHorizontalHeaderLabels([title for _c, title in cols])
+        table.setRowCount(len(view))
+        for r, (_i, row) in enumerate(view.iterrows()):
+            for j, (c, _title) in enumerate(cols):
+                v = row[c]
+                text = (f'{v:+.2f}' if c == 'score' else f'{v:.0%}' if c == 'concordance' and np.isfinite(v) else
+                        f'{v:.3g}' if isinstance(v, (float, np.floating)) else str(v))
+                table.setItem(r, j, _item(text, data=row['set_key'] if j == 0 else None))
+        table.resizeColumnsToContents()
+        table.setColumnWidth(0, min(table.columnWidth(0), 320))
+        table.setSortingEnabled(True)
+        table.setToolTip('Double-click a row to show its guides in the Pathway members view.')
+        table.cellDoubleClicked.connect(lambda row, _col, table=table: self._on_pathway_row(table, row))
+        return table
+
+    def _on_pathway_row(self, table, row: int):
+        item = table.item(row, 0)
+        if item is not None and item.data(Qt.UserRole):
+            self.show_pathway(str(item.data(Qt.UserRole)))
+
+    def show_pathway(self, set_key: str):
+        """Show *set_key*'s guides in the chosen comparison in the Pathway
+        members tab (after the pathway table) and switch to it. Later
+        comparison changes keep it when it was tested there."""
+        result = (self.stats or {}).get('pathways')
+        pair = self.current_pair()
+        if not result or pair is None:
+            return
+        self._pathway_set = set_key
+        label = fst.comparison_label(*pair)
+        items = fpw.figures(result, self.stats['comparisons'], label, set_key, self._pathway_ci(self.stats, label),
+                           float(self.settings['pval_threshold']), self.plugin.is_dark(), self.counted_population(),
+                           dot_plot=False)
+        item = items.get('pathway_members')
+        if item is None or item['fig'] is None:
+            self.figure_msg.setText(f"Pathway members: {(item or {}).get('error', 'not tested')}")
+            return
+        for i in range(self.figure_tabs.count() - 1, 0, -1):
+            widget = self.figure_tabs.widget(i)
+            if getattr(widget, 'figure_key', None) == 'pathway_members':
+                self.figure_tabs.removeTab(i)
+                widget.deleteLater()
+        self.figures['pathway_members'] = item
+        position = self._insert_panel('pathway_members', self._figure_panel('pathway_members', item), item['title'])
+        self.figure_tabs.setCurrentIndex(position)
+
+    def _on_dot_click(self, event, fig):
+        """Double-click on the dot plot: show that pathway in that comparison."""
+        ax = getattr(fig, '_dot_axes', None)
+        if not (event.dblclick and event.button == 1) or ax is None or event.inaxes is not ax or event.x is None:
+            return
+        points = fig._dot_points
+        if not len(points):
+            return
+        px = ax.transData.transform(points)
+        d = np.hypot(px[:, 0] - event.x, px[:, 1] - event.y)
+        i = int(np.argmin(d))
+        if d[i] > 12:
+            return
+        comparison, set_key = fig._dot_keys[i]
+        self._pathway_set = set_key
+        pair = self.current_pair()
+        if pair is not None and fst.comparison_label(*pair) == comparison:
+            self.show_pathway(set_key)
+            return
+        index = self.cb_comparison.findText(comparison)
+        if index >= 0:
+            self.cb_comparison.setCurrentIndex(index)
+            self._shown_figure = 'Pathway members'
+
+    def _on_member_click(self, event, fig):
+        """Double-click on a guide of the members plot: plot it in every sample."""
+        ax = getattr(fig, '_member_axes', None)
+        if not (event.dblclick and event.button == 1) or ax is None or event.inaxes is not ax or event.ydata is None:
+            return
+        features = fig._member_features
+        i = int(round(event.ydata))
+        if 0 <= i < len(features):
+            self.show_combination(features[i])
+
+    def _group_result(self) -> dict | None:
+        """The gene-group result with the groups in the order chosen in the
+        Gene groups dialog, or None."""
+        result = (self.stats or {}).get('gene_groups')
+        if not result:
+            return None
+        ran = list(result.get('group_order') or [])
+        chosen = [g for g in self.gene_group_order() if g in ran]
+        return {**result, 'group_order': chosen + [g for g in ran if g not in chosen]}
+
+    def _shown_gene_group(self, comparison: str | None) -> str | None:
+        """The group of the Gene group members tab in *comparison*: the one
+        chosen last when it was tested there, else the first in the table
+        with either FDR passing, else the first tested."""
+        result = self._group_result()
+        if not result or comparison is None:
+            return None
+        table = fgg.group_table(result, comparison)
+        if table.empty:
+            return None
+        if self._group_set in set(table['set_key']):
+            return self._group_set
+        hits = fgg.export_groups(result, comparison, float(self.settings['pval_threshold']), limit=1)
+        return hits[0] if hits else str(table['set_key'].iloc[0])
+
+    def _gene_group_table(self):
+        """The chosen comparison's gene groups, in group order."""
+        result = self._group_result()
+        view = fgg.group_table(result, fst.comparison_label(*self.current_pair()))
+        cols = (('set_name', 'group'), ('score', 'score'), ('concordance', 'agreement'), ('members', 'guides'),
+                ('libraries', 'libraries'), ('competitive_FDR', 'competitive FDR'),
+                ('competitive_P.Value', 'competitive p'), ('mixed_FDR', 'any-change FDR'),
+                ('mixed_P.Value', 'any-change p'), ('FDR', 'self-contained FDR'), ('P.Value', 'self-contained p'),
+                ('leading', 'leading guides'), ('per_library', 'per library'))
+        table = CopyableTableWidget([], [])
+        table.setSortingEnabled(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        table.setColumnCount(len(cols))
+        table.setHorizontalHeaderLabels([title for _c, title in cols])
+        table.setRowCount(len(view))
+        for r, (_i, row) in enumerate(view.iterrows()):
+            for j, (c, _title) in enumerate(cols):
+                v = row[c]
+                text = (f'{v:+.2f}' if c == 'score' else f'{v:.0%}' if c == 'concordance' and np.isfinite(v) else
+                        f'{v:.3g}' if isinstance(v, (float, np.floating)) else str(v))
+                table.setItem(r, j, _item(text, data=row['set_key'] if j == 0 else None))
+        table.resizeColumnsToContents()
+        table.setSortingEnabled(True)
+        table.setToolTip('Double-click a row to show its guides in the Gene group members view.')
+        table.cellDoubleClicked.connect(lambda row, _col, table=table: self._on_gene_group_row(table, row))
+        return table
+
+    def _on_gene_group_row(self, table, row: int):
+        item = table.item(row, 0)
+        if item is not None and item.data(Qt.UserRole):
+            self.show_gene_group(str(item.data(Qt.UserRole)))
+
+    def show_gene_group(self, set_key: str):
+        """Show *set_key*'s guides in the chosen comparison in the Gene group
+        members tab and switch to it. Later comparison changes keep it when it
+        was tested there."""
+        result = self._group_result()
+        pair = self.current_pair()
+        if not result or pair is None:
+            return
+        self._group_set = set_key
+        label = fst.comparison_label(*pair)
+        items = fgg.figures(result, None, self.gene_group_colours(), {}, [], {}, label, set_key,
+                            self._pathway_ci(self.stats, label), float(self.settings['pval_threshold']),
+                            self.plugin.is_dark(), self.counted_population(), summary=False)
+        item = items.get('gene_group_members')
+        if item is None or item['fig'] is None:
+            self.figure_msg.setText(f"Gene group members: {(item or {}).get('error', 'not tested')}")
+            return
+        for i in range(self.figure_tabs.count() - 1, 0, -1):
+            widget = self.figure_tabs.widget(i)
+            if getattr(widget, 'figure_key', None) == 'gene_group_members':
+                self.figure_tabs.removeTab(i)
+                widget.deleteLater()
+        self.figures['gene_group_members'] = item
+        position = self._insert_panel('gene_group_members', self._figure_panel('gene_group_members', item),
+                                      item['title'])
+        self.figure_tabs.setCurrentIndex(position)
+
+    def _on_spider_click(self, event, fig):
+        """Double-click on a spider point: show that group in that comparison."""
+        ax = getattr(fig, '_spider_axes', None)
+        if not (event.dblclick and event.button == 1) or ax is None or event.inaxes is not ax or event.x is None:
+            return
+        points = fig._spider_points
+        if not len(points):
+            return
+        px = ax.transData.transform(points)
+        d = np.hypot(px[:, 0] - event.x, px[:, 1] - event.y)
+        i = int(np.argmin(d))
+        if d[i] > 12:
+            return
+        comparison, set_key = fig._spider_keys[i]
+        self._group_set = set_key
+        pair = self.current_pair()
+        if pair is not None and fst.comparison_label(*pair) == comparison:
+            self.show_gene_group(set_key)
+            return
+        index = self.cb_comparison.findText(comparison)
+        if index >= 0:
+            self.cb_comparison.setCurrentIndex(index)
+            self._shown_figure = 'Gene group members'
+
     def _figure_panel(self, key: str, item: dict) -> fcfp.FigurePanel:
         """A figure tab; on the volcanos and fold-change bars a double-click
         on a combination shows it in the Combination tab (right-click for a
         menu), also in their popped-out windows."""
-        panel = fcfp.FigurePanel(self._figure_name(key, item['title']), self.analysis_root)
+        panel = fcfp.FigurePanel(self._figure_name(key, item.get('export_title') or item['title']), self.analysis_root)
         panel.figure_key = key
         if key in ('counts_volcano', 'freq_volcano', 'fold_change_bars'):
             results = item.get('results')
@@ -3105,6 +4215,24 @@ class AnalysisPage(QWidget):
             results = item.get('results')
             panel.connect_canvas = lambda canvas, fig, results=results: self._connect_clicks(
                 canvas, fig, results, markers=True)
+        elif key in ('pathway_dot_plot', 'pathway_members'):
+            handler = self._on_dot_click if key == 'pathway_dot_plot' else self._on_member_click
+
+            def connect(canvas, fig, handler=handler, key=key):
+                canvas.mpl_connect('button_press_event', lambda event, fig=fig: handler(event, fig))
+                canvas.setToolTip('Double-click a dot to show that pathway\'s guides (Pathway members).'
+                                  if key == 'pathway_dot_plot' else
+                                  'Double-click a guide to plot it in every sample (Combination view).')
+            panel.connect_canvas = connect
+        elif key in ('gene_group_spider', 'gene_group_members'):
+            handler = self._on_spider_click if key == 'gene_group_spider' else self._on_member_click
+
+            def connect(canvas, fig, handler=handler, key=key):
+                canvas.mpl_connect('button_press_event', lambda event, fig=fig: handler(event, fig))
+                canvas.setToolTip('Double-click a point to show that group\'s guides (Gene group members).'
+                                  if key == 'gene_group_spider' else
+                                  'Double-click a guide to plot it in every sample (Combination view).')
+            panel.connect_canvas = connect
         fig, make = self._stamped(item['fig'], item.get('make'))
         panel.set_figure(fig, make=make)
         return panel
@@ -3115,9 +4243,9 @@ class AnalysisPage(QWidget):
         canvas.mpl_connect('button_press_event',
                            lambda event, fig=fig, results=results: self._on_figure_click(event, fig, results,
                                                                                           markers))
-        canvas.setToolTip('Double-click a point to plot it in every sample (Marker tab); right-click for more.'
+        canvas.setToolTip('Double-click a point to plot it in every sample (Marker view); right-click for more.'
                           if markers else 'Double-click a combination to plot it in every sample (Combination '
-                          'tab); right-click for more.')
+                          'view); right-click for more.')
 
     def _combination_at(self, event, fig, results) -> str | None:
         """The combination under a mouse event: the bar of the fold-change
@@ -3156,7 +4284,7 @@ class AnalysisPage(QWidget):
             from PySide6.QtWidgets import QMenu
             menu = QMenu(self)
             menu.addSection(combination)
-            menu.addAction('Show in the Marker tab' if markers else 'Show in the Combination tab').triggered.connect(
+            menu.addAction('Show in the Marker view' if markers else 'Show in the Combination view').triggered.connect(
                 lambda: show(combination))
             menu.addAction('Open in a window').triggered.connect(lambda: window(combination))
             menu.exec(QCursor.pos())
@@ -3427,6 +4555,18 @@ class AnalysisPage(QWidget):
                     rule += ('; k is the smallest of 0 to 4 (steps of 0.25) at which the control combinations '
                              'have no significant marker hits')
             lines.append(f'  Marker spillover: {rule}')
+        if s['run_pathways']:
+            lines += fpw.settings_lines((stats or {}).get('pathways'), {
+                'evidence': s['pathway_evidence'], 'min_size': s['pathway_min_size'],
+                'rotations': s['pathway_rotations'], 'overrides': s.get('pathway_names') or {}})
+        if s['run_gene_groups']:
+            table = self.gene_group_frame()
+            lines += fgg.settings_lines((stats or {}).get('gene_groups'), {
+                'file': s.get('gene_group_file'), 'digest': fgg.table_digest(table) if table is not None else '',
+                'groups': len(self.gene_group_order()), 'min_size': s['pathway_min_size'],
+                'rotations': s['pathway_rotations']})
+            if (stats or {}).get('gene_groups'):
+                lines.append('  Gene group spider comparisons: ' + ', '.join(self.spider_comparisons()))
         if stats is not None:
             lines.append('  Comparisons run: ' + ', '.join(stats['comparisons']))
             if markers:
@@ -3502,12 +4642,43 @@ class AnalysisPage(QWidget):
                 for key in ('marker_heatmap', 'marker_volcano'):
                     figures.append((f'Markers {label} - {key.replace("marker_", "")}',
                                     lambda label=label, key=key: figure_of(('markers', label), key)))
+            pathways = stats.get('pathways')
+            threshold = float(s['pval_threshold'])
+            if pathways:
+                figures.append(('Pathway dot plot', lambda: fpw.dot_plot_figure(
+                    pathways, stats['comparisons'], threshold, is_dark, population)))
+                for label in stats['comparisons']:
+                    ci = self._pathway_ci(stats, label)
+                    for key in fpw.export_sets(pathways, label, threshold):
+                        figures.append((f'{label} - pathway {fpw.set_name(pathways, key)}',
+                                        lambda label=label, key=key, ci=ci: fpw.members_figure(
+                                            pathways, label, key, ci, threshold, is_dark, population)))
+            groups_result = self._group_result()
+            if groups_result:
+                group_colours = self.gene_group_colours()
+                spider = self.spider_comparisons()
+                spider_colours = fgg.comparison_colours(spider, stats.get('pairs'), colours)
+                min_size = groups_result['settings'].get('min_size')
+                if groups_result.get('allocation') is not None:
+                    figures.append(('Guide allocation', lambda: fgg.donut_figure(
+                        groups_result['allocation'], group_colours, is_dark, population,
+                        s.get('gene_group_areas') or {})))
+                figures.append(('Gene group spider', lambda: fgg.spider_figure(
+                    groups_result, spider, spider_colours, group_colours, threshold, is_dark, population, min_size)))
+                for label in stats['comparisons']:
+                    ci = self._pathway_ci(stats, label)
+                    for key in fgg.export_groups(groups_result, label, threshold):
+                        figures.append((f'{label} - gene group {fpw.set_name(groups_result, key)}',
+                                        lambda label=label, key=key, ci=ci: fpw.members_figure(
+                                            groups_result, label, key, ci, threshold, is_dark, population,
+                                            groups=True)))
 
         def work(progress):
             written = fst.write_analysis_folder(folder, population=population, raw_counts=counts, meta=meta,
                                                 qc=qc, filtered=filtered, stats=stats, sample_table=sample_table,
                                                 settings_text=settings_text, figures=figures, sample_labels=labels,
-                                                progress=progress, no_fret=no_fret)
+                                                progress=progress, no_fret=no_fret,
+                                                fdr_threshold=float(s['pval_threshold']))
             progress(len(figures), len(figures), '')
             return written
 
@@ -3534,11 +4705,13 @@ class AnalysisPage(QWidget):
     def on_task_finished(self, key, result):
         {'analysis_count': self.on_count_finished, 'analysis_stats': self.on_stats_finished,
          'analysis_figures': self.on_figures_finished, 'analysis_export': self.on_export_finished,
+         'analysis_loo': self.on_loo_finished, 'analysis_restore': self.on_restore_finished,
          fcgv.TASK: self.gating_view.on_finished}[key](result)
 
     def on_task_error(self, key, message):
         {'analysis_count': self.on_count_error, 'analysis_stats': self.on_stats_error,
          'analysis_figures': self.on_figures_error, 'analysis_export': self.on_export_error,
+         'analysis_loo': self.on_loo_error, 'analysis_restore': self.on_restore_error,
          fcgv.TASK: self.gating_view.on_error}[key](message)
 
     def on_task_progress(self, key, n, total, text):
@@ -3548,6 +4721,9 @@ class AnalysisPage(QWidget):
             self.count_status.setText(f'Counting {text}… ({n + 1}/{total})')
         elif key == 'analysis_export' and text:
             self.export_status.setText(f'Writing {text}… ({n + 1}/{total})')
+        elif key == 'analysis_loo' and text:
+            name = self._loo_labels.get(text, text)
+            self.loo_status.setText(f'Leave one out: refit {n + 1} of {total}, without {name}.')
 
     def refresh_status(self):
         kind, text = self.status_summary()

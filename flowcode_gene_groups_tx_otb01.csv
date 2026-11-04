@@ -1,0 +1,57 @@
+gene,group,reference,pmid
+Egr1,TCR-induced immediate-early,"Collins et al. 2008, Eur J Immunol. Opposing regulation of T cell function by Egr-1/NAB2 and Egr-2/Egr-3.",18203138
+Egr2,TCR-induced immediate-early,"Collins et al. 2008, Eur J Immunol. Opposing regulation of T cell function by Egr-1/NAB2 and Egr-2/Egr-3. | Morita et al. 2016, Proc Natl Acad Sci U S A. Egr2 and Egr3 in regulatory T cells cooperatively control systemic autoimmunity through Ltbp3-mediated TGF-β3 production.",18203138;27911796
+Nr4a1,TCR-induced immediate-early,"Fassett et al. 2012, Proc Natl Acad Sci U S A. Nuclear receptor Nr4a1 modulates both regulatory T-cell (Treg) differentiation and clonal deletion. | Moran et al. 2011, J Exp Med. T cell receptor signal strength in Treg and iNKT cell development demonstrated by a novel fluorescent reporter mouse.",22345564;21606508
+Nr4a2,TCR-induced immediate-early,"Sekiya et al. 2013, Nat Immunol. Nr4a receptors are essential for thymic regulatory T cell development and immune homeostasis. | Sekiya et al. 2011, Nat Commun. The nuclear orphan receptor Nr4a2 induces Foxp3 and regulates differentiation of CD4+ T cells.",23334790;21468021
+Nr4a3,TCR-induced immediate-early,"Sekiya et al. 2013, Nat Immunol. Nr4a receptors are essential for thymic regulatory T cell development and immune homeostasis. | Jennings et al. 2020, Cell Rep. Nr4a1 and Nr4a3 Reporter Mice Are Differentially Sensitive to T Cell Receptor Signal Strength and Duration.",23334790;33147449
+Fos,TCR-induced immediate-early,"Ma et al. 2024, Sci Immunol. Serine enrichment in tumors promotes regulatory T cell accumulation through sphinganine-mediated regulation of c-Fos.",38640251
+Fosb,TCR-induced immediate-early,"Baumann et al. 2003, Oncogene. An unexpected role for FosB in activation-induced cell death of T cells.",12618758
+Crem,TCR-induced immediate-early,"Bodor et al. 2007, Eur J Immunol. ICER/CREM-mediated transcriptional attenuation of IL-2 and its role in suppression by regulatory T cells.",17372992
+Elk1,TCR-induced immediate-early,"Maurice et al. 2018, J Immunol. ERK Signaling Controls Innate-like CD8(+) T Cell Differentiation via the ELK4 (SAP-1) and ELK1 Transcription Factors.",30068599
+Atf3,AP-1 / BATF effector network,"Filén et al. 2010, J Immunol. Activating transcription factor 3 is a positive regulator of human IFNG gene expression.",20304822
+Batf,AP-1 / BATF effector network,"Delacher et al. 2020, Immunity. Precursors for Nonlymphoid-Tissue Treg Cells Reside in Secondary Lymphoid Organs and Are Programmed by the Transcription Factor BATF.",31924477
+Jun,AP-1 / BATF effector network,"Lynn et al. 2019, Nature. c-Jun overexpression in CAR T cells induces exhaustion resistance.",31802004
+Junb,AP-1 / BATF effector network,"Koizumi et al. 2018, Nat Commun. JunB regulates homeostasis and suppressive functions of effector regulatory T cells.",30559442
+Jund,AP-1 / BATF effector network,"Meixner et al. 2004, EMBO J. JunD regulates lymphocyte proliferation and T helper cell cytokine expression.",15029240
+Fosl2,AP-1 / BATF effector network,"Renoux et al. 2020, Cell Rep. The AP1 Transcription Factor Fosl2 Promotes Systemic Autoimmunity and Inflammation by Repressing Treg Development.",32610127
+Irf4,Effector and tissue Treg programme,"Cretney et al. 2011, Nat Immunol. The transcription factors Blimp-1 and IRF4 jointly control the differentiation and function of effector regulatory T cells. | Zheng et al. 2009, Nature. Regulatory T-cell suppressor program co-opts transcription factor IRF4 to control T(H)2 responses.",21378976;19182775
+Prdm1,Effector and tissue Treg programme,"Cretney et al. 2011, Nat Immunol. The transcription factors Blimp-1 and IRF4 jointly control the differentiation and function of effector regulatory T cells.",21378976
+Maf,Effector and tissue Treg programme,"Xu et al. 2018, Nature. c-MAF-dependent regulatory T cells mediate immunological tolerance to a gut pathobiont.",29414937
+Pparg,Effector and tissue Treg programme,"Cipolletta et al. 2012, Nature. PPAR-γ is a major driver of the accumulation and phenotype of adipose tissue Treg cells.",22722857
+Rora,Effector and tissue Treg programme,"Malhotra et al. 2018, Sci Immunol. RORα-expressing T regulatory cells restrain allergic skin inflammation.",29500225
+Gata3,Effector and tissue Treg programme,"Wohlfert et al. 2011, J Clin Invest. GATA3 controls Foxp3⁺ regulatory T cell fate during inflammation in mice.",21965331
+Ahr,Effector and tissue Treg programme,"Ye et al. 2017, Cell Rep. The Aryl Hydrocarbon Receptor Preferentially Marks and Promotes Gut Regulatory T Cells.",29166616
+Cebpa,Effector and tissue Treg programme,"Lee et al. 2026, Nat Commun. IL-6-induced C/EBPα drives follicular regulatory T cell differentiation to regulate humoral immunity in mice.",42414311
+Trps1,Effector and tissue Treg programme,"Obradovic et al. 2023, Cancer Cell. Systematic elucidation and pharmacological targeting of tumor-infiltrating regulatory T cell master regulators.",37116491
+Tbx21,Helper-lineage programmes in Treg,"Koch et al. 2009, Nat Immunol. The transcription factor T-bet controls regulatory T cell homeostasis and function during type 1 inflammation.",19412181
+Rbpj,Helper-lineage programmes in Treg,"Delacher et al. 2019, Nat Commun. Rbpj expression in regulatory T cells is critical for restraining T(H)2 responses.",30962454
+Irf8,Helper-lineage programmes in Treg,"Lee et al. 2016, Cell Mol Immunol. Transcription factor IRF8 controls Th1-like regulatory T-cell function.",26166768
+Gfi1,Helper-lineage programmes in Treg,"Zhu et al. 2009, J Exp Med. Down-regulation of Gfi-1 expression by TGF-beta is important for differentiation of Th17 and CD103+ inducible regulatory T cells.",19188499
+Nfkb2,Inflammatory and NF-κB signalling,"Dhar et al. 2019, Sci Rep. Role of NF-kappaB2-p100 in regulatory T cell homeostasis and activation.",31554891
+Relb,Inflammatory and NF-κB signalling,"Grinberg-Bleyer et al. 2018, J Immunol. The Alternative NF-κB Pathway in Regulatory T Cell Homeostasis and Suppressive Function.",29459403
+Irf5,Inflammatory and NF-κB signalling,"Fabié et al. 2018, Cell Rep. IRF-5 Promotes Cell Death in CD4 T Cells during Chronic Infection.",30067973
+Hif1a,Inflammatory and NF-κB signalling,"Shi et al. 2011, J Exp Med. HIF1alpha-dependent glycolytic pathway orchestrates a metabolic checkpoint for the differentiation of TH17 and Treg cells.",21708926
+Ikzf2,"Treg identity, stability and quiescence","Kim et al. 2015, Science. Stable inhibitory activity of regulatory T cells requires the transcription factor Helios.",26472910
+Nfil3,"Treg identity, stability and quiescence","Kim et al. 2019, Exp Mol Med. The transcription factor NFIL3 controls regulatory T-cell function and stability.",31311918
+Runx1,"Treg identity, stability and quiescence","Kitoh et al. 2009, Immunity. Indispensable role of the Runx1-Cbfbeta transcription complex for in vivo-suppressive function of FoxP3+ regulatory T cells.",19800266
+Runx3,"Treg identity, stability and quiescence","Rudra et al. 2009, Nat Immunol. Runx-CBFbeta complexes control expression of the transcription factor Foxp3 in regulatory T cells.",19767756
+Tcf7,"Treg identity, stability and quiescence","Xing et al. 2019, J Exp Med. Tcf1 and Lef1 are required for the immunosuppressive function of regulatory T cells.",30837262
+Ikzf1,"Treg identity, stability and quiescence","Ichiyama et al. 2024, Immunity. Transcription factor Ikzf1 associates with Foxp3 to repress gene expression in Treg cells and limit autoimmunity and anti-tumor immunity.",39111316
+Hic1,"Treg identity, stability and quiescence","Ubaid et al. 2018, Cell Rep. Transcriptional Repressor HIC1 Contributes to Suppressive Function of Human Induced Regulatory T Cells.",29466736
+Nr2f6,"Treg identity, stability and quiescence","Hermann-Kleiter et al. 2008, Immunity. The nuclear orphan receptor NR2F6 suppresses lymphocyte activation and T helper 17-dependent autoimmunity.",18701084
+Klf4,"Treg identity, stability and quiescence","An et al. 2011, FASEB J. Krüppel-like factor 4 (KLF4) directly regulates proliferation in thymocyte development and IL-17 expression during Th17 differentiation.",21685331
+Myc,Proliferation and growth,"Saravia et al. 2020, Sci Adv. Homeostasis and transitional activation of regulatory T cells require c-Myc.",31911938
+E2f1,Proliferation and growth,"Field et al. 1996, Cell. E2F-1 functions in mice to promote apoptosis and suppress proliferation.",8653790
+E2f7,Proliferation and growth,"Mitxelena et al. 2016, Nucleic Acids Res. E2F7 regulates transcription and maturation of multiple microRNAs to restrain cell proliferation.",26961310
+Jdp2,Other (no established Treg role),"Mansour et al. 2018, J Exp Med. JDP2: An oncogenic bZIP transcription factor in T cell acute lymphoblastic leukemia.",29941549
+Csrnp1,Other (no established Treg role),"Ye et al. 2017, Exp Cell Res. Axin1 up-regulated 1 accelerates stress-induced cardiomyocytes apoptosis through activating Wnt/β-catenin signaling.",28830684
+Gata1,Other (no established Treg role),,
+Mafa,Other (no established Treg role),,
+Maff,Other (no established Treg role),"Kang et al. 2026, Tissue Cell. MAFF mediates transcriptional activation of CFLAR to reduce regulatory T cell apoptosis and inhibit diabetic retinopathy progression.",42348964
+Mafg,Other (no established Treg role),"Katsuoka et al. 2016, Gene. Small Maf proteins (MafF, MafG, MafK): History, structure and function.",27058431
+Prox1,Other (no established Treg role),,
+Runx2,Other (no established Treg role),"Zitti et al. 2023, Immunity. Human skin-resident CD8(+) T cells require RUNX2 and RUNX3 for induction of cytotoxicity and expression of the integrin CD49a.",37269830
+Hey1,Other (no established Treg role),,
+Hlf,Other (no established Treg role),,
+Zbtb14,Other (no established Treg role),"Deng et al. 2022, Elife. Zbtb14 regulates monocyte and macrophage development through inhibiting pu.1 expression in zebrafish.",36205309
+Nr2c2,Other (no established Treg role),"Zhang et al. 2016, J Clin Endocrinol Metab. Testicular Receptor-4: Novel Regulator of Glucocorticoid Resistance.",27253665
