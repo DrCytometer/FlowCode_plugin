@@ -262,7 +262,7 @@ class GatingSection(QWidget):
             return
         view = self.view_combo.currentData()
         views = [view] + ([fcg.VIEW_UNCORRECTED] if view != fcg.VIEW_UNCORRECTED else [])
-        counted = list(page.used_files())
+        counted = [k for k in page.used_files() if not fa.is_linked(k)]
         keys = counted if key in counted else [key]
         try:
             # the counted samples' unmixing signature, so the view the counts use shares their cache

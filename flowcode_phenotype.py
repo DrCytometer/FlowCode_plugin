@@ -18,12 +18,14 @@ centre. An event's membership is the product of the probabilities
 population's size is the sum of memberships, a soft count, per barcode
 combination.
 
-Definitions are written in canonical marker names (``marker_database.csv``)
-and resolved against the experiment's spectral model, so they transfer
-across panels. A positive marker the panel lacks leaves the definition
-unresolved; a negative marker the panel lacks is dropped and reported as
-not checked. The panel's viability dye (``is.viability`` in the fluorophore
-database) is added as a negative marker when there is one.
+Definitions are Honeychrome's cell-type database, written in canonical
+marker names (``marker_database.csv``) and resolved against the
+experiment's spectral model, so they transfer across panels. Only the
+markers on the panel have a say: a marker the panel lacks, of either sign,
+is reported as not checked, and definitions that read the same on the
+panel are offered as one phenotype (``phenotype_groups``). The panel's
+viability dye (``is.viability`` in the fluorophore database) is added as a
+negative marker when there is one.
 
 Limits. The probability says "above the negative" only, so level
 distinctions (CD44 high against intermediate) are out of scope. Scatter has
@@ -43,7 +45,7 @@ from __future__ import annotations
 
 import csv
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -53,11 +55,12 @@ logger = logging.getLogger(__name__)
 SCORE_VERSION = 'soft-threshold-1'
 POSITIVE_Z = 3.0            # SDs above the negative where the probability is one half
 POSITIVE_WIDTH = 0.5        # SDs over which it goes from 0.27 to 0.73
-DEFINITIONS_FILE = 'flowcode_phenotypes.csv'
-BUNDLED_DATABASE = 'drc_cell_type_database.csv'
-SOURCE_PLUGIN = 'plugin'
 SOURCE_BUNDLED = 'bundled'
 AF_ABUNDANCE = 'AF Abundance'
+# Definitions this plugin once kept in its own file, and the database
+# definitions that replace them, so phenotypes chosen under the old names
+# stay chosen.
+RENAMED = {'CD4 T cell (mouse)': 'CD4 (mouse)', 'CD8 T cell (mouse)': 'CD8 (mouse)'}
 
 
 # ---------------------------------------------------------------------------
@@ -66,13 +69,19 @@ AF_ABUNDANCE = 'AF Abundance'
 
 @dataclass(frozen=True)
 class Definition:
-    """One phenotype: canonical marker names, positive and negative."""
+    """One phenotype: canonical marker names, positive and negative. A
+    phenotype formed from several database definitions that the panel
+    cannot tell apart (``phenotype_groups``) lists their keys in
+    ``members`` and the unstained markers on which they differ in
+    ``separated_by``."""
     cell_type: str
     species: str
     positive: tuple
     negative: tuple
-    source: str = SOURCE_PLUGIN
+    source: str = SOURCE_BUNDLED
     notes: str = ''
+    members: tuple = ()
+    separated_by: tuple = ()
 
     @property
     def key(self) -> str:
@@ -143,23 +152,18 @@ def read_definitions(path, source: str, marker_db=None) -> list:
 
 
 def bundled_database_path() -> Path:
-    import honeychrome
-    return Path(honeychrome.__file__).resolve().parent / 'bundled_plugins' / BUNDLED_DATABASE
+    from honeychrome.controller_components import cell_type_panel
+    return cell_type_panel.DATABASE_PATH
 
 
-def load_definitions(plugin_dir=None, include_bundled: bool = True, marker_db=None) -> list:
-    """The plugin's definitions (``flowcode_phenotypes.csv`` beside this
-    module, or in *plugin_dir*) followed by the bundled cell-type database.
-    A plugin definition hides a bundled one with the same cell type and
-    species."""
-    plugin_dir = Path(plugin_dir) if plugin_dir is not None else Path(__file__).resolve().parent
-    out = read_definitions(plugin_dir / DEFINITIONS_FILE, SOURCE_PLUGIN, marker_db)
-    if include_bundled:
-        seen = {d.key for d in out}
-        for d in read_definitions(bundled_database_path(), SOURCE_BUNDLED, marker_db):
-            if d.key not in seen:
-                out.append(d)
-                seen.add(d.key)
+def load_definitions(marker_db=None) -> list:
+    """The definitions of Honeychrome's cell-type database. A later row with
+    the same cell type and species as an earlier one is ignored."""
+    out, seen = [], set()
+    for d in read_definitions(bundled_database_path(), SOURCE_BUNDLED, marker_db):
+        if d.key not in seen:
+            out.append(d)
+            seen.add(d.key)
     return out
 
 
@@ -276,12 +280,14 @@ class Unresolved:
 
 
 def resolve(definition: Definition, panel: Panel, viability: bool = True):
-    """``Resolved`` or ``Unresolved``. Every positive marker must be on
-    exactly one fluorophore; a negative marker on none is dropped into
-    ``not_checked``; a marker on two fluorophores is ambiguous. With
-    *viability*, the panel's viability dye (the first when there are
-    several) is appended as a negative marker."""
-    markers, missing, ambiguous, not_checked = [], [], [], []
+    """``Resolved`` or ``Unresolved``. Only the markers on the panel have a
+    say: a marker of either sign that the panel lacks is dropped into
+    ``not_checked``. The definition is unresolved when a marker is on two
+    fluorophores (ambiguous), when none of its markers is on the panel, or
+    when only markers that count against it are (nothing on the panel
+    identifies it). With *viability*, the panel's viability dye (the first
+    when there are several) is appended as a negative marker."""
+    markers, ambiguous, not_checked = [], [], []
     for sign, names in ((1, definition.positive), (-1, definition.negative)):
         for name in names:
             found = panel.markers.get(name, ())
@@ -289,26 +295,67 @@ def resolve(definition: Definition, panel: Panel, viability: bool = True):
                 markers.append((name, found[0], sign))
             elif len(found) > 1:
                 ambiguous.append((name, found))
-            elif sign > 0:
-                missing.append(name)
             else:
                 not_checked.append(name)
-    if missing or ambiguous:
-        reasons = []
-        if missing:
-            reasons.append('not in the panel: ' + ', '.join(missing))
-        if ambiguous:
-            reasons.append('on several fluorophores: ' + ', '.join(f'{m} ({", ".join(f)})' for m, f in ambiguous))
-        return Unresolved(definition=definition, reason='; '.join(reasons), missing=tuple(missing),
-                          ambiguous=tuple(ambiguous))
+    if ambiguous:
+        reason = 'on several fluorophores: ' + ', '.join(f'{m} ({", ".join(f)})' for m, f in ambiguous)
+        return Unresolved(definition=definition, reason=reason, ambiguous=tuple(ambiguous))
+    if not markers:
+        return Unresolved(definition=definition, reason='none of its markers is on the panel',
+                          missing=tuple(not_checked))
+    if not any(s > 0 for _m, _f, s in markers):
+        return Unresolved(definition=definition, reason='only markers that count against it are on the panel',
+                          missing=tuple(m for m in not_checked if m in definition.positive))
     dye = None
     if viability and panel.viability:
         dye = panel.viability[0]
         if dye not in {f for _m, f, _s in markers}:
             markers.append(('viability', dye, -1))
-    if not markers:
-        return Unresolved(definition=definition, reason='no marker to score')
     return Resolved(definition=definition, markers=tuple(markers), not_checked=tuple(not_checked), viability=dye)
+
+
+def phenotype_groups(definitions, panel: Panel, viability: bool = True) -> tuple:
+    """
+    ``({key: Resolved | Unresolved}, aliases)``: *definitions* as the panel
+    can tell them apart. Within each species, resolved definitions whose
+    signs on the panel are identical form one phenotype
+    (``cell_type_panel.panel_groups``), named after its single member or
+    ``signs: A / B``, with ``members`` and ``separated_by`` filled; a single
+    member keeps its own key. Unresolved definitions keep their own key.
+    *aliases* maps every member's key, and each ``RENAMED`` key, to the key
+    of its phenotype, so earlier choices can be carried over. Phenotypes
+    follow the database order of their first member.
+    """
+    from honeychrome.controller_components import cell_type_panel
+    stained = {m for m, f in panel.markers.items() if len(f) == 1}
+    items, aliases, by_species = [], {}, {}
+    for i, d in enumerate(definitions):
+        res = resolve(d, panel, viability)
+        if isinstance(res, Unresolved):
+            items.append((i, d.key, res))
+        else:
+            by_species.setdefault(d.species, []).append((i, d))
+    for species, entries in by_species.items():
+        index = {d.cell_type: (i, d) for i, d in entries}
+        grouped = cell_type_panel.panel_groups([(d.cell_type, d.positive, d.negative) for _i, d in entries], stained)
+        for g in grouped.groups:
+            members = [index[name][1] for name in g.names]
+            first_index, first = index[g.names[0]]
+            off_panel = tuple(dict.fromkeys(m for d in members for m in (*d.positive, *d.negative) if m not in stained))
+            phenotype = Definition(cell_type=g.label, species=species, positive=g.positive, negative=g.negative,
+                                   source=first.source, notes=first.notes if len(members) == 1 else '',
+                                   members=tuple(d.key for d in members), separated_by=g.separated_by)
+            res = resolve(phenotype, panel, viability)
+            if isinstance(res, Resolved):
+                res = replace(res, not_checked=off_panel)
+            items.append((first_index, phenotype.key, res))
+            for d in members:
+                aliases[d.key] = phenotype.key
+    for old, new in RENAMED.items():
+        if new in aliases:
+            aliases.setdefault(old, aliases[new])
+    items.sort(key=lambda t: t[0])
+    return {key: res for _i, key, res in items}, aliases
 
 
 CONGENIC_MARKERS = ('CD45.1', 'CD45.2')
@@ -334,7 +381,9 @@ def split_congenic(resolved: Resolved, panel: Panel, markers=CONGENIC_MARKERS) -
         definition = Definition(cell_type=f'{resolved.definition.cell_type} {own}', species=resolved.definition.species,
                                 positive=resolved.definition.positive + (own,),
                                 negative=resolved.definition.negative + (other,),
-                                source=resolved.definition.source, notes=resolved.definition.notes)
+                                source=resolved.definition.source, notes=resolved.definition.notes,
+                                members=resolved.definition.members,
+                                separated_by=resolved.definition.separated_by)
         out[definition.cell_type] = Resolved(definition=definition, markers=tuple(body + extra + tail),
                                              not_checked=resolved.not_checked, viability=resolved.viability)
     return out

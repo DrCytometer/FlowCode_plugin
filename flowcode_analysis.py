@@ -36,7 +36,8 @@ populations need the live unmix, whose AF library gives the negative model;
 exported files carry no such model.
 
 ``live_links`` lists the raw files the live unmix can use,
-``link_exports`` matches exported files to samples, ``SampleGating`` (taken on the
+``link_exports`` matches exported files to samples, ``link_folders`` lists the
+exported files of other experiments (other acquisition days) to count with them, ``SampleGating`` (taken on the
 main thread with ``SampleGating.from_controller``) holds the gates and gates
 each file with its own sample's gates, ``count_events`` gates and counts one
 sample's events (``count_sample``: of an exported file), ``count_table`` assembles every sample, ``filter_counts`` applies the
@@ -60,6 +61,7 @@ from __future__ import annotations
 import logging
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -79,14 +81,22 @@ LINK_UNREADABLE = 'unreadable'
 LINK_OTHER_COMBOS = 'different combinations'
 LINK_OTHER_CHARACTERISATION = 'older characterisation'
 LINK_NO_AF = 'no AF library'
+LINK_OTHER_CHANNELS = 'different channels'
 USABLE_BY_DEFAULT = (LINK_OK,)
+
+# Sample key of a file linked from another experiment's export folder.
+LINKED_PREFIX = 'linked:'
+
+# Covariate filled in from the files' acquisition dates ($DATE).
+DATE_COVARIATE = 'acquisition date'
+DATE_FORMATS = ('%d-%b-%Y', '%Y-%m-%d', '%d/%m/%Y', '%Y/%m/%d', '%d-%m-%Y', '%d.%m.%Y', '%d %b %Y', '%b %d, %Y')
 
 # Where the page's events come from.
 SOURCE_LIVE = 'live'
 SOURCE_EXPORTED = 'exported'
 SOURCES = (SOURCE_LIVE, SOURCE_EXPORTED)
 
-DEFAULT_MIN_SAMPLE_EVENTS = 20
+DEFAULT_MIN_SAMPLE_EVENTS = 1
 DEFAULT_MIN_COMBO_EVENTS = 20
 
 # Pairing and split choices that are not covariates.
@@ -100,6 +110,8 @@ COUNT_COLUMNS = ('events', 'in_population', 'barcoded', 'untransduced', 'unresol
 ANALYSIS_DEFAULTS = {
     'source': SOURCE_LIVE,
     'folder': None,
+    'linked_folders': [],
+    'date_covariate': True,
     'gates': [],
     'phenotypes': [],
     'congenic_split': False,
@@ -117,7 +129,7 @@ ANALYSIS_DEFAULTS = {
     'adjust': [],
     'split_by': '',
     'run_counts': True,
-    'run_freq': False,
+    'run_freq': True,
     'contrast_mode': 'reference',
     'reference': '',
     'pval_threshold': 0.05,
@@ -141,25 +153,26 @@ ANALYSIS_DEFAULTS = {
     'population_contrasts': False,
     'population_pairing': PAIR_BY_SAMPLE,
     'population_split': SPLIT_BY_GROUP,
-    'run_markers': False,
+    'run_markers': True,
     'marker_reference': 'tags',
     'marker_spillover': True,
     'marker_spillover_k': 'auto',
     'marker_channels': None,
     'marker_min_events': 10,
     'marker_threshold': 0.03,
-    'run_pathways': False,
+    'run_pathways': True,
     'pathway_min_size': 3,
     'pathway_rotations': 9999,
     'pathway_evidence': 'all',
     'pathway_names': {},
-    'run_gene_groups': False,
+    'run_gene_groups': True,
     'gene_group_table': [],
     'gene_group_file': '',
     'gene_group_areas': {},
     'gene_group_colours': {},
     'gene_group_order': [],
     'gene_group_comparisons': [],
+    'shift': {},
 }
 PATHWAY_EVIDENCE = ('all', 'experimental')
 
@@ -175,6 +188,8 @@ def analysis_settings(stored: dict | None) -> dict:
         out['source'] = SOURCE_EXPORTED
     if out['source'] not in SOURCES:
         out['source'] = SOURCE_LIVE
+    folders = out['linked_folders']
+    out['linked_folders'] = [str(f) for f in folders if f] if isinstance(folders, list) else []
     k = out['marker_spillover_k']
     if k != 'auto' and not (isinstance(k, (int, float)) and not isinstance(k, bool) and k >= 0):
         out['marker_spillover_k'] = 'auto'
@@ -393,8 +408,132 @@ def link_exports(folder, sample_keys: list, raw_subdir: str, display_names: dict
             current = sample_libraries.get(key) or 'no library'
             note = ' '.join(filter(None, [note, f"Exported as {kw['flowcodelibrary']}; counted as {current}."]))
         files[key] = {'path': str(path), 'status': status, 'note': note,
-                      'uncorrected': str(kw.get('flowcodecorrection', '')).strip().upper() == NO_CORRECTION_KEYWORD}
+                      'uncorrected': str(kw.get('flowcodecorrection', '')).strip().upper() == NO_CORRECTION_KEYWORD,
+                      'date': acquisition_date(kw)}
     unlinked = [str(p) for p in found if p not in used]
+    return {'files': files, 'unlinked': unlinked}
+
+
+# ---------------------------------------------------------------------------
+# Files of other experiments (other acquisition days)
+# ---------------------------------------------------------------------------
+
+def is_linked(key) -> bool:
+    """True for a sample that is a file linked from another experiment."""
+    return str(key).startswith(LINKED_PREFIX)
+
+
+def linked_key(path) -> str:
+    """Sample key of a linked file: its absolute path behind ``LINKED_PREFIX``."""
+    return LINKED_PREFIX + Path(path).resolve().as_posix()
+
+
+def acquisition_date(keywords: dict) -> str | None:
+    """The ``$DATE`` keyword of an FCS file (*keywords* as ``read_fcs_keywords``
+    gives them) as YYYY-MM-DD, or as written when no known format reads it;
+    None when the file has no date."""
+    raw = str(keywords.get('date') or '').strip()
+    if not raw:
+        return None
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return raw
+
+
+def file_dates(paths: dict) -> dict:
+    """{sample: acquisition date} of the files *paths* ({sample: path});
+    files that cannot be read or carry no date are left out."""
+    out = {}
+    for key, path in paths.items():
+        try:
+            date = acquisition_date(read_fcs_keywords(path))
+        except Exception:
+            continue
+        if date:
+            out[key] = date
+    return out
+
+
+def file_pnn(keywords: dict) -> list:
+    """Channel names ($PnN) of an FCS file from its keywords."""
+    try:
+        n = int(keywords.get('par') or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return [str(keywords.get(f'p{i}n') or '') for i in range(1, n + 1)]
+
+
+def linked_display_name(path, suffix: str) -> str:
+    """The sample name of an exported file: its file name without the
+    export's ``<suffix> (Unmixed)`` ending."""
+    stem = Path(path).stem
+    for tail in (f'{suffix} (Unmixed)', ' (Unmixed)'):
+        if tail and stem.endswith(tail):
+            return stem[:-len(tail)]
+    return stem
+
+
+def link_folders(folders, combos_keyword: str | None, required_channels, suffix: str, exclude=()) -> dict:
+    """
+    FlowCode exports of other experiments (e.g. the same cohort acquired on
+    other days, each day processed in its own experiment), in the shape
+    ``link_exports`` returns, keyed by ``linked_key``. Every FCS file under
+    each folder (searched recursively) that has FlowCode combination channels
+    is listed with a status:
+
+    * ``ok``
+    * ``unreadable``             — the file's header could not be read
+    * ``different combinations`` — ``FLOWCODECOMBOS`` differs from *combos_keyword*
+    * ``different channels``     — one of *required_channels* (this
+      experiment's unmixed channels) is missing, e.g. another panel
+
+    The characterisation is not checked: each experiment has its own. Each
+    entry also holds 'name' (the file name without the export's ending),
+    'date' (``acquisition_date``), 'folder' and 'library'
+    (``FLOWCODELIBRARY``, or None). Files at the paths in *exclude* (this
+    experiment's own exports) are skipped; FCS files without combination
+    channels are returned in 'unlinked'.
+    """
+    exclude = {Path(p).resolve() for p in exclude}
+    required = [c for c in required_channels if c]
+    files, unlinked = {}, []
+    for folder in folders:
+        root = Path(folder)
+        found = sorted(p for p in root.rglob('*.fcs') if not p.name.startswith('._')) if root.is_dir() else []
+        for path in found:
+            if path.resolve() in exclude:
+                continue
+            key = linked_key(path)
+            if key in files:
+                continue
+            entry = {'path': str(path), 'status': LINK_OK, 'note': '', 'uncorrected': False,
+                     'name': linked_display_name(path, suffix), 'date': None, 'folder': str(root), 'library': None}
+            try:
+                kw = read_fcs_keywords(path)
+            except Exception as exc:
+                entry.update(status=LINK_UNREADABLE, note=str(exc) or type(exc).__name__)
+                files[key] = entry
+                continue
+            pnn = file_pnn(kw)
+            if not combo_names_in_file(pnn):
+                unlinked.append(str(path))
+                continue
+            entry['date'] = acquisition_date(kw)
+            entry['library'] = kw.get('flowcodelibrary') or None
+            entry['uncorrected'] = str(kw.get('flowcodecorrection', '')).strip().upper() == NO_CORRECTION_KEYWORD
+            missing = [c for c in required if c not in pnn]
+            if combos_keyword is not None and kw.get('flowcodecombos', '') != combos_keyword:
+                entry.update(status=LINK_OTHER_COMBOS, note='Exported with a different combination table.')
+            elif missing:
+                more = f' and {len(missing) - 3} more' if len(missing) > 3 else ''
+                entry.update(status=LINK_OTHER_CHANNELS,
+                             note=f"Lacks this experiment's channel(s) {', '.join(missing[:3])}{more}.")
+            else:
+                entry['note'] = f"Linked; acquired {entry['date'] or 'on an unknown date'}."
+            files[key] = entry
     return {'files': files, 'unlinked': unlinked}
 
 
@@ -617,9 +756,9 @@ def count_populations(events: np.ndarray, pnn: list, sample_key: str, snapshot: 
     return out
 
 
-def count_sample_populations(path, sample_key: str, snapshot: SampleGating, populations: list,
-                             marker_channels=()) -> dict:
-    """``count_populations`` of an exported file."""
+def read_exported_events(path) -> tuple:
+    """(events, pnn) of an exported file; ValueError when it has no FlowCode
+    combination channels."""
     from honeychrome.controller_components.functions import sample_from_fcs
 
     sample = sample_from_fcs(str(path))
@@ -627,6 +766,13 @@ def count_sample_populations(path, sample_key: str, snapshot: SampleGating, popu
     events = np.asarray(sample.get_events(source='raw'), dtype=np.float64)
     if not combo_names_in_file(pnn):
         raise ValueError(f'{Path(path).name} has no FlowCode combination channels.')
+    return events, pnn
+
+
+def count_sample_populations(path, sample_key: str, snapshot: SampleGating, populations: list,
+                             marker_channels=()) -> dict:
+    """``count_populations`` of an exported file."""
+    events, pnn = read_exported_events(path)
     return count_populations(events, pnn, sample_key, snapshot, populations, marker_channels)
 
 

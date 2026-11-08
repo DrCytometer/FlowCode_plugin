@@ -433,7 +433,7 @@ def donut_figure(alloc: pd.DataFrame, colours: dict, is_dark: bool = False, popu
     total = int(view['guides'].sum())
     ink = '#eeeeee' if is_dark else '#222222'
     muted = '#aaaaaa' if is_dark else '#666666'
-    surface = '#2b2b2b' if is_dark else 'white'
+    surface = dp.figure_background(is_dark)
     colour_of = dict(colours)
     colour_of.update({CONTROL_SLICE: CONTROL_COLOUR, UNASSIGNED_SLICE: UNASSIGNED_COLOUR})
     names, sizes = list(view['group']), [int(n) for n in view['guides']]
@@ -564,8 +564,8 @@ def _spoke_label(ax, angle: float, radius: float, text: str, colour: str):
     ``SPOKE_LABEL_WIDTH`` characters a line and aligned away from the web
     (left-aligned on the right, right-aligned on the left, centred at the
     top and bottom), so long names neither cross the plot nor get cut.
-    The label is left out of the layout; ``_fit_spider`` makes room
-    for it."""
+    ``_fit_spider`` makes room for it; it stays in the layout so a trimmed
+    export (``bbox_inches='tight'``) keeps it."""
     import textwrap
 
     across, up = np.sin(angle), np.cos(angle)
@@ -573,7 +573,6 @@ def _spoke_label(ax, angle: float, radius: float, text: str, colour: str):
     va = 'bottom' if up > 0.2 else 'top' if up < -0.2 else 'center'
     label = ax.text(angle, radius, textwrap.fill(text, SPOKE_LABEL_WIDTH, break_on_hyphens=False), ha=ha, va=va,
                     ma=ha if ha != 'center' else 'center', fontsize=8, color=colour, clip_on=False)
-    label.set_in_layout(False)
     return label
 
 
@@ -638,7 +637,7 @@ def spider_figure(result: dict, comparisons: list, colours: dict, label_colours:
     lim = float(np.nanmax(np.abs(view['score'].astype(float)))) if not view.empty else 1.0
     lim = _nice_limit(max(lim, 1.0))
     fg = '#eeeeee' if is_dark else '#222222'
-    face = '#2b2b2b' if is_dark else 'white'
+    face = dp.figure_background(is_dark)
     angles = np.linspace(0.0, 2.0 * np.pi, len(order), endpoint=False)
     fig = Figure(figsize=(8.6, 8.4))
     ax = fig.add_subplot(111, projection='polar')

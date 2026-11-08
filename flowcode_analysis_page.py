@@ -21,6 +21,10 @@ Sections
                 pairing, split, thresholds
     Results     results table and figures per comparison, comparison
                 heatmap, sample PCA, QC, and the marker tabs of one group
+    Phenotype shift
+                whether each guide's cells move to other phenotypes
+                (cluster fingerprints against the tag model), with its own
+                settings, run and figures (flowcode_shift_view.py)
     Export      CSV tables, figures and a PDF report in a folder named after
                 the populations
 
@@ -76,10 +80,12 @@ from honeychrome.view_components.copyable_table_widget import CopyableTableWidge
 from honeychrome.view_components.help_toggle_widget import WheelBlocker
 
 import flowcode_analysis as fa
+import flowcode_count_cache as fcnt
 import flowcode_figure_panel as fcfp
 import flowcode_gating_view as fcgv
 import flowcode_gene_groups as fgg
 import flowcode_pathways as fpw
+import flowcode_shift_view as fshv
 import flowcode_stats as fst
 import flowcode_view_stack as fvs
 from flowcode_state import NO_FRET_WARNING, OTHER_LIBRARY, library_label
@@ -108,7 +114,7 @@ SAMPLE_COLUMN_MAX_WIDTH = 280
 COVARIATE_COLUMN_MIN_WIDTH = 110
 HEATMAP_ORDERS = {'effect': 'By effect', 'alphabetical': 'Alphabetical'}
 # Figures over every comparison, kept when only the chosen comparison changes.
-SUMMARY_FIGURES = ('comparison_heatmap', 'sample_pca', 'qc')
+SUMMARY_FIGURES = ('comparison_heatmap', 'comparison_heatmap_freq', 'sample_pca', 'qc')
 # Marker test tabs, drawn for the chosen marker group.
 MARKER_FIGURES = ('marker_table', 'marker_heatmap', 'marker_volcano', 'marker_combination')
 # Pathway tabs, after the marker tabs: the dot plot over every comparison,
@@ -138,7 +144,7 @@ RESTORE_TOOLTIP = 'Put these settings back to their default values.'
 # again to saved results.
 STATS_INPUT_EXCLUDED = ('heatmap_order', 'heatmap_rows', 'n_loadings', 'export_root', 'group_colors',
                         'group_patterns', 'counts', 'gene_group_file', 'gene_group_areas', 'gene_group_colours',
-                        'gene_group_order', 'gene_group_comparisons') + THRESHOLD_KEYS
+                        'gene_group_order', 'gene_group_comparisons', 'shift') + THRESHOLD_KEYS
 RESTORING_TEXT = 'Reading the saved results.'
 STALE_TEXT = ('Out of date: these saved results were made with other counts or settings. Run statistics again '
               'to update them.')
@@ -203,6 +209,22 @@ HELP = (
     '<i>Exported files</i> reads the files section 5 wrote: each sample is linked to its file by the '
     '<tt>FLOWCODESOURCE</tt> keyword, or by the export\'s file name, and files exported with a different '
     'combination table, or with an earlier characterisation, are listed but not used unless ticked.</p>'
+    '<p><b>Other experiments.</b> When a cohort is acquired over several days, each day with its own '
+    'controls, process each day in its own experiment (sections 1 to 5) and export its samples. Then, in one '
+    'of these experiments, choose <i>Exported files</i> and add the other days\' export folders under '
+    '<i>Other experiments</i>. Their files are counted with this experiment\'s samples, named by their file '
+    'names, and gated with this experiment\'s unmixed gates (the template boundaries: sample overrides exist '
+    'only for this experiment\'s samples, and the Gating tab shows only its samples). A file is used only when '
+    'it has the same combination table (<tt>FLOWCODECOMBOS</tt>) and every unmixed channel of this '
+    'experiment; with several libraries, its <tt>FLOWCODELIBRARY</tt> must name a library of this experiment. '
+    'Live unmix and phenotypes do not use linked files.</p>'
+    '<p><b>Acquisition date.</b> When the samples were acquired on more than one day (the files\' '
+    '<tt>$DATE</tt>), a covariate <i>acquisition date</i> is filled in on the Groups tab and ticked under '
+    '<i>Adjust for</i>, so that day-to-day differences in staining, acquisition and FlowCode processing are '
+    'not taken for group effects. When samples are paired by mouse and each mouse was acquired on one day, '
+    'the pairing already accounts for the day and the covariate is left out of the model. When every sample '
+    'of a group was acquired on one day and another group on another, day and group cannot be told apart and '
+    'the statistics say so. Values typed by hand are kept; removing the covariate stops the filling.</p>'
     '<p><b>Data.</b> Tick the populations in the unmixed gating tree; each ticked gate is counted as a population of '
     'its own (e.g. CD8 and Tconv, or Naive, Activated and Resident). Only the '
     'gate <i>boundaries</i> come from the experiment: they are applied to the FlowCode-corrected '
@@ -212,19 +234,28 @@ HELP = (
     'can be checked. Unstained samples, single-stain controls (also copies of them elsewhere in the raw '
     'folder, matched by file name) and bead samples are left out unless their <i>Include</i> tick box is '
     'ticked. <b>Phenotypes</b> are populations without a gate: a marker definition (CD3+ CD4+ FoxP3+ CD8-, '
-    'from the plugin\'s <tt>flowcode_phenotypes.csv</tt> or Honeycluster\'s cell-type database) resolved '
+    'from Honeychrome\'s cell-type database) resolved '
     'against the antigens of the spectral model, where every event inside the FlowCode gates gets a '
     'membership between 0 and 1 (each marker is a soft threshold at 3 SD of the sample\'s negative, from the '
-    'AF library\'s envelope and the spillover spread) and the counts are memberships summed. A definition '
-    'is unresolved when a positive marker is not in the panel; a negative marker that is not is left '
-    'unchecked, and the viability dye is added when there is one. <i>Split by congenic marker</i> counts each '
+    'AF library\'s envelope and the spillover spread) and the counts are memberships summed. Only the '
+    'markers on the panel have a say: a marker the panel lacks is left unchecked, and the viability dye is '
+    'added when there is one. Definitions that read the same on this panel (for example alpha-beta and '
+    'gamma-delta T cells without the TCRs) are one phenotype, named by its signs and its members; the tooltip '
+    'says which markers would separate them. <i>Split by congenic marker</i> counts each '
     'ticked phenotype as its CD45.1+ CD45.2- and CD45.1- CD45.2+ variants when the panel carries both. '
     'Phenotypes need <i>Live unmix</i>, and their fractional counts take the Frequencies test only; the Gating '
     'tab can highlight a phenotype\'s events (membership at least one half) over the gates. '
     '<b>Select all</b> and <b>Deselect all</b> tick or untick every sample in the table. '
     '<b>Count events</b> gates every sample and counts its events per combination in each population, '
     'and sums each combination\'s marker intensities for the marker test; the counts are kept with the '
-    'experiment and the marker sums in its <tt>cache/flowcode_analysis</tt> folder.</p>'
+    'experiment and the marker sums in its <tt>cache/flowcode_analysis</tt> folder. To make counting again fast, '
+    'the first count keeps, for each sample, only what counting uses: the events inside the gate above every '
+    'counted population that is drawn on scatter, Time or the viability dye (usually the viable gate), with the '
+    'channels gates are drawn on (and, for barcoded events, the marker channels), in '
+    '<tt>cache/flowcode_analysis/count_events</tt>. Later counts read only these, so redrawing gates below that '
+    'gate or ticking other populations under it needs no unmixing; a sample is read in full again when its file, '
+    'the unmixing, that gate or a gate above it changes, or a gate is drawn on a channel not kept. Counts with '
+    'phenotypes ticked read every sample in full.</p>'
     '<p><b>Inclusion rules</b> (applied in this order): unticked combinations are left out; combinations '
     'with fewer events than the minimum, summed over all samples, are left out; samples with fewer '
     'barcoded events than the minimum are left out. Frequencies are among barcoded cells of the '
@@ -237,15 +268,16 @@ HELP = (
     'in every figure.</p>'
     '<p><b>Statistics.</b> <i>Counts</i>: a negative-binomial GLM per combination with the sample\'s '
     'library size as offset; each sample is weighted by its cell number, so small samples count for '
-    'less. The <i>quasi-likelihood F test</i> (default) shrinks the dispersions towards a common value. On '
-    'random splits of inbred mice with plenty of events (BATF chimeras, where nothing differed) it found 3–7 % '
-    'false positives at p < 0.05 instead of 5 %; on gated populations of a human cohort it found 7–11 % for '
-    'populations under 100 events, because donors vary more than the model allows for. The <i>Wald test</i> '
-    'uses each combination\'s own dispersion and is not recommended: 21–31 % on the same mice and 10–13 % on '
-    'the human cohort. With few barcoded cells per sample '
-    '(about 100, e.g. brain) the quasi-likelihood test corrects for the low counts but stays slightly liberal '
-    '(about 6–7 % false positives at p < 0.05 instead of 5 %); a fold-change threshold with TREAT keeps the hits '
-    'reliable. <i>Frequencies</i>: a moderated '
+    'less. The <i>quasi-likelihood F test</i> (default) fits each comparison on the samples of its two groups, '
+    'and gives each combination a dispersion (its extra sample-to-sample noise) taken from the combinations '
+    'with similar counts, so rare combinations are not treated as quieter than they are. On random splits of '
+    'inbred mice with plenty of events (BATF chimeras, where nothing differed) it found 3–6 % false positives '
+    'at p < 0.05 instead of 5 %, and 2–4 % on FlowCode mice with tissue labels swapped within each mouse; on '
+    'gated populations of a human cohort it found 7–10 % for populations under 100 events, because donors '
+    'vary more than the model allows for. The <i>Wald test</i> uses each combination\'s own dispersion and is '
+    'not recommended: 21–31 % on the same mice and 10–13 % on the human cohort. With few barcoded cells per '
+    'sample (about 100, e.g. brain) the quasi-likelihood test stays close to 5 % (5 % on average, at most 7 % '
+    'in one tissue); a fold-change threshold with TREAT keeps the hits reliable. <i>Frequencies</i>: a moderated '
     'linear model on log2 % of the library size (half an event added to every count). '
     '<i>Normalisation</i> sets the library size: <i>Robust</i> (default) rescales the barcoded events by a '
     'trimmed ratio of sums, so a few expanded clones do not push every other combination down; '
@@ -344,6 +376,10 @@ HELP = (
     'first group; outside the dashed ring the knockouts are depleted; a filled point passes the competitive FDR, a '
     'ringed one the any-change FDR. Double-click a point, or a row of the <i>Gene group table</i>, to show that '
     'group\'s guides in <i>Gene group members</i>.</p>'
+    '<p><b>Phenotype shift</b> (tab after Results): whether the mix of phenotypes among a guide\'s cells differs '
+    'from what its tags predict in the same mouse, how large the shift is (the shift angle) and towards which '
+    'clusters, for each ticked population and sample group; it has its own settings, run, help and saved '
+    'results, and is added to the export when current.</p>'
     '<p><b>Gating</b> (first tab, view only): the experiment\'s Unmixed Data plots and gates over the '
     'FlowCode-unmixed events of the sample picked in the sample browser, gated exactly as the counts (sample '
     'overrides included), in three views: <i>Uncorrected</i> (the experiment\'s own unmix of the raw file), '
@@ -355,7 +391,9 @@ HELP = (
     'reopened, with the current thresholds. It is marked <i>Out of date</i> (and cannot be exported) when the counts '
     'or other settings have changed since; run statistics again to update it. <i>View</i> chooses the table or '
     'figure shown, listed under the comparison, all comparisons, markers, pathways and gene groups; the arrows '
-    'step to the previous or next one. With the marker test, the <i>Markers</i> menu chooses the group whose combination × '
+    'step to the previous or next one. The <i>Comparison heatmap</i> shows every comparison\'s significant '
+    'log2 fold changes from the Counts test (from the Frequencies test when Counts is not run); with both tests '
+    'run, <i>Comparison heatmap (frequencies)</i> shows the same from the Frequencies test. With the marker test, the <i>Markers</i> menu chooses the group whose combination × '
     'marker heatmap, volcano and table are shown (independent of the <i>Comparison</i> menu). Double-click a '
     'marker volcano point or a marker table row to plot that combination and marker in every sample '
     '(<i>Marker</i> view: each sample\'s reference and combination means joined by a line).</p>'
@@ -440,6 +478,7 @@ class AnalysisPage(QWidget):
         self._filling = False
         self.links = None
         self._links_key = None
+        self._linked_names = {}
         self.counts = None
         self.meta = None
         self.qc = None
@@ -451,6 +490,7 @@ class AnalysisPage(QWidget):
         self._hierarchy_key = None
         self._phenotype_key = None
         self._phenotypes = {}
+        self._phenotype_aliases = {}
         self._count_token = None
         self._combination = None
         self._markers_key = ()
@@ -493,6 +533,8 @@ class AnalysisPage(QWidget):
         self._build_groups(self._add_section('Groups'))
         self._build_stats(self._add_section('Statistics'))
         self._build_results(self._add_section('Results', scroll=False))
+        self.shift_view = fshv.ShiftSection(self)
+        self.section_tabs.addTab(self.shift_view, 'Phenotype shift')
         self._build_export(self._add_section('Export'))
         titles = [self.section_tabs.tabText(i) for i in range(self.section_tabs.count())]
         opened = str(plugin.qsettings.value(f'open_section_{SECTION}_title', 'Data') or 'Data')
@@ -514,6 +556,7 @@ class AnalysisPage(QWidget):
         """Forget everything held for the previous experiment."""
         self.links = None
         self._links_key = None
+        self._linked_names = {}
         self.counts = self.meta = self.qc = self.filtered = None
         self.stats = None
         self.figures = {}
@@ -522,6 +565,7 @@ class AnalysisPage(QWidget):
         self._hierarchy_key = None
         self._phenotype_key = None
         self._phenotypes = {}
+        self._phenotype_aliases = {}
         self._combination = None
         self._markers_key = ()
         self._markers = None
@@ -537,6 +581,7 @@ class AnalysisPage(QWidget):
         self.loo_status.setText('')
         self._clear_figure_tabs()
         self._show_auto_note(None)
+        self.shift_view.reset_session()
 
     # -- frame ---------------------------------------------------------------
 
@@ -657,8 +702,39 @@ class AnalysisPage(QWidget):
     def _controller(self):
         return self.plugin.controller
 
+    def figure_options_store(self):
+        """The experiment's figure options (figure_options), or None."""
+        from honeychrome.view_components import figure_options as fo
+        return fo.store_for(self.plugin.controller)
+
+    @staticmethod
+    def _report_figure_key(name: str) -> str:
+        """The figure options key of a report figure: the key of the same
+        figure on the Analysis page."""
+        fixed = {'QC': 'qc', 'Comparison heatmap': 'comparison_heatmap',
+                 'Comparison heatmap (frequencies)': 'comparison_heatmap_freq',
+                 'Phenotype shift summary heatmap': 'shift_summary_heatmap',
+                 'Pathway dot plot': 'pathway_dot_plot', 'Guide allocation': 'guide_allocation',
+                 'Gene group spider': 'gene_group_spider'}
+        if name in fixed:
+            return fixed[name]
+        if name.startswith('Sample PCA'):
+            return 'sample_pca'
+        tail = name.rsplit(' - ', 1)[-1]
+        if name.startswith('Markers '):
+            return f'marker_{tail}'
+        if tail.startswith('pathway '):
+            return 'pathway_members'
+        if tail.startswith('gene group '):
+            return 'gene_group_members'
+        return tail.replace(' ', '_')
+
     def _display_names(self) -> dict:
-        return dict(self._controller().experiment.samples.get('all_samples', {}) or {})
+        """{sample: name} of the experiment's samples and of the files
+        linked from other experiments."""
+        names = dict(self._controller().experiment.samples.get('all_samples', {}) or {})
+        names.update(self._linked_names)
+        return names
 
     def _name(self, key: str) -> str:
         return self._display_names().get(key, Path(str(key)).stem)
@@ -699,9 +775,11 @@ class AnalysisPage(QWidget):
         return fp.panel_from_spectral_model(c.experiment.process.get('spectral_model') or [], fcm.fcc_fluor_names(c))
 
     def resolved_phenotypes(self) -> dict:
-        """``{definition key: Resolved | Unresolved}`` of every known
-        definition on this panel; resolved again when the panel's
-        fluorophores or antigens, or the definitions, change."""
+        """``{phenotype key: Resolved | Unresolved}`` of the cell-type
+        database on this panel, definitions the panel cannot tell apart
+        grouped into one phenotype (``flowcode_phenotype.phenotype_groups``);
+        resolved again when the panel's fluorophores or antigens, or the
+        definitions, change."""
         import flowcode_phenotype as fp
         try:
             panel = self._panel()
@@ -709,7 +787,7 @@ class AnalysisPage(QWidget):
             key = (panel.fluorophores, tuple(sorted(panel.antigens.items())), tuple(definitions))
             if key != self._phenotype_key:
                 self._phenotype_key = key
-                self._phenotypes = {d.key: fp.resolve(d, panel) for d in definitions}
+                self._phenotypes, self._phenotype_aliases = fp.phenotype_groups(definitions, panel)
             return dict(self._phenotypes)
         except Exception as exc:
             logger.warning('FlowCode analysis: phenotype definitions could not be resolved: %s', exc)
@@ -725,11 +803,12 @@ class AnalysisPage(QWidget):
         congenic split, each becomes its CD45.1 and CD45.2 variants when the
         panel carries both markers."""
         import flowcode_phenotype as fp
-        chosen = set(self.settings.get('phenotypes') or []) if keys is None else set(keys)
+        resolved = self.resolved_phenotypes()
+        chosen = set(self._current_keys(self.settings.get('phenotypes') if keys is None else keys))
         split = self.congenic_split()
         panel = self._panel() if split else None
         out = {}
-        for key, res in self.resolved_phenotypes().items():
+        for key, res in resolved.items():
             if key not in chosen or not isinstance(res, fp.Resolved):
                 continue
             variants = fp.split_congenic(res, panel) if split else {}
@@ -738,6 +817,12 @@ class AnalysisPage(QWidget):
             else:
                 out[res.definition.cell_type] = res
         return out
+
+    def _current_keys(self, keys) -> list:
+        """*keys* as keys of the current phenotypes: a definition now grouped
+        with others, or one renamed, is carried over to its phenotype."""
+        aliases = self._phenotype_aliases
+        return list(dict.fromkeys(aliases.get(k, k) for k in (keys or [])))
 
     def ticked_phenotypes(self) -> dict:
         """``{population name: Resolved}`` of the ticked, resolved definitions (split when asked)."""
@@ -768,7 +853,7 @@ class AnalysisPage(QWidget):
     def _fill_phenotype_list(self):
         import flowcode_phenotype as fp
         resolved = self.resolved_phenotypes()
-        chosen = [k for k in (self.settings.get('phenotypes') or []) if k in resolved]
+        chosen = [k for k in self._current_keys(self.settings.get('phenotypes')) if k in resolved]
         if chosen != list(self.settings.get('phenotypes') or []):
             self.settings['phenotypes'] = chosen
         filling, self._filling = self._filling, True
@@ -777,12 +862,16 @@ class AnalysisPage(QWidget):
             self.phenotype_list.clear()
             for key, res in resolved.items():
                 d = res.definition
-                it = QListWidgetItem(f'{d.key}: {d.text()}')
+                it = QListWidgetItem(d.key if len(d.members) > 1 else f'{d.key}: {d.text()}')
                 it.setData(Qt.UserRole, key)
                 if isinstance(res, fp.Resolved):
                     it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
                     it.setCheckState(Qt.Checked if key in chosen else Qt.Unchecked)
-                    it.setToolTip(res.summary() + f' ({d.source})')
+                    tip = res.summary() + f' ({d.source})'
+                    if d.separated_by:
+                        tip += ('\nThis panel cannot tell these cell types apart; staining for '
+                                + ', '.join(d.separated_by) + ' would.')
+                    it.setToolTip(tip)
                 else:
                     it.setFlags(Qt.ItemIsUserCheckable)
                     it.setCheckState(Qt.Unchecked)
@@ -857,6 +946,11 @@ class AnalysisPage(QWidget):
         assigned. Always None with one library."""
         if not self.multi_library():
             return None
+        if fa.is_linked(sample):
+            # A linked file carries its library (FLOWCODELIBRARY); it counts
+            # only when this experiment has a library of that name.
+            lib = (((self.links or {}).get('files') or {}).get(sample) or {}).get('library')
+            return lib if lib in self.library_labels() else None
         lib = self.plugin.state.library_of(sample)
         if lib is None and sample not in self._library_samples():
             return OTHER_LIBRARY
@@ -901,13 +995,17 @@ class AnalysisPage(QWidget):
     def _left_out_note(self) -> str:
         """The samples left out of the counts for having no library."""
         other = [self._name(s) for s, lib in self._left_out.items() if lib == OTHER_LIBRARY]
-        none = [self._name(s) for s, lib in self._left_out.items() if lib != OTHER_LIBRARY]
+        none = [self._name(s) for s, lib in self._left_out.items() if lib != OTHER_LIBRARY and not fa.is_linked(s)]
+        linked = [self._name(s) for s, lib in self._left_out.items() if lib != OTHER_LIBRARY and fa.is_linked(s)]
         parts = []
         if other:
             parts.append('Samples assigned to Other have no guides and were left out: ' + ', '.join(other) + '.')
         if none:
             parts.append('Samples without a library were left out (assign them in section 2, Tags & Combos): '
                          + ', '.join(none) + '.')
+        if linked:
+            parts.append('Linked files whose library (FLOWCODELIBRARY) is not a library of this experiment were '
+                         'left out: ' + ', '.join(linked) + '.')
         return ' '.join(parts)
 
     def status_summary(self) -> tuple:
@@ -966,7 +1064,27 @@ class AnalysisPage(QWidget):
             b.clicked.connect(slot)
             row.addWidget(b)
         bl.addLayout(row)
+        linked_row = QHBoxLayout()
+        linked_label = QLabel('Other experiments:')
+        linked_label.setAlignment(Qt.AlignTop)
+        linked_row.addWidget(linked_label)
+        self.linked_list = QListWidget()
+        self.linked_list.setMaximumHeight(80)
+        self.linked_list.setToolTip('Export folders (section 5) of other experiments of the same study, e.g. '
+                                    'samples acquired on other days with their own controls. Their files are '
+                                    'counted with this experiment\'s samples, gated with this experiment\'s '
+                                    'unmixed gates.')
+        linked_row.addWidget(self.linked_list, stretch=1)
+        linked_buttons = QVBoxLayout()
+        for text, slot in (('Add folder…', self._on_add_linked), ('Remove', self._on_remove_linked)):
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            linked_buttons.addWidget(b)
+        linked_buttons.addStretch()
+        linked_row.addLayout(linked_buttons)
+        bl.addLayout(linked_row)
         self.link_note = _label('')
+        self.link_note.setWordWrap(True)
         bl.addWidget(self.link_note)
         lay.addWidget(box)
 
@@ -1111,6 +1229,31 @@ class AnalysisPage(QWidget):
         self._changed()
         self.rescan()
 
+    def _on_add_linked(self):
+        folder = QFileDialog.getExistingDirectory(self, "Export folder of another experiment's FlowCode files",
+                                                  str(self.export_folder().parent))
+        if not folder:
+            return
+        folders = list(self.settings.get('linked_folders') or [])
+        if folder in folders:
+            return
+        if Path(folder).resolve() == Path(self.export_folder()).resolve():
+            QMessageBox.information(self, 'Other experiments', "This is this experiment's own export folder.")
+            return
+        self.settings['linked_folders'] = folders + [folder]
+        self._changed()
+        self.rescan()
+
+    def _on_remove_linked(self):
+        folders = list(self.settings.get('linked_folders') or [])
+        row = self.linked_list.currentRow()
+        if not 0 <= row < len(folders):
+            return
+        del folders[row]
+        self.settings['linked_folders'] = folders
+        self._changed()
+        self.rescan()
+
     def _on_rule(self, key, value):
         if self._filling:
             return
@@ -1209,6 +1352,10 @@ class AnalysisPage(QWidget):
                 return
             self._links_key = key
             self.links = fa.live_links(keys, c.experiment_dir, af_ok)
+            self._linked_names = {}
+            for k, date in fa.file_dates({k: v['path'] for k, v in self.links['files'].items() if v['path']}).items():
+                self.links['files'][k]['date'] = date
+            self._update_date_covariate()
             return
         folder = self.export_folder()
         design = self._current_design()
@@ -1224,13 +1371,64 @@ class AnalysisPage(QWidget):
             characterisation = None
         libraries = {k: self.library_of(k) for k in keys} if self.multi_library() else None
         key = ('exported', str(folder), tuple(keys), combos_kw, characterisation,
-               tuple(sorted((libraries or {}).items(), key=lambda kv: kv[0])))
+               tuple(sorted((libraries or {}).items(), key=lambda kv: kv[0])),
+               tuple(self.settings.get('linked_folders') or []))
         if key == self._links_key and self.links is not None:
             return
         self._links_key = key
+        self._linked_names = {}
         raw_subdir = c.experiment.settings['raw']['raw_samples_subdirectory']
         self.links = fa.link_exports(folder, keys, raw_subdir, self._display_names(),
                                      self.plugin.export_name_suffix(), combos_kw, characterisation, libraries)
+        self._link_other_experiments(combos_kw)
+        self._update_date_covariate()
+
+    def _link_other_experiments(self, combos_kw):
+        """Add the exported files in the other experiments' folders
+        (``linked_folders``) to the links, each named by its file, with its
+        acquisition date (else its folder) added when the name is taken."""
+        own_folder = Path(self.export_folder()).resolve()
+        folders = [f for f in self.settings.get('linked_folders') or [] if f and Path(f).resolve() != own_folder]
+        if not folders:
+            return
+        files = self.links['files']
+        own = [info['path'] for info in files.values() if info.get('path')]
+        required = list(self._controller().experiment.settings['unmixed']['event_channels_pnn'])
+        linked = fa.link_folders(folders, combos_kw, required, self.plugin.export_name_suffix(), exclude=own)
+        taken = set(self._display_names().values())
+        for key, info in linked['files'].items():
+            name = info['name']
+            if name in taken:
+                name = f"{name} ({info.get('date') or Path(info['folder']).name})"
+            taken.add(name)
+            self._linked_names[key] = name
+        files.update(linked['files'])
+        linked_paths = {Path(info['path']).resolve() for info in linked['files'].values()}
+        self.links['unlinked'] = ([p for p in self.links['unlinked'] if Path(p).resolve() not in linked_paths]
+                                  + linked['unlinked'])
+
+    def _update_date_covariate(self):
+        """Fill the acquisition-date covariate from the files' $DATE when
+        the samples were acquired on more than one day. Values typed by hand
+        are kept. A newly made covariate is ticked under Adjust for (unless it
+        is the pairing or split); removing it stops the automatic filling."""
+        s = self.settings
+        if not s.get('date_covariate', True) or self.links is None:
+            return
+        dates = {k: info['date'] for k, info in self.links['files'].items() if info.get('path') and info.get('date')}
+        if len(set(dates.values())) < 2:
+            return
+        covariates = s.setdefault('covariates', {})
+        created = fa.DATE_COVARIATE not in covariates
+        values = covariates.setdefault(fa.DATE_COVARIATE, {})
+        added = {k: d for k, d in dates.items() if not str(values.get(k) or '').strip()}
+        if not added and not created:
+            return
+        values.update(added)
+        in_design = (s.get(self._design_key('pairing')), s.get(self._design_key('split_by')))
+        if created and fa.DATE_COVARIATE not in in_design and fa.DATE_COVARIATE not in (s.get('adjust') or []):
+            s['adjust'] = list(s.get('adjust') or []) + [fa.DATE_COVARIATE]
+        self._changed()
 
     def used_files(self) -> dict:
         """{sample: path} of the linked files ticked for use, in experiment order."""
@@ -1277,13 +1475,17 @@ class AnalysisPage(QWidget):
                                       'source, or untick them.')
             return
         signature = fa.counts_signature(files, gates, snapshot.signature())
+        folder, fluors, viability = self._compact_inputs()
+        source_keys = {key: json.dumps([str(path), fa.file_signature(path)]) for key, path in files.items()}
 
         def work(progress):
-            records, errors = {p: {} for p in populations}, {}
+            records, errors, read = {p: {} for p in populations}, {}, 0
             for i, (key, path) in enumerate(files.items()):
                 progress(i, len(files), Path(path).name)
                 try:
-                    counted = fa.count_sample_populations(path, key, snapshot, gates, markers)
+                    counted, full = fcnt.count_sample(key, lambda path=path: fa.read_exported_events(path), snapshot,
+                                                      gates, markers, folder, source_keys[key], fluors, viability)
+                    read += int(full)
                     for pop in populations:
                         records[pop][key] = counted[pop]
                 except Exception as exc:
@@ -1291,7 +1493,7 @@ class AnalysisPage(QWidget):
             progress(len(files), len(files), '')
             fa.save_marker_sums(cache, signature, records, populations)
             return {'records': records, 'errors': errors, 'signature': signature, 'populations': populations,
-                    'source': fa.SOURCE_EXPORTED}
+                    'source': fa.SOURCE_EXPORTED, 'read_full': read}
 
         if self.plugin._start_task('analysis_count', work):
             self.count_btn.setEnabled(False)
@@ -1336,21 +1538,31 @@ class AnalysisPage(QWidget):
         signature = fa.counts_signature(files, gates, snapshot.signature(), unmixing,
                                         [res.signature_parts() for res in phenotypes.values()])
         cache_keys = {key: fce.live_cache_key(unmixing, key, fce.file_signature(path)) for key, path in files.items()}
+        folder, fluors, viability = self._compact_inputs()
+
+        def unmixed(key):
+            events = fce.live_sample_events(
+                inputs['layout'], inputs['af_by_sample'][key], inputs['unmix_fn'], key, inputs['pnn'],
+                inputs['n_extra'], cache_key=cache_keys[key], max_cache_bytes=inputs['max_cache_bytes'])
+            return np.asarray(events, dtype=np.float64), list(inputs['pnn'])
 
         def work(progress):
-            records, errors = {p: {} for p in populations}, {}
+            records, errors, read = {p: {} for p in populations}, {}, 0
             for i, key in enumerate(keys):
                 progress(i, len(keys), Path(key).stem)
                 try:
-                    events = fce.live_sample_events(
-                        inputs['layout'], inputs['af_by_sample'][key], inputs['unmix_fn'], key, inputs['pnn'],
-                        inputs['n_extra'], cache_key=cache_keys[key], max_cache_bytes=inputs['max_cache_bytes'])
-                    counted = fa.count_populations(np.asarray(events, dtype=np.float64), inputs['pnn'], key,
-                                                   snapshot, populations if phenotypes else gates, markers,
-                                                   phenotypes=sample_phenotypes(key), gate_records=gate_records)
+                    if phenotypes:
+                        events, pnn = unmixed(key)
+                        counted = fa.count_populations(events, pnn, key, snapshot, populations, markers,
+                                                       phenotypes=sample_phenotypes(key), gate_records=gate_records)
+                        read += 1
+                        del events
+                    else:
+                        counted, full = fcnt.count_sample(key, lambda key=key: unmixed(key), snapshot, gates, markers,
+                                                          folder, cache_keys[key], fluors, viability)
+                        read += int(full)
                     for pop in populations:
                         records[pop][key] = counted[pop]
-                    del events
                 except Exception as exc:
                     logger.exception('FlowCode live unmix failed for %s', key)
                     errors[key] = str(exc) or type(exc).__name__
@@ -1358,7 +1570,7 @@ class AnalysisPage(QWidget):
             fa.save_marker_sums(cache, signature, records, populations)
             return {'records': records, 'errors': errors, 'signature': signature, 'populations': populations,
                     'phenotypes': {name: res.summary() for name, res in phenotypes.items()},
-                    'source': fa.SOURCE_LIVE, 'method': inputs['plan'].label}
+                    'source': fa.SOURCE_LIVE, 'method': inputs['plan'].label, 'read_full': read}
 
         if self.plugin._start_task('analysis_count', work):
             self._count_token = token
@@ -1366,6 +1578,13 @@ class AnalysisPage(QWidget):
             self.count_status.setText(f'Unmixing and counting {len(keys)} sample(s) ({inputs["plan"].label})…')
         elif token is not None:
             token.release()
+
+    def _compact_inputs(self) -> tuple:
+        """(folder, fluorophores, viability dyes) for the compact count cache
+        (``flowcode_count_cache``), on the main thread."""
+        panel = self._panel()
+        return (fcnt.cache_folder(self._controller().experiment_dir), list(panel.fluorophores),
+                list(panel.viability))
 
     def _release_count_token(self):
         token, self._count_token = self._count_token, None
@@ -1388,6 +1607,9 @@ class AnalysisPage(QWidget):
         what = 'sample(s), unmixed live' if result.get('source') == fa.SOURCE_LIVE else 'file(s)'
         n_counted = len(next(iter(result['records'].values()), {}))
         text = f"Counted {n_counted} {what} in {', '.join(result['populations'])}."
+        if 'read_full' in result:
+            text += (f" {result['read_full']} read in full, the others from the kept events "
+                     '(cache/flowcode_analysis/count_events).')
         if errors:
             text += ' Could not count: ' + '; '.join(f'{self._name(k)} ({m})' for k, m in errors.items())
         self.count_status.setText(text)
@@ -1477,8 +1699,15 @@ class AnalysisPage(QWidget):
             else:
                 self.source_note.setText('')
             self.folder_label.setText(str(self.export_folder()))
+            self.linked_list.clear()
+            for folder in s.get('linked_folders') or []:
+                self.linked_list.addItem(folder)
             links = self.links or {'files': {}, 'unlinked': []}
             notes = []
+            n_linked = sum(1 for k in links['files'] if fa.is_linked(k))
+            if s.get('linked_folders'):
+                notes.append(f'{n_linked} file(s) linked from other experiments, gated with this experiment\'s '
+                             'unmixed gates (without per-sample overrides).')
             if links['unlinked']:
                 notes.append(f"{len(links['unlinked'])} file(s) in the folder match no sample: "
                              + ', '.join(Path(p).name for p in links['unlinked'][:5])
@@ -1647,6 +1876,15 @@ class AnalysisPage(QWidget):
                         (assign, self._on_assign_by_pattern),
                         (QPushButton('Suggest groupings…'), self._on_suggest_groupings)):
             b.clicked.connect(slot)
+            brow.addWidget(b)
+        for text, step, tip in (('▲', -1, 'Move the selected group up.'),
+                                ('▼', 1, 'Move the selected group down.')):
+            b = QPushButton(text)
+            b.setFixedWidth(32)
+            b.setToolTip(tip + ' The group order is the order used in the Reference list, '
+                         'comparisons between every pair (the earlier group is the baseline) '
+                         'and every figure.')
+            b.clicked.connect(lambda _c=False, s=step: self._on_move_group(s))
             brow.addWidget(b)
         brow.addStretch()
         gl.addLayout(brow)
@@ -1911,6 +2149,21 @@ class AnalysisPage(QWidget):
             self._fill_groups()
             self._fill_stats_choices()
 
+    def _on_move_group(self, step: int):
+        """Move the group selected in the Groups table *step* rows up (-1)
+        or down (+1)."""
+        names = self.settings.get('group_names') or []
+        row = self.group_defs.currentRow()
+        new = row + step
+        if row < 0 or not 0 <= new < len(names):
+            return
+        names.insert(new, names.pop(row))
+        self._changed()
+        self._fill_groups()
+        self._fill_stats_choices()
+        self._invalidate_stats()
+        self.group_defs.setCurrentCell(new, 0)
+
     def _on_remove_group(self):
         """Remove the group selected in the Groups table (or chosen from a
         list when none is selected); its samples lose their group."""
@@ -1955,6 +2208,8 @@ class AnalysisPage(QWidget):
     def _drop_covariate(self, name):
         s = self.settings
         s['covariates'].pop(name, None)
+        if name == fa.DATE_COVARIATE:
+            s['date_covariate'] = False
         if s.get('pairing') == name:
             s['pairing'] = ''
         if s.get('split_by') == name:
@@ -2143,10 +2398,11 @@ class AnalysisPage(QWidget):
         for key, text in COUNT_TESTS.items():
             self.cb_count_test.addItem(text, key)
         self.cb_count_test.setToolTip(
-            'Quasi-likelihood F: negative-binomial dispersions shrunk towards a common value, then a '
-            'moderated quasi-dispersion per combination; 3–7 % false positives at p < 0.05 on inbred mice with '
-            'plenty of events, more on varied donors and small populations. Wald: each combination\'s own '
-            'dispersion and a z test; not recommended (21–31 % on the same mice).')
+            'Quasi-likelihood F: each comparison fitted on its two groups, negative-binomial dispersions taken '
+            'from combinations with similar counts, then a moderated quasi-dispersion per combination; 2–6 % '
+            'false positives at p < 0.05 on inbred mice (about 5 % with 100 cells per sample), more on varied '
+            'donors (7–10 %). Wald: each combination\'s own dispersion and a z test; not recommended (21–31 % '
+            'on the same mice).')
         self.cb_norm = QComboBox()
         for key, text in NORMALISATIONS.items():
             self.cb_norm.addItem(text, key)
@@ -4206,7 +4462,8 @@ class AnalysisPage(QWidget):
         """A figure tab; on the volcanos and fold-change bars a double-click
         on a combination shows it in the Combination tab (right-click for a
         menu), also in their popped-out windows."""
-        panel = fcfp.FigurePanel(self._figure_name(key, item.get('export_title') or item['title']), self.analysis_root)
+        panel = fcfp.FigurePanel(self._figure_name(key, item.get('export_title') or item['title']),
+                                 self.analysis_root, options_store=self.figure_options_store)
         panel.figure_key = key
         if key in ('counts_volcano', 'freq_volcano', 'fold_change_bars'):
             results = item.get('results')
@@ -4468,9 +4725,12 @@ class AnalysisPage(QWidget):
                + '; counts are memberships summed' if self.soft_counts() else '') + ')',
             f"Counted: {saved.get('time', '')}",
             (f"Source: live unmix of the raw files ({saved.get('method') or ''})"
-             if saved.get('source') == fa.SOURCE_LIVE else f'Exported files: {self.export_folder()}'),
+             if saved.get('source') == fa.SOURCE_LIVE else f'Exported files: {self.export_folder()}'
+             + ''.join(f'; linked from another experiment: {f}' for f in s.get('linked_folders') or [])),
             'Gating: the experiment\'s unmixed gate boundaries (with each sample\'s own overrides) applied to the '
-            'FlowCode-unmixed events.',
+            'FlowCode-unmixed events.'
+            + (' Files linked from other experiments are gated with the template boundaries.'
+               if saved.get('source') != fa.SOURCE_LIVE and s.get('linked_folders') else ''),
             f"Inclusion: combinations left out by choice: {', '.join(s.get('exclude_combos') or []) or 'none'}; "
             f"min. events per combination {s['min_combo_events']}; min. barcoded events per sample "
             f"{s['min_sample_events']}.",
@@ -4595,7 +4855,7 @@ class AnalysisPage(QWidget):
         groups = self._unit_groups()
         colours = self.group_colours()
         qc, filtered, counts, meta = self.qc, self.filtered, self.counts, self.meta
-        settings_text = self.settings_text()
+        settings_text = self.settings_text() + self.shift_view.settings_text()
         sample_table = self.sample_table_frame()
 
         figures = []
@@ -4630,7 +4890,10 @@ class AnalysisPage(QWidget):
             pca_figures = ([(f'sample_pca {lib}', f'Sample PCA ({lib_labels.get(lib, lib)})')
                             for lib in dict.fromkeys(unit_library.values())] if unit_library
                            else [('sample_pca', 'Sample PCA')])
-            for key, name in [('comparison_heatmap', 'Comparison heatmap')] + pca_figures:
+            heatmaps = [('comparison_heatmap', 'Comparison heatmap')]
+            if stats.get('counts') is not None and stats.get('freq') is not None:
+                heatmaps.append(('comparison_heatmap_freq', 'Comparison heatmap (frequencies)'))
+            for key, name in heatmaps + pca_figures:
                 figures.append((name, lambda key=key: figure_of('summary', key)))
             for pair in stats['pairs']:
                 label = fst.comparison_label(*pair)
@@ -4673,12 +4936,22 @@ class AnalysisPage(QWidget):
                                             groups_result, label, key, ci, threshold, is_dark, population,
                                             groups=True)))
 
+        figures += self.shift_view.export_figures(is_dark)
+        store = self.figure_options_store()
+        if store is not None:
+            from honeychrome.view_components import figure_options as fo
+            figures = [(name, fo.with_options(make, fo.FigureOptionsRef(
+                store, fcfp.OPTIONS_SCOPE, self._report_figure_key(name))))
+                for name, make in figures]
+        shift_tables = self.shift_view.write_tables
+
         def work(progress):
             written = fst.write_analysis_folder(folder, population=population, raw_counts=counts, meta=meta,
                                                 qc=qc, filtered=filtered, stats=stats, sample_table=sample_table,
                                                 settings_text=settings_text, figures=figures, sample_labels=labels,
                                                 progress=progress, no_fret=no_fret,
                                                 fdr_threshold=float(s['pval_threshold']))
+            written = list(written) + list(shift_tables(folder))
             progress(len(figures), len(figures), '')
             return written
 
@@ -4703,19 +4976,27 @@ class AnalysisPage(QWidget):
     # =====================================================================
 
     def on_task_finished(self, key, result):
+        if key in fshv.TASKS:
+            self.shift_view.on_finished(key, result)
+            return
         {'analysis_count': self.on_count_finished, 'analysis_stats': self.on_stats_finished,
          'analysis_figures': self.on_figures_finished, 'analysis_export': self.on_export_finished,
          'analysis_loo': self.on_loo_finished, 'analysis_restore': self.on_restore_finished,
          fcgv.TASK: self.gating_view.on_finished}[key](result)
 
     def on_task_error(self, key, message):
+        if key in fshv.TASKS:
+            self.shift_view.on_error(key, message)
+            return
         {'analysis_count': self.on_count_error, 'analysis_stats': self.on_stats_error,
          'analysis_figures': self.on_figures_error, 'analysis_export': self.on_export_error,
          'analysis_loo': self.on_loo_error, 'analysis_restore': self.on_restore_error,
          fcgv.TASK: self.gating_view.on_error}[key](message)
 
     def on_task_progress(self, key, n, total, text):
-        if key == fcgv.TASK:
+        if key in fshv.TASKS:
+            self.shift_view.on_progress(key, n, total, text)
+        elif key == fcgv.TASK:
             self.gating_view.on_progress(n, total, text)
         elif key == 'analysis_count' and text:
             self.count_status.setText(f'Counting {text}… ({n + 1}/{total})')
@@ -4756,6 +5037,7 @@ class AnalysisPage(QWidget):
         self._fill_stats_choices()
         self._restore_saved_stats()
         self.gating_view.refresh()
+        self.shift_view.refresh()
         self.root_label.setText(str(self.analysis_root()))
         self._update_default_buttons()
         self.refresh_status()

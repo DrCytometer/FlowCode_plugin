@@ -259,7 +259,15 @@ _HELP = {
         'error lies almost wholly inside the span (out-of-span share below the minimum) is not identifiable and '
         'keeps the backbone\'s model. Detectors are weighted by the noise model when the experiment uses M2pg, '
         'else by the sample\'s median signal. The tandem breakdown is estimated after the calibration. '
-        '<i>Brightness-dependent calibration</i> lets the scale change with tag brightness.</p>'),
+        '<i>Brightness-dependent calibration</i> lets the scale change with tag brightness.</p>'
+        '<p><b>FRET correction overrides</b> (Advanced settings): replace a combination\'s FRET/error correction '
+        'in every exported sample. <i>Off</i> removes it and <i>Scaled</i> multiplies it (1 is the backbone\'s '
+        'model); either takes the place of the per-sample calibration of that combination, and the tandem '
+        'breakdown is estimated on the overridden correction. They are meant for a backbone whose model does '
+        'not fit the samples, such as FRET controls from another experiment: a combination whose correction '
+        'moves a gating marker that the uncorrected data show no sign of needing, or makes a marker depend on '
+        'tag brightness within the combination. Overrides are kept by the combination\'s tags, so renaming it '
+        'keeps them, and are recorded in <tt>FlowCode_run.json</tt> and the FLOWCODEOVERRIDES keyword.</p>'),
 }
 
 # Filled by _ensure_qt_imports() on the main thread: these modules create Qt
@@ -2936,8 +2944,14 @@ class CharacterisePage(_Page):
         self.body.addWidget(grp)
 
         folder = lambda: Path(plugin.controller.experiment_dir) / OUTPUT_SUBDIR  # noqa: E731
+
+        def options_store():
+            from honeychrome.view_components import figure_options as fo
+            return fo.store_for(plugin.controller)
+
         lay = self.add_section('Combo frequencies', scroll=False)
-        self.frequency = fcfp.FigurePanel('FlowCode combo frequencies', folder)
+        self.frequency = fcfp.FigurePanel('FlowCode combo frequencies', folder,
+                                          options_store=options_store)
         lay.addWidget(self.frequency, stretch=1)
 
         lay = self.add_section('FRET and spillover error', scroll=False)
@@ -2951,11 +2965,12 @@ class CharacterisePage(_Page):
         row.addWidget(self.heat_space)
         row.addStretch()
         lay.addLayout(row)
-        self.heatmap = fcfp.FigurePanel('FlowCode spillover', folder)
+        self.heatmap = fcfp.FigurePanel('FlowCode spillover', folder, options_store=options_store)
         lay.addWidget(self.heatmap, stretch=1)
 
         lay = self.add_section('Panel expression before and after correction', scroll=False)
-        self.expression = fcfp.FigurePanel('FlowCode panel expression', folder)
+        self.expression = fcfp.FigurePanel('FlowCode panel expression', folder,
+                                           options_store=options_store)
         lay.addWidget(self.expression, stretch=1)
 
         lay = self.add_section('Assess correction')
@@ -3224,6 +3239,8 @@ _CORRECTION_ITEMS = (('Per combination; pairwise model for the rest (combo)', 'c
                      ('No correction (none)', 'none'))
 _REGRESSOR_ITEMS = (('Fixed basis: spectra plus mean AF (fixed)', 'fixed'),
                     ('Debarcoding space (debarcode)', 'debarcode'))
+_OVERRIDE_HEADERS = ['Combination', 'Tags', 'FRET correction', 'Scale']
+_OVERRIDE_ITEMS = (('Backbone model', 'backbone'), ('Scaled', 'scaled'), ('Off', 'off'))
 
 
 class ExportPage(_Page):
@@ -3447,8 +3464,38 @@ class ExportPage(_Page):
         self.calib_status.setStyleSheet(_HINT_STYLE)
         clay.addWidget(self.calib_status)
         lay.addWidget(cgrp)
+
+        ogrp = QGroupBox('FRET correction per combination: overrides')
+        olay = QVBoxLayout(ogrp)
+        hint = QLabel('Replace a combination\'s FRET/error correction in every exported sample: Off removes it, '
+                      'Scaled multiplies it (1 = the backbone\'s model). An override takes the place of the '
+                      'per-sample calibration of that combination. Use it where the samples show that the '
+                      'backbone\'s model does not fit them (see Help).')
+        hint.setWordWrap(True)
+        hint.setStyleSheet(_HINT_STYLE)
+        olay.addWidget(hint)
+        self.override_table = QTableWidget(0, len(_OVERRIDE_HEADERS))
+        self.override_table.setHorizontalHeaderLabels(_OVERRIDE_HEADERS)
+        self.override_table.verticalHeader().setVisible(False)
+        self.override_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.override_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.override_table.setMinimumHeight(200)
+        olay.addWidget(self.override_table)
+        row = QHBoxLayout()
+        self.override_clear = QPushButton('Clear overrides')
+        self.override_clear.setToolTip('Every combination back to the backbone\'s model and the calibration.')
+        self.override_clear.clicked.connect(lambda: self.plugin.clear_combo_overrides())
+        self.override_status = QLabel('')
+        self.override_status.setWordWrap(True)
+        self.override_status.setStyleSheet(_HINT_STYLE)
+        row.addWidget(self.override_clear)
+        row.addWidget(self.override_status, stretch=1)
+        olay.addLayout(row)
+        lay.addWidget(ogrp)
+        self._override_rows = None
+        self._override_widgets = {}
         self.default_keys = ('correction', 'regressor', *self.adv, 'tandem_tags', *self.tandem_adv,
-                             *self.calib_checks, *self.calib_adv)
+                             *self.calib_checks, *self.calib_adv, 'combo_overrides')
 
     # -- refresh -------------------------------------------------------------
 
@@ -3475,6 +3522,7 @@ class ExportPage(_Page):
                 widget.blockSignals(False)
             self._fill_tandems()
             self._fill_calibration()
+            self._fill_overrides()
         finally:
             self._filling = False
         self.restore_btn.setEnabled(not plugin.settings_at_defaults(self.default_keys))
@@ -3559,6 +3607,74 @@ class ExportPage(_Page):
     def _on_calib_toggled(self, key: str, checked: bool):
         if not self._filling:
             self.plugin.on_setting_changed(key, bool(checked))
+
+    def _fill_overrides(self):
+        """One row per included combination: its override (Backbone model,
+        Scaled, Off) and scale. Rows are rebuilt only when the combinations
+        change."""
+        state = self.plugin.state
+        settings = state.settings
+        rows = [(fcc.combo_key(row['tags']), str(row['name']), '_'.join(sorted(str(t) for t in row['tags'])))
+                for row in state.included_combos()]
+        if rows != self._override_rows:
+            table = self.override_table
+            table.setRowCount(len(rows))
+            self._override_widgets = {}
+            for r, (key, name, tags) in enumerate(rows):
+                for c, text in enumerate((name, tags)):
+                    item = QTableWidgetItem(text)
+                    item.setFlags(Qt.ItemIsEnabled)
+                    table.setItem(r, c, item)
+                mode = QComboBox()
+                for text, value in _OVERRIDE_ITEMS:
+                    mode.addItem(text, value)
+                spin = _float_spin(0.05, fcc.CALIB_MAX_SCALE, 2, 0.05)
+                mode.currentIndexChanged.connect(
+                    lambda _i, k=key, box=mode: self._on_override_mode(k, box.currentData()))
+                spin.valueChanged.connect(lambda value, k=key: self._on_override_scale(k, value))
+                _no_wheel(mode)
+                table.setCellWidget(r, 2, mode)
+                table.setCellWidget(r, 3, spin)
+                self._override_widgets[key] = (mode, spin)
+            table.resizeColumnsToContents()
+            self._override_rows = rows
+        overrides = settings.get('combo_overrides') or {}
+        no_fret = bool(state.no_fret)
+        usable = settings.get('correction') == 'combo' and not no_fret
+        for key, (mode, spin) in self._override_widgets.items():
+            value = overrides.get(key)
+            mode.blockSignals(True)
+            spin.blockSignals(True)
+            mode.setCurrentIndex(mode.findData('backbone' if value is None else 'off' if value == 0 else 'scaled'))
+            spin.setValue(1.0 if value is None or value == 0 else float(value))
+            mode.setEnabled(usable)
+            spin.setEnabled(usable and value is not None and value > 0)
+            mode.blockSignals(False)
+            spin.blockSignals(False)
+        names = {key: name for key, name, _tags in rows}
+        active = [(names[k], float(v)) for k, v in overrides.items() if k in names]
+        self.override_clear.setEnabled(bool(overrides))
+        if no_fret:
+            text = 'Not applied without FRET correction ("No FRET backbone" in section 1).'
+        elif settings.get('correction') != 'combo':
+            text = 'Applies only with the per-combination correction (Correction: combo).'
+        elif active:
+            text = f'{len(active)} combination(s) overridden: ' + ', '.join(
+                f'{name} off' if value == 0 else f'{name} \u00d7{value:.2f}' for name, value in active) + '.'
+        else:
+            text = 'No overrides: every combination uses the backbone\'s model and the calibration.'
+        self.override_status.setText(text)
+
+    def _on_override_mode(self, key: str, mode: str):
+        if self._filling:
+            return
+        spin = self._override_widgets[key][1]
+        self.plugin.set_combo_override(key, None if mode == 'backbone' else 0.0 if mode == 'off' else spin.value())
+
+    def _on_override_scale(self, key: str, value: float):
+        if self._filling or self._override_widgets[key][0].currentData() != 'scaled':
+            return
+        self.plugin.set_combo_override(key, value)
 
     def _fill_samples(self):
         plugin = self.plugin
@@ -4953,6 +5069,25 @@ class PluginWidget(QWidget):
             ticked.discard(fluor)
         self.on_setting_changed('tandem_tags', [c['fluor'] for c in candidates if c['fluor'] in ticked])
 
+    def set_combo_override(self, key: str, scale):
+        """Override the FRET correction of the combination *key*
+        (``combo_key`` of its tags) with *scale* (0: off), or remove its
+        override (None)."""
+        self.on_setting_changed('combo_overrides', self.state.with_combo_override(key, scale))
+
+    def clear_combo_overrides(self):
+        if self.state.settings.get('combo_overrides'):
+            self.on_setting_changed('combo_overrides', {})
+
+    def export_overrides(self, fc) -> dict:
+        """{combination name: scale} an export with *fc* applies: none
+        without FRET correction or with a correction other than the
+        per-combination one."""
+        settings = self.state.settings
+        if not fc.fret_corrected or settings.get('correction') != 'combo':
+            return {}
+        return fcc.combination_overrides(settings.get('combo_overrides'), fc.design)
+
     def export_tandems(self, candidates=None) -> tuple:
         """(ticked ``TandemTag`` list, every usable ``TandemTag``); none
         ticked without FRET correction."""
@@ -5356,7 +5491,8 @@ class PluginWidget(QWidget):
         af_lists = self.export_af_lists(list(keys))
         used = sorted({n for names in af_lists.values() for n in names})
         merged = {**self.state.settings, **(overrides or {})}
-        settings = {k: merged.get(k) for k in fcs.SECTION5_SETTINGS + fcs.CALIBRATION_SETTINGS}
+        settings = {k: merged.get(k) for k in
+                    fcs.SECTION5_SETTINGS + fcs.CALIBRATION_SETTINGS + fcs.OVERRIDE_SETTINGS}
         tandems = self.tandem_selection()
         if overrides and 'tandem_tags' in overrides:
             tandems = [t for t in tandems if t in overrides['tandem_tags']]
@@ -5530,6 +5666,11 @@ class PluginWidget(QWidget):
                 + (f'; {", ".join(f"{c} {v:.2f}" for c, v in row["largest"])}' if row['largest'] else '')
                 + (f'; not identifiable: {", ".join(row["not_identifiable"])}' if row['not_identifiable'] else '')
                 for name, row in calibration.items())
+        overrides = last.get('overrides')
+        if overrides:
+            text += ('<br>FRET correction overridden: ' + ', '.join(
+                f'{name} off' if value == 0 else f'{name} \u00d7{value:.2f}' for name, value in overrides.items())
+                + '.')
         return text
 
     def start_export(self):
@@ -5562,7 +5703,8 @@ class PluginWidget(QWidget):
         design = fc.design
         job = {'design': design, 'folder': self.export_folder(), 'current': None, 'samples': [],
                'inputs': state.section_inputs(5, self.fingerprint()), 'fc': fc, 'tandems': [], 'tandem': None,
-               'scales': None, 'calibrate': self.calibration_mode(fc) != 'off'}
+               'scales': None, 'calibrate': self.calibration_mode(fc) != 'off',
+               'overrides': self.export_overrides(fc)}
         in_library = self.export_library_combos(sample_keys)
 
         def on_block(summary):
@@ -5579,7 +5721,7 @@ class PluginWidget(QWidget):
             summary = job['current'] or empty
             if job['tandems']:
                 summary = dict(summary, tandem=job['tandem'] or [])
-            if job['calibrate']:
+            if job['calibrate'] or job['overrides']:
                 summary = dict(summary, combo_scales=job['scales'])
             if in_library is not None:
                 lib, own = in_library[sample_key]
@@ -5694,6 +5836,10 @@ class PluginWidget(QWidget):
             'FLOWCODECHARACTERISATION': fc.characterisation_id(),
         }
         keywords['FLOWCODECALIBRATION'] = self.calibration_mode(fc)
+        combo_overrides = (fcc.combination_overrides(settings.get('combo_overrides'), design)
+                           if fc.fret_corrected and settings.get('correction') == 'combo' else {})
+        if combo_overrides:
+            keywords['FLOWCODEOVERRIDES'] = ';'.join(f'{name}={value:g}' for name, value in combo_overrides.items())
         if not fc.fret_corrected:
             keywords['FLOWCODECORRECTION'] = fa.NO_CORRECTION_KEYWORD
             keywords['FLOWCODEWARNING'] = fcs.NO_FRET_WARNING
@@ -5734,7 +5880,8 @@ class PluginWidget(QWidget):
                              'n_samples': len(rows), 'events': int(events), 'barcoded': int(barcoded),
                              'tandem_tags': [t.fluor for t in job['tandems']],
                              'tandem_corrected': int(tandem_corrected),
-                             'no_fret': not job['fc'].fret_corrected, 'calibration': calibration}
+                             'no_fret': not job['fc'].fret_corrected, 'calibration': calibration,
+                             'overrides': dict(job['overrides'])}
         if job['inputs'] == state.section_inputs(5, self.fingerprint()):
             state.mark_completed(5, self.fingerprint())
         page.set_run_status(f'Done: {len(rows)} sample(s) exported.')
@@ -5748,7 +5895,7 @@ class PluginWidget(QWidget):
         fc = job['fc']
         design = job['design']
         settings = {k: state.settings.get(k) for k in
-                    fcs.SECTION4_SETTINGS + fcs.SECTION5_SETTINGS + fcs.CALIBRATION_SETTINGS}
+                    fcs.SECTION4_SETTINGS + fcs.SECTION5_SETTINGS + fcs.CALIBRATION_SETTINGS + fcs.OVERRIDE_SETTINGS}
         settings['debarcode_method'] = self.debarcode_method()
         plan = job['plan']
         return {
@@ -5769,6 +5916,7 @@ class PluginWidget(QWidget):
             'settings': settings,
             'final_unmix': plan.label,
             'calibration': self.calibration_mode(fc),
+            'fret_overrides': dict(job.get('overrides') or {}),
             'unmixing_method_token': plan.token,
             'sample_unmixing': job.get('methods') or {},
             'fingerprint': fc.fingerprint(),

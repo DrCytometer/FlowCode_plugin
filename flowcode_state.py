@@ -34,7 +34,7 @@ from pathlib import Path
 
 import numpy as np
 
-PLUGIN_VERSION = '0.7.0'
+PLUGIN_VERSION = '0.4.1'
 PROCESS_KEY = 'flowcode_unmix'
 
 SINGLETS_GATE = 'FlowCode Singlets'
@@ -103,6 +103,7 @@ DEFAULT_SETTINGS = {
     'calib_z_min': 3.0,
     'calib_min_share': 0.05,
     'calib_min_events': 40,
+    'combo_overrides': {},
 }
 
 SECTION3_SETTINGS = ('backbone_max_events', 'unstained_max_events', 'cell_weight')
@@ -115,6 +116,11 @@ SECTION5_SETTINGS = ('tag_shift_min_n', 'correction', 'regressor', 'tandem_tags'
 # Per-sample combination calibration (section 5): a run input of its own, so
 # that exports made before it existed say why they need a re-run.
 CALIBRATION_SETTINGS = ('calib_combos', 'calib_brightness', 'calib_z_min', 'calib_min_share', 'calib_min_events')
+# Per-combination FRET correction overrides (section 5): {``combo_key`` of a
+# combination's tags: scale}, 0 switching the combination's correction off.
+# A run input of its own, absent while there are none, so exports made
+# without overrides stay current.
+OVERRIDE_SETTINGS = ('combo_overrides',)
 
 # Final-unmix settings of earlier versions; the experiment's method (AutoSpectral tab) replaces them.
 RETIRED_SETTINGS = ('use_variants', 'n_passes', 'n_af_passes', 'refine_af_quantile', 'noise_floor', 'alpha',
@@ -134,6 +140,7 @@ _REASONS = {
     'settings4': 'section 4 settings changed',
     'settings5': 'section 5 settings changed',
     'calibration': 'combination calibration settings changed',
+    'overrides': 'FRET correction overrides changed',
     'samples': 'sample selection changed',
     'output': 'output folder changed',
     'debarcode': 'debarcoding unmix changed',
@@ -348,6 +355,9 @@ class FlowCodeState:
                                              for row in self.included_combos()])
             inputs['settings5'] = _digest({k: self.settings.get(k) for k in SECTION5_SETTINGS})
             inputs['calibration'] = _digest({k: self.settings.get(k) for k in CALIBRATION_SETTINGS})
+            overrides = self.settings.get('combo_overrides') or {}
+            inputs['overrides'] = (_digest(sorted((str(k), float(v)) for k, v in overrides.items()))
+                                   if overrides else None)
             inputs['samples'] = _digest(self.export_samples) if not self.settings.get('export_include_controls') \
                 else _digest([self.export_samples, 'controls'])
             inputs['output'] = _digest(self.output_folder)
@@ -356,6 +366,20 @@ class FlowCodeState:
                                             for lib in self.libraries] + [self.sample_libraries])
                                    if self.multi_library else None)
         return inputs
+
+    def with_combo_override(self, key: str, scale) -> dict:
+        """A new ``combo_overrides`` setting with the combination *key*
+        (``combo_key`` of its tags) given *scale*, kept within
+        [0, ``CALIB_MAX_SCALE``], or its override removed when *scale* is
+        None. The current setting is not modified."""
+        from flowcode_core import CALIB_MAX_SCALE
+
+        out = {str(k): float(v) for k, v in (self.settings.get('combo_overrides') or {}).items()}
+        if scale is None:
+            out.pop(str(key), None)
+        else:
+            out[str(key)] = float(min(max(float(scale), 0.0), CALIB_MAX_SCALE))
+        return out
 
     def combo_backbone_counts(self) -> dict:
         """{combo name: backbone events} from the last characterisation,

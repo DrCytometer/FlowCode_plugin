@@ -33,7 +33,7 @@ def _theme(fig, is_dark: bool, axes=None) -> str:
     if style_figure_theme is not None:
         return style_figure_theme(fig, is_dark, axes=axes)
     fg = 'white' if is_dark else 'black'
-    fig.patch.set_facecolor('#1e1e1e' if is_dark else 'white')
+    fig.patch.set_facecolor('black' if is_dark else 'white')
     return fg
 
 

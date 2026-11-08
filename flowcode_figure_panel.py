@@ -10,6 +10,11 @@ and resizes it with the window (as Honeycluster's Pop Out does).
 Message figures ("Run the characterisation…") are shown at their own size
 without the controls.
 
+With *options_store* (a callable returning the experiment's
+``figure_options.FigureOptionsStore``), each figure is drawn with its figure
+options (scope ``'flowcode'``, key ``figure_key`` or the panel's name), set
+in the Options side panel and used by Pop Out and Export as well.
+
 ``scrolling_help`` is the app's help toggle with its text in a scroll area,
 for page heads that sit above tabs.
 
@@ -30,6 +35,7 @@ from honeychrome.view_components.scalable_figure_widget import (
 )
 
 _HINT_STYLE = 'color: grey; font-style: italic;'
+OPTIONS_SCOPE = 'flowcode'
 HELP_HEIGHT_FRACTION = 0.45
 HELP_MIN_HEIGHT = 160
 _INVALID_NAME_CHARS = re.compile(r'[\\/:*?"<>|]')
@@ -127,10 +133,11 @@ class FigurePanel(QWidget):
     e.g. to connect mouse clicks.
     """
 
-    def __init__(self, name: str, folder_fn, parent=None):
+    def __init__(self, name: str, folder_fn, parent=None, options_store=None):
         super().__init__(parent)
         self.name = name
         self._folder_fn = folder_fn
+        self._options_store = options_store
         self.figure = None
         self.view = None
         self.exportable = False
@@ -146,6 +153,15 @@ class FigurePanel(QWidget):
         self.export_msg.setWordWrap(True)
         lay.addWidget(self.export_msg)
 
+    def options_ref(self):
+        """This panel's figure options (figure_options), or None."""
+        from honeychrome.view_components import figure_options as fo
+        store = self._options_store() if self._options_store is not None else None
+        if store is None:
+            return None
+        key = str(getattr(self, 'figure_key', None) or self.name).split(' ')[0]
+        return fo.FigureOptionsRef(store, OPTIONS_SCOPE, key)
+
     @property
     def canvas(self):
         return None if self.view is None else getattr(self.view, 'canvas', self.view)
@@ -160,7 +176,8 @@ class FigurePanel(QWidget):
         if exportable:
             self.view = _PanelFigure(self, fig, title=self.name, experiment_dir='',
                                      pop_out=self.pop_out if make is not None else None,
-                                     initial_scale=initial_scale_for(fig), parent=self)
+                                     initial_scale=initial_scale_for(fig), parent=self,
+                                     options=self.options_ref())
             self.holder.addWidget(self.view, stretch=1)
         else:
             self.view = scrollable_canvas_class()(fig)
@@ -210,6 +227,9 @@ class FigurePanel(QWidget):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             fig = self._make()
+            ref = self.options_ref()
+            if ref is not None and fig is not None:
+                ref.apply(fig)
         except Exception as exc:
             fig = None
             error = str(exc) or type(exc).__name__

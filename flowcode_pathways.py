@@ -94,8 +94,11 @@ pathway with knockout signs k = −sign: x_g = k_g (z_g − z̄_other),
 the others (on G − 2 df), variance inflation VIF = m × mean_i(mean_g k_g
 U_gi)² from the guides' residual directions U (scaled to mean square 1;
 VIF floored at 1), and t = δ / √(σ² (VIF/m + mean(k)²/(G − m))) on
-min(n − p, G − 2) df. With every k = +1 this is limma's camera with an
-estimated inter-gene correlation.
+G − 2 df. With every k = +1 this is limma's camera with an estimated
+inter-gene correlation, except for the df: limma uses min(n − p, G − 2),
+which with few mice (n − p of 3 to 6 in one comparison's fit) holds the
+test far below its nominal rate; on G − 2 df it was close to nominal on
+JA_007 nulls. ``signed_camera(..., guides_df=False)`` gives limma's df.
 
 Any change. In one library, m = mean of z_g² over the set's guides, and
 its rotated value mean of z*_g² on every rotation; p = (b + 1)/(R + 1)
@@ -161,8 +164,9 @@ _TIE = 1e-12
 _SET_CHUNK = 256
 _HEADER = re.compile(r'GO\s+(?P<go>[^;]+);\s*MGI GAF\s+(?P<gaf>[^;]+);')
 
-NEEDS_LOW_COUNT = ("The pathway analysis needs the quasi-likelihood test with the low-count adjustment and "
-                   "per-comparison fits, which this version of Honeychrome does not have.")
+NEEDS_LOW_COUNT = ("The pathway analysis needs the quasi-likelihood test with the low-count adjustment, "
+                   "per-comparison fits and the trended dispersion, which this version of Honeychrome "
+                   "does not have.")
 
 
 class PathwayError(RuntimeError):
@@ -295,7 +299,7 @@ class FeatureFit(NamedTuple):
     y: np.ndarray
     offset: np.ndarray          # log library sizes
     mu: np.ndarray              # fitted means of the negative-binomial fit
-    alpha: float                # common negative-binomial dispersion
+    alpha: float                # negative-binomial dispersion (trended with abundance)
     residual_df: float          # low-count adjusted residual df
     quasi_dispersion: float     # moderated quasi-dispersion (the F test's denominator)
 
@@ -322,18 +326,19 @@ def _log_offsets(counts_df: pd.DataFrame, offset_df: pd.DataFrame | None) -> np.
 
 def rebuild_ql_fit(counts_df: pd.DataFrame, group_vec: list, base: str, pairing_vec: list | None,
                    covariates: pd.DataFrame | None, offset_df: pd.DataFrame | None,
-                   alpha: float | None = None, design: np.ndarray | None = None,
+                   alpha: np.ndarray | None = None, design: np.ndarray | None = None,
                    group_cols: dict | None = None) -> QLFit:
     """
     The quasi-likelihood fit of ``differential_stats._glm_ql_tests`` for
     these inputs (those of one comparison's fit), with the parts the
-    rotation needs: fitted means, the common dispersion (*alpha*, else
-    estimated on these samples), residual df and d0. *design* and
-    *group_cols* are the comparison's design (``ql_comparisons``); without
-    them it is built from the groups, pairing and covariates. Each step is
-    the statistics run's own function, in the same order.
+    rotation needs: fitted means, the dispersions (*alpha*, one per column
+    of *counts_df*, else estimated on these samples), residual df and d0.
+    *design* and *group_cols* are the comparison's design
+    (``ql_comparisons``); without them it is built from the groups, pairing
+    and covariates. Each step is the statistics run's own function, in the
+    same order.
     """
-    if not hasattr(ds, 'ql_comparisons'):
+    if not hasattr(ds, 'ql_block_dispersions'):
         raise PathwayError(NEEDS_LOW_COUNT)
     if design is None:
         design, _names, group_cols = ds.build_design(group_vec, base, pairing_vec, covariates)
@@ -345,9 +350,7 @@ def rebuild_ql_fit(counts_df: pd.DataFrame, group_vec: list, base: str, pairing_
     out: dict = {}
     prior_df = np.nan
     if blocks:
-        if alpha is None or not np.isfinite(alpha):
-            alpha, mus = ds._ql_dispersion(blocks, mus)
-        alphas = [np.full(b.Y.shape[0], alpha) for b in blocks]
+        alphas, mus = ds.ql_block_dispersions(blocks, mus, alpha)
         full = [ds._fit_rows(b.Y, b.X, b.O, a) for b, a in zip(blocks, alphas)]
         mus = [np.array([f[1] if f is not None else m for f, m in zip(fb, mu)])
                for fb, mu in zip(full, mus)]
@@ -405,14 +408,14 @@ def rebuilt_t(fit: QLFit, coef: int, features: list) -> dict:
 def _fits_of_record(record: dict) -> list:
     """(rebuilt fit, comparisons as [(results label, base, other)]) for one
     recorded ``run_glm_counts`` call (QL): one fit per comparison, on the
-    samples of its two groups, with the common dispersion of every sample
-    of the call, as the statistics run fits it."""
+    samples of its two groups, with the dispersions estimated on every
+    sample of the call, as the statistics run fits it."""
     labels = record['labels']
     counts_df, group_vec = record['counts'], record['group_vec']
     pairing_vec, covariates = record['pairing_vec'], record['covariates']
     full_design, _names, _cols = ds.build_design(group_vec, record['contrasts'][0][0], pairing_vec, covariates)
-    alpha = ds.ql_common_dispersion(counts_df.values.T.astype(float), full_design,
-                                    _log_offsets(counts_df, record['offset_df']))
+    alpha = ds.ql_dispersion(counts_df.values.T.astype(float), full_design,
+                             _log_offsets(counts_df, record['offset_df']))
     out = []
     for base, other, mask, design, coef in ds.ql_comparisons(group_vec, record['contrasts'], pairing_vec,
                                                              covariates):
@@ -537,11 +540,13 @@ def rotation_pvalues(z: np.ndarray, vectors: np.ndarray, weights: np.ndarray,
 
 
 def signed_camera(z: np.ndarray, directions: np.ndarray, members: np.ndarray, signs: np.ndarray,
-                  residual_df: float) -> dict:
+                  residual_df: float, guides_df: bool = False) -> dict:
     """
     Signed CAMERA of one set in one unit. *z*: every tested guide's z;
     *directions*: unit residual directions (guides × (n − p)); *members*:
     positions of the set's guides in *z*; *signs*: their knockout signs.
+    The t is read on min(*residual_df*, guides − 2) df, as limma's camera
+    does, or with *guides_df* on guides − 2 df (the pathway analysis).
     Returns delta, t, df, p (two-sided), correlation (NaN for one member)
     and vif.
     """
@@ -565,7 +570,7 @@ def signed_camera(z: np.ndarray, directions: np.ndarray, members: np.ndarray, si
     else:
         vif, correlation = 1.0, np.nan
     se = np.sqrt(pooled * (vif / m + float(np.mean(signs)) ** 2 / m2))
-    df = float(min(residual_df, n - 2))
+    df = float(n - 2 if guides_df else min(residual_df, n - 2))
     t = delta / se if se > 0 else np.nan
     p = float(2.0 * special.stdtr(df, -abs(t))) if np.isfinite(t) else np.nan
     return {'delta': delta, 't': float(t), 'df': df, 'p': p, 'correlation': correlation, 'vif': vif}
@@ -773,8 +778,11 @@ def members_figure(result: dict, comparison: str, set_key: str, ci: pd.DataFrame
     One pathway in one comparison: each member's log2 fold change with its
     95% interval (*ci*: CI.L and CI.R by feature), coloured by sign and
     grouped by library (a dotted line between libraries; each library's
-    result is in ``library_summary``). The shaded side of each row is the direction the
-    pathway's score predicts for that member (−sign × sign of the score).
+    result is in ``library_summary``). Within a library, members are listed
+    by sign (+1 first) and then by gene name, so a pathway's rows keep the
+    same order across comparisons. The shaded side of each row is the
+    direction the pathway's score predicts for that member (−sign × sign of
+    the score).
     With *groups* (gene groups, every sign +1) the legend has no signs and
     the title gives the competitive and any-change FDR. Double-clicking a
     member needs ``fig._member_features`` and ``fig._member_axes``.
@@ -792,7 +800,9 @@ def members_figure(result: dict, comparison: str, set_key: str, ci: pd.DataFrame
         return dp.message_figure(f'{what[0]} was not tested in this comparison.', what[1], is_dark)
     row = row.iloc[0]
     direction = 1.0 if float(row['score']) >= 0 else -1.0
-    view = view.sort_values(['library', 'contribution'], ascending=[True, False], ignore_index=True)
+    view = view.assign(_name=[str(g or f).lower() for g, f in zip(view['gene'], view['feature'])])
+    view = view.sort_values(['library', 'sign', '_name', 'feature'], ascending=[True, False, True, True],
+                            ignore_index=True).drop(columns='_name')
     fig = Figure(figsize=(7.5, max(2.8, 0.32 * len(view) + 2.2)), layout='constrained')
     ax = fig.add_subplot(111)
     lfc = view['logFC'].astype(float).values
@@ -803,10 +813,11 @@ def members_figure(result: dict, comparison: str, set_key: str, ci: pd.DataFrame
     extent = float(np.nanmax(np.abs(np.concatenate([lo, hi, lfc, [1.0]]))))
     extent = 1.05 * extent if np.isfinite(extent) else 2.0
     y = np.arange(len(view))[::-1]
+    shade_colour, shade_alpha = ('white', 0.16) if is_dark else ('grey', 0.12)
     for yi, sign in zip(y, view['sign'].astype(int)):
         side = -sign * direction
         ax.axhspan(yi - 0.45, yi + 0.45, xmin=0.5 if side > 0 else 0.0, xmax=1.0 if side > 0 else 0.5,
-                   color='grey', alpha=0.12, lw=0)
+                   color=shade_colour, alpha=shade_alpha, lw=0)
     for sign, colour in SIGN_COLOURS.items():
         pick = view['sign'].astype(int).values == sign
         if not pick.any():
@@ -836,7 +847,7 @@ def members_figure(result: dict, comparison: str, set_key: str, ci: pd.DataFrame
                      f"self-contained FDR {row['FDR']:.3g}{' *' if own else ''}; competitive FDR "
                      f"{row['competitive_FDR']:.3g}{' *' if comp else ''}", fontsize=9)
         handles = [Patch(color=c, label=SIGN_NAMES[s]) for s, c in SIGN_COLOURS.items()]
-    handles.append(Patch(color='grey', alpha=0.3, label='direction the score predicts'))
+    handles.append(Patch(color=shade_colour, alpha=2.5 * shade_alpha, label='direction the score predicts'))
     fig.legend(handles=handles, loc='outside lower center', fontsize=8, frameon=False, ncol=3)
     dp.style_figure_theme(fig, is_dark)
     if population:
@@ -896,7 +907,8 @@ def settings_lines(result: dict | None, settings: dict) -> list:
         f"min. {run.get('min_size', settings.get('min_size'))} members; "
         f"{run.get('rotations', settings.get('rotations'))} rotations, seed {run.get('seed', DEFAULT_SEED)}",
         '  Pathway tests: self-contained rotation test on the QL z-scores (percentile matching), signed CAMERA '
-        '(estimated inter-gene correlation) as the competitive score; libraries combined by weighted Stouffer; '
+        '(estimated inter-gene correlation, guides - 2 df) as the competitive score; libraries combined by '
+        'weighted Stouffer; '
         'BH FDR within each comparison. Score = mean of -sign x z: positive means the process promotes '
         'accumulation in the first group.',
     ]
@@ -1115,7 +1127,7 @@ def _test_sets(pathways: pd.DataFrame, units: dict, logfc: pd.Series, genes: dic
         for j, (key, inside) in enumerate(zip(keys, member_lists)):
             idx = np.array([i for i, _k, _f, _s in inside])
             ks = np.array([k for _i, k, _f, _s in inside])
-            camera = signed_camera(data.z, residual_dirs, idx, ks, data.residual_df)
+            camera = signed_camera(data.z, residual_dirs, idx, ks, data.residual_df, guides_df=True)
             z_rot = signed_z_of_p(pvals[j], scores[j])
             z_cam = signed_z_of_p(camera['p'], camera['delta'])
             z_mixed = float(-special.ndtri(min(max(float(mixed_p[j]), 1e-300), 1.0)))
@@ -1169,6 +1181,6 @@ def _control_check(units: dict, controls: list, label: str, rotations: int, seed
         score, p = rotation_pvalues(data.z, data.vectors, weights, directions)
         residual_dirs = data.vectors[:, 1:] / np.maximum(
             np.linalg.norm(data.vectors[:, 1:], axis=1, keepdims=True), 1e-300)
-        camera = signed_camera(data.z, residual_dirs, idx, np.ones(idx.size), data.residual_df)
+        camera = signed_camera(data.z, residual_dirs, idx, np.ones(idx.size), data.residual_df, guides_df=True)
         out.append((label, data.name, int(idx.size), float(score[0]), float(p[0]), camera['p']))
     return out

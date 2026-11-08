@@ -22,7 +22,8 @@ Pipeline
     4. ``unmix_staged`` on each sample: debarcode, subtract each event's
        characterised error from its raw data, rescale each combination's
        error by the sample's own out-of-span calibration
-       (``estimate_combination_scales``, ``apply_combination_scales``),
+       (``estimate_combination_scales``, ``apply_combination_scales``) or by
+       the user's per-combination override (``combination_overrides``),
        remove the sample's tandem breakdown, then unmix the corrected data
        (per-cell AF and, optionally, fluorophore variants), and build the
        FlowCode and per-combo channels.
@@ -2145,7 +2146,9 @@ def apply_combination_scales(corrected_raw: np.ndarray, ids: np.ndarray, tag_abu
     added back to every event of the combination, s its applied scale
     (``estimate_combination_scales``; per event, clipped to
     [0, ``CALIB_MAX_SCALE``], with the brightness term). Events given the
-    pairwise model are unchanged. Returns a new array.
+    pairwise model are unchanged, except those of a combination with a
+    user override (``with_combination_overrides``), whose pairwise error is
+    rescaled the same way. Returns a new array.
     """
     out = np.array(corrected_raw, dtype=np.float64, copy=True)
     combos = (scales or {}).get('combos') or {}
@@ -2162,9 +2165,15 @@ def apply_combination_scales(corrected_raw: np.ndarray, ids: np.ndarray, tag_abu
         g = names.index(name)
         error = fc.combo_error[g]
         idx = np.flatnonzero(ids == g + 1)
-        if error is None or idx.size == 0:
+        if idx.size == 0:
             continue
         on = design.on_tags(g)
+        if error is None:
+            if rec.get('override') and fc.pair_model is not None:
+                active = np.zeros((idx.size, design.n_tags), dtype=bool)
+                active[:, on] = True
+                out[idx] += (1.0 - s0) * fc.pair_model.predict(shifted[idx], active)
+            continue
         if s1:
             u = _log_brightness(np.asarray(tag_abundances, dtype=float)[np.ix_(idx, on)], thr[on]) - rec['u_median']
             s_event = np.clip(s0 + s1 * u, 0.0, CALIB_MAX_SCALE)
@@ -2176,15 +2185,63 @@ def apply_combination_scales(corrected_raw: np.ndarray, ids: np.ndarray, tag_abu
 
 def calibration_summary(scales: dict | None, design: FlowCodeDesign, n_largest: int = 5) -> dict:
     """For records and status text: the combinations calibrated (weight > 0),
-    identifiable, not identifiable, and the *n_largest* changes
-    [(name, applied scale)] by |1 - scale|."""
-    combos = (scales or {}).get('combos') or {}
+    identifiable, not identifiable, the *n_largest* changes
+    [(name, applied scale)] by |1 - scale|, and the user's overrides
+    [(name, scale)], which are not counted as calibrated or identifiable."""
+    every = (scales or {}).get('combos') or {}
+    combos = {n: r for n, r in every.items() if not r.get('override')}
     calibrated = {n: r for n, r in combos.items() if r['weight'] > 0}
     largest = sorted(calibrated.items(), key=lambda kv: -abs(1.0 - kv[1]['applied'][0]))[:n_largest]
     order = {n: i for i, n in enumerate(design.combo_names)}
+    overridden = sorted((n for n, r in every.items() if r.get('override')), key=order.get)
     return {'calibrated': sorted(calibrated, key=order.get), 'identifiable': len(combos),
             'not_identifiable': list((scales or {}).get('not_identifiable') or []),
-            'largest': [(n, r['applied'][0]) for n, r in largest]}
+            'largest': [(n, r['applied'][0]) for n, r in largest],
+            'overridden': [(n, every[n]['applied'][0]) for n in overridden]}
+
+
+def combination_overrides(overrides: dict | None, design: FlowCodeDesign) -> dict:
+    """
+    {combination name: scale} of the user's per-combination FRET correction
+    overrides for the combinations of *design*, in design order.
+
+    overrides : {``combo_key`` of a combination's tags: scale}, the
+                ``combo_overrides`` setting; keys of combinations not in
+                *design* are ignored and scales are kept within
+                [0, ``CALIB_MAX_SCALE``].
+    """
+    keyed = {str(k).upper(): v for k, v in (overrides or {}).items() if v is not None}
+    out = {}
+    for name, tags in zip(design.combo_names, design.combo_tags):
+        value = keyed.get(combo_key(tags))
+        if value is not None:
+            out[name] = float(np.clip(float(value), 0.0, CALIB_MAX_SCALE))
+    return out
+
+
+def with_combination_overrides(scales: dict | None, overrides: dict) -> dict | None:
+    """
+    *scales* (an ``estimate_combination_scales`` result, or None) with each
+    combination in *overrides* ({name: scale}, ``combination_overrides``)
+    given that fixed scale in place of its per-sample calibration, for
+    ``apply_combination_scales``: 0 removes the combination's correction, 1
+    keeps the backbone's model. The override records carry 'override' True,
+    'applied' [scale, 0] and weight 1. *scales* unchanged when *overrides* is
+    empty.
+    """
+    if not overrides:
+        return scales
+    out = dict(scales) if scales else {'combos': {}, 'not_identifiable': [], 'too_few': [], 'brightness': False,
+                                       'events': 0}
+    combos = dict(out.get('combos') or {})
+    for name, value in overrides.items():
+        combos[name] = {'s': float(value), 'slope': 0.0, 'se': None, 'z': None, 'weight': 1.0,
+                        'applied': [float(value), 0.0], 'share': None, 'n': None, 'u_median': None,
+                        'override': True}
+    out['combos'] = combos
+    out['not_identifiable'] = [n for n in out.get('not_identifiable') or [] if n not in overrides]
+    out['too_few'] = [n for n in out.get('too_few') or [] if n not in overrides]
+    return out
 
 
 def staged_corrected_raw(raw: np.ndarray, fc: FlowCodeSpectra, spectra: np.ndarray, fluor_names,
@@ -2223,7 +2280,8 @@ def staged_corrected_raw(raw: np.ndarray, fc: FlowCodeSpectra, spectra: np.ndarr
     if combo_scales:
         corrected_raw = apply_combination_scales(corrected_raw, stage['dc'].ids, stage['tag_abundances'],
                                                  stage['tag_baseline'], fc, combo_scales, thr)
-        stage['calibrated'] = sum(1 for r in combo_scales.get('combos', {}).values() if r['weight'] > 0)
+        stage['calibrated'] = sum(1 for r in combo_scales.get('combos', {}).values()
+                                  if r['weight'] > 0 and not r.get('override'))
     tandem_shifts = [(tandem, float(beta)) for tandem, beta in tandem_shifts]
     if any(beta for _t, beta in tandem_shifts):
         corrected_raw = apply_tandem_correction(corrected_raw, stage['tag_abundances'], stage['dc'].ids,
@@ -2357,7 +2415,9 @@ def staged_export_fn(fc: FlowCodeSpectra, spectra: np.ndarray, fluor_names, fina
     and too-few references come from all its events (the shift from those
     inside the FlowCode gates). From that debarcoding it calibrates each
     combination's error on the sample's singlets
-    (``estimate_combination_scales``, when ``calib_combos`` is on) and
+    (``estimate_combination_scales``, when ``calib_combos`` is on), puts the
+    user's per-combination overrides (``combo_overrides``) in place of the
+    calibration of those combinations (``with_combination_overrides``) and
     estimates the tandem breakdown from its gated events on the calibrated
     correction (``estimate_tandem_shifts``). The chunks that follow reuse
     the debarcoding (found by their rows; a block that is not the prepared
@@ -2380,9 +2440,10 @@ def staged_export_fn(fc: FlowCodeSpectra, spectra: np.ndarray, fluor_names, fina
     settings     : ``tag_shift_min_n``, ``correction``, ``regressor``,
                    ``tandem_z_min``, ``tandem_min_combos``,
                    ``tandem_max_events`` (also the most events the
-                   calibration reads) and the ``CALIB_DEFAULTS`` keys. The
-                   rescue settings come from the characterisation
-                   (``fc.settings``).
+                   calibration reads), the ``CALIB_DEFAULTS`` keys and
+                   ``combo_overrides`` ({``combo_key``: scale}; used with the
+                   per-combination correction only). The rescue settings
+                   come from the characterisation (``fc.settings``).
     on_block     : called with each chunk's ``staged_summary``.
     tandems      : ``TandemTag`` list to correct; ``tandem_pool`` as in
                    ``estimate_tandem_shifts``.
@@ -2395,7 +2456,8 @@ def staged_export_fn(fc: FlowCodeSpectra, spectra: np.ndarray, fluor_names, fina
                    (``poisson_weights``) when None.
     on_scales    : called with each sample's calibration (the
                    ``estimate_combination_scales`` result plus
-                   'weighting').
+                   'weighting', with the overrides in place), when the
+                   calibration is on or there are overrides.
     """
     fluor_names = list(fluor_names)
     transform = logicle_transform(float(fc.transform_params.get('magnitude_ceiling', 4194304.0)),
@@ -2415,6 +2477,8 @@ def staged_export_fn(fc: FlowCodeSpectra, spectra: np.ndarray, fluor_names, fina
     )
     calib = calibration_settings(settings)
     calibrate = bool(calib['calib_combos']) and fc.fret_corrected and staged['correction'] == 'combo'
+    overrides = (combination_overrides(settings.get('combo_overrides'), fc.design)
+                 if fc.fret_corrected and staged['correction'] == 'combo' else {})
     rescue_settings = {k: staged[k] for k in ('rescue', 'flat_threshold', 'gate_frac', 'tag_shift_min_n',
                                               'regressor', 'too_few')}
     sample = {'shifts': [], 'scales': None, 'debarcoded': None, 'row_sums': None, 'next': 0}
@@ -2456,8 +2520,9 @@ def staged_export_fn(fc: FlowCodeSpectra, spectra: np.ndarray, fluor_names, fina
         max_events = int(settings.get('tandem_max_events', 2_000_000))
         if calibrate:
             sample['scales'] = calibrate_sample(raw_fl, raw, af, sample_key, names, max_events, debarcoded)
-            if on_scales is not None:
-                on_scales(sample['scales'])
+        sample['scales'] = with_combination_overrides(sample['scales'], overrides)
+        if (calibrate or overrides) and on_scales is not None:
+            on_scales(sample['scales'])
         if not tandems:
             return
         idx = subsample(gated, len(raw_fl), max_events)

@@ -902,6 +902,25 @@ def library_blocks(stats: dict, sample_labels: dict | None = None) -> tuple:
     return shown, library_colours(dict.fromkeys(labels.get(lib, lib) for lib in libraries.values()))
 
 
+def volcano_limits(results: pd.DataFrame, fdr_scope: str) -> tuple:
+    """
+    (largest |log2 fold change|, largest -log10 adjusted p-value) over every
+    comparison in one test's results, so that test's volcanos all share one
+    scale. The p-value column is the one the volcano plots (see
+    differential_plots.significance_column). Either is None when no finite
+    value exists.
+    """
+    from honeychrome.view_components import differential_plots as dp
+
+    logfc = np.abs(results['logFC'].to_numpy(dtype=float))
+    logfc = logfc[np.isfinite(logfc)]
+    pval_col, _ = dp.significance_column(results, fdr_scope)
+    neg_lp = -np.log10(np.maximum(results[pval_col].to_numpy(dtype=float), 1e-300))
+    neg_lp = neg_lp[np.isfinite(neg_lp)]
+    return (float(logfc.max()) if logfc.size else None,
+            float(neg_lp.max()) if neg_lp.size else None)
+
+
 def comparison_figures(stats: dict, pair: tuple, pval_threshold: float, fc_threshold: float,
                        fdr_scope: str, is_dark: bool, population: str,
                        sample_labels: dict | None = None, group_colours: dict | None = None,
@@ -954,10 +973,12 @@ def comparison_figures(stats: dict, pair: tuple, pval_threshold: float, fc_thres
             continue
         if first is None:
             first, first_key = view, key
+        x_limit, y_limit = volcano_limits(res, fdr_scope)
         add(f'{key}_volcano', f'{TEST_NAMES[key]} volcano', dp.make_volcano_figure, results=view,
             results_df=view, title=f'{TEST_NAMES[key]} volcano: {label}', pval_threshold=pval_threshold,
             fc_threshold=fc_threshold, is_dark=is_dark, fdr_scope=fdr_scope, x_label=X_LABELS[key],
-            run_label=run_label, group_a=base, group_b=other, group_colours=colours)
+            run_label=run_label, group_a=base, group_b=other, group_colours=colours,
+            x_limit=x_limit, y_limit=y_limit)
     if first is not None:
         add('fold_change_bars', 'Fold-change bars', fold_change_bars_figure, results=first,
             results_df=first, title=f'{TEST_NAMES[first_key]}: {label}', group_a=base, group_b=other,
@@ -983,9 +1004,11 @@ def summary_figures(stats: dict, is_dark: bool, population: str, heatmap_order: 
                     heatmap_rows: int = 1, n_loadings: int = 10,
                     sample_labels: dict | None = None, group_colours: dict | None = None) -> dict:
     """Figures over every comparison: the comparison heatmap of the
-    primary test and the sample PCA ({key: {'fig', 'title', 'error',
-    'make'}}). With several libraries there is one PCA per library
-    (``sample_pca <library>``), each on its own samples and guides."""
+    primary test (counts when run), the same heatmap of the frequencies
+    test when both were run (``comparison_heatmap_freq``), and the sample
+    PCA ({key: {'fig', 'title', 'error', 'make'}}). With several libraries
+    there is one PCA per library (``sample_pca <library>``), each on its own
+    samples and guides."""
     from honeychrome.view_components import differential_plots as dp
 
     _bundled_plugins_on_path()
@@ -993,18 +1016,22 @@ def summary_figures(stats: dict, is_dark: bool, population: str, heatmap_order: 
 
     out = {}
     key, res = primary_results(stats)
-    if res is not None:
-        def make_heatmap():
+    heatmaps = [('comparison_heatmap', 'Comparison heatmap', key, res)]
+    if key == 'counts' and stats.get('freq') is not None:
+        heatmaps.append(('comparison_heatmap_freq', 'Comparison heatmap (frequencies)', 'freq', stats['freq']))
+    for fig_key, fig_title, test, results in heatmaps:
+        if results is None:
+            continue
+
+        def make_heatmap(test=test, results=results):
             return dp.make_comparison_heatmap_figure(
-                res, f'{population}: {TEST_NAMES[key].lower()}, all comparisons', is_dark=is_dark,
+                results, f'{population}: {TEST_NAMES[test].lower()}, all comparisons', is_dark=is_dark,
                 order=heatmap_order, n_rows=heatmap_rows, comparison_order=stats['comparisons'])
 
         try:
-            out['comparison_heatmap'] = {'fig': make_heatmap(), 'title': 'Comparison heatmap', 'error': None,
-                                         'make': make_heatmap}
+            out[fig_key] = {'fig': make_heatmap(), 'title': fig_title, 'error': None, 'make': make_heatmap}
         except Exception as exc:
-            out['comparison_heatmap'] = {'fig': None, 'title': 'Comparison heatmap',
-                                         'error': str(exc) or type(exc).__name__}
+            out[fig_key] = {'fig': None, 'title': fig_title, 'error': str(exc) or type(exc).__name__}
     libraries = stats.get('libraries')
     labels = stats.get('library_labels') or {}
     runs = ([(f'sample_pca {lib}', f'Sample PCA ({labels.get(lib, lib)})', lib)
