@@ -18,9 +18,11 @@
 #      Honeychrome's requirements when they have changed.
 #   5. Compiles the speed-up kernels (SOM, AutoSpectral optimisation,
 #      noise-model GLS, Fix My Unmix) and checks that each one loads.
-#   6. Copies the FlowCode plugin files (Python modules and the data tables
+#   6. Checks that every Honeychrome module, function and setting the
+#      FlowCode plugin uses is present, and stops before copying it if not.
+#   7. Copies the FlowCode plugin files (Python modules and the data tables
 #      read beside them) into ~/Experiments/plugins.
-#   7. Puts "Honeychrome" and "Update Honeychrome" icons on the Desktop.
+#   8. Puts "Honeychrome" and "Update Honeychrome" icons on the Desktop.
 #
 # Everything is logged to ~/Honeychrome/install.log.
 #
@@ -225,7 +227,7 @@ try:
 except ImportError:
     fmu = False
 status = {
-    'SOM (clustering)': SOM_KERNEL_AVAILABLE,
+    'SOM (clustering, phenotype shift)': SOM_KERNEL_AVAILABLE,
     'AutoSpectral optimisation': AUTOSPECTRAL_OPT_KERNEL_AVAILABLE,
     'Noise-model GLS': GLS_M2P_KERNEL_AVAILABLE,
     'Fix My Unmix': fmu,
@@ -238,6 +240,86 @@ PYCHECK
 # ---------------------------------------------------------------------------
 # FlowCode plugin
 # ---------------------------------------------------------------------------
+
+# Every Honeychrome module, function and setting the plugin imports must be
+# present; otherwise the plugin is newer than the Honeychrome branch and the
+# files already in the plugins folder are left as they are.
+step "Checking that the FlowCode plugin fits this Honeychrome"
+cd "$APP_DIR"
+"$VPY" - "$PLUGIN_SRC" "${PLUGIN_SKIP[@]}" <<'PYCHECK' || fail "the FlowCode plugin needs a newer Honeychrome than the $HONEYCHROME_BRANCH branch provides (see the MISSING lines above). No plugin files were copied, so a previously installed plugin stays as it was. Send the log to Oliver."
+import ast
+import importlib
+import os
+import sys
+import types
+from pathlib import Path
+
+os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+src = Path(sys.argv[1])
+skip_names = set(sys.argv[2:])
+
+
+def guarded(tree):
+    """Nodes inside try blocks: optional imports the plugin can do without."""
+    ids = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try):
+            for part in node.body + node.orelse + node.handlers + node.finalbody:
+                ids.update(id(sub) for sub in ast.walk(part))
+    return ids
+
+
+imports, attributes = {}, {}
+for path in sorted(src.glob('*.py')):
+    if path.name in skip_names or path.name.endswith('_test.py'):
+        continue
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    skip = guarded(tree)
+    aliases = {}
+    for node in ast.walk(tree):
+        if id(node) in skip:
+            continue
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and (node.module or '').split('.')[0] == 'honeychrome':
+            for a in node.names:
+                imports.setdefault((node.module, a.name), path.name)
+                aliases[a.asname or a.name] = (node.module, a.name)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split('.')[0] == 'honeychrome':
+                    imports.setdefault((a.name, None), path.name)
+                    if a.asname:
+                        aliases[a.asname] = (a.name, None)
+    for node in ast.walk(tree):
+        if (id(node) not in skip and isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name) and node.value.id in aliases):
+            attributes.setdefault((aliases[node.value.id], node.attr), path.name)
+
+
+def resolve(module, name):
+    obj = importlib.import_module(module)
+    if name is None:
+        return obj
+    if hasattr(obj, name):
+        return getattr(obj, name)
+    return importlib.import_module(f'{module}.{name}')
+
+
+found, missing = {}, []
+for (module, name), where in sorted(imports.items(), key=lambda kv: (kv[0][0], kv[0][1] or '')):
+    try:
+        found[(module, name)] = resolve(module, name)
+    except Exception as exc:
+        label = module if name is None else f'{module}.{name}'
+        missing.append(f'{label} (used in {where}; {type(exc).__name__}: {exc})')
+for (target, attr), where in sorted(attributes.items(), key=lambda kv: (kv[0][0][0], kv[0][0][1] or '', kv[0][1])):
+    obj = found.get(target)
+    if isinstance(obj, types.ModuleType) and not hasattr(obj, attr):
+        missing.append(f'{obj.__name__}.{attr} (used in {where})')
+for line in missing:
+    print(f'    MISSING {line}')
+print(f'    {len(imports) + len(attributes)} Honeychrome names used by the plugin, {len(missing)} missing')
+sys.exit(1 if missing else 0)
+PYCHECK
 
 step "Installing the FlowCode plugin into $PLUGINS_DIR"
 mkdir -p "$PLUGINS_DIR"

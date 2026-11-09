@@ -1,6 +1,6 @@
 # FlowCode plugin for Honeychrome
 
-FlowCode debarcoding with FRET and spillover correction for spectral flow cytometry, and the analysis of FlowCode knockout screens. The plugin is a Honeychrome tab (`FlowCode`) and a Python port of the FlowCodeUnmix 0.6.0 AF-matched staged pipeline, extended with a through-origin error model, a too-few-tag rescue and a tandem-breakdown check, followed by differential statistics on the combinations, a marker test, and signed pathway and gene-group tests.
+FlowCode debarcoding with FRET and spillover correction for spectral flow cytometry, and the analysis of FlowCode knockout screens. The plugin is a Honeychrome tab (`FlowCode`) and a Python port of the FlowCodeUnmix 0.6.0 AF-matched staged pipeline, extended with a through-origin error model, a too-few-tag rescue, a tandem-breakdown check and a per-sample calibration of each combination's correction, followed by differential statistics on the combinations, a marker test, signed pathway and gene-group tests, and a per-guide phenotype-shift test. A cohort acquired over several days, each day with its own controls, is processed day by day and analysed together (see [Cohorts acquired over several days](#cohorts-acquired-over-several-days)).
 
 Contents
 
@@ -10,7 +10,8 @@ Contents
 4. [Outputs](#4-outputs)
 5. [Mechanics: debarcoding and FRET spillover correction](#5-mechanics-debarcoding-and-fret-spillover-correction)
 6. [Mechanics: pathway and gene-group tests](#6-mechanics-pathway-and-gene-group-tests)
-7. [Differences from the R package](#7-differences-from-the-r-package)
+7. [Mechanics: phenotype shift and tag spillover correction](#7-mechanics-phenotype-shift-and-tag-spillover-correction)
+8. [Differences from the R package](#8-differences-from-the-r-package)
 
 ---
 
@@ -26,11 +27,11 @@ The plugin does six jobs, one per section:
 | Tab | Job |
 |---|---|
 | 1. Inputs | Choose the backbone samples (cells that carry every combination), the matched unstained sample and its AF library |
-| 2. Tags & Combos | Pick the tag channels and define the combinations |
+| 2. Tags & Combos | Pick the tag channels and define the combinations, for one guide library or several |
 | 3. Gates & Thresholds | Scatter gates on the backbone and a positivity threshold per tag |
 | 4. Debarcode & FRET | Characterise the unmixing error of every combination on the backbone and show before/after plots |
 | 5. Unmix & Export | Unmix the selected samples with the correction and write FCS files with a `FlowCode` channel and one `FC <name>` channel per combination |
-| 6. Analysis | Differential barcode distributions between sample groups or populations, marker effects of each combination, and pathway and gene-group tests, counted live from the raw files or from the exported files |
+| 6. Analysis | Differential barcode distributions between sample groups or populations, marker effects of each combination, pathway and gene-group tests and each guide's phenotype shift, counted live from the raw files or from the exported files, including those of other experiments of the same study |
 
 The plugin reuses Honeychrome's AutoSpectral machinery: AF profiles from AutoSpectral › Autofluorescence, and the experiment's unmixing method set on the AutoSpectral tab (per-cell AF, the noise model (M2pg) or spectral variants, with Fix My Unmix's spectral corrections when they are in use) for the final unmix.
 
@@ -46,11 +47,15 @@ The plugin reuses Honeychrome's AutoSpectral machinery: AF profiles from AutoSpe
 | `flowcode_method.py` | The experiment's unmixing method as FlowCode uses it (final unmix, debarcoding space), no Qt |
 | `flowcode_export.py` | Reading, FlowCode unmixing and writing of whole samples: the export and the Analysis page's live unmix |
 | `flowcode_fix_unmix.py` | Fix My Unmix (AutoSpectral › Spectral Correction) on FRET-corrected data, started from section 5, no Qt |
-| `flowcode_analysis.py`, `flowcode_stats.py` | Analysis page numerics, no Qt |
+| `flowcode_analysis.py`, `flowcode_stats.py` | Analysis page numerics, no Qt (`flowcode_analysis.py` also links the exported files of other experiments) |
+| `flowcode_count_cache.py` | The compact per-sample events *Count events* keeps, so that counting again needs no unmixing, no Qt |
 | `flowcode_analysis_page.py` | Section 6 (Analysis) |
 | `flowcode_view_stack.py` | The drop-down that chooses section 6's result views |
 | `flowcode_gating.py`, `flowcode_gating_view.py` | Section 6's Gating tab: the experiment's gates over FlowCode-unmixed events (numerics and figure, no Qt; the tab) |
-| `flowcode_phenotype.py`, `flowcode_phenotypes.csv` | Phenotype populations for the Analysis page: marker definitions scored on the live-unmixed events, no Qt; the plugin's own definitions |
+| `flowcode_phenotype.py` | Phenotype populations for the Analysis page: definitions from Honeychrome's cell-type database, resolved on the panel and scored on the live-unmixed events, no Qt |
+| `flowcode_phenotype_shift.py` | Per-guide phenotype shift: clustering, cluster fingerprints, the agreement test, kept events and saved results, no Qt |
+| `flowcode_tag_correction.py` | Data-level correction of combination-specific tag spillover for the phenotype shift, no Qt |
+| `flowcode_shift_view.py`, `flowcode_shift_plots.py` | Section 6's *Phenotype shift* tab and its figures |
 | `flowcode_pathways.py` | Signed GO pathway tests on the Counts results, and their figures, no Qt |
 | `flowcode_go_signed_sets.csv.gz`, `flowcode_mgi_gene_names.csv.gz` | The signed mouse GO Biological Process sets and the MGI gene symbols and synonyms (GO release 2026-07-26, MGI GAF 2026-05-21; CC BY 4.0, Gene Ontology Consortium and MGI) |
 | `flowcode_gene_groups.py` | Gene-group tests, the guide allocation and the spider figure, no Qt |
@@ -65,6 +70,8 @@ The plugin reuses Honeychrome's AutoSpectral machinery: AF profiles from AutoSpe
 
 - Honeychrome run from Python (the PyPI package or a source clone, Python 3.12 or higher), in a version with the AutoSpectral tab's unmixing method (`controller_components/unmix_method.py`). With an older Honeychrome the tab shows a message instead. The plugin system is not available in the packaged executables.
 - For section 6's Pathways and Gene groups, a Honeychrome whose counts statistics have the calibrated quasi-likelihood test (`ql_common_dispersion` and `ql_comparisons` in `controller_components/differential_stats.py`). With an older one, running statistics with either ticked fails.
+- A Honeychrome with the plugins' figure options (`view_components/figure_options.py`) and the cell-type database module (`controller_components/cell_type_panel.py`). The install scripts check every Honeychrome module, function and setting the plugin imports before copying it, and keep the previous plugin when one is missing.
+- The phenotype shift clusters with the FlowSOM bundled with Honeychrome (Honeycluster's `flowsom_consensus`); the compiled SOM kernel makes it fast.
 - No packages beyond Honeychrome's own requirements (numpy, scipy, pandas, scikit-learn, matplotlib, colorcet, pyqtgraph, flowkit, flowio).
 - In the experiment, before opening the FlowCode tab:
   - The unmixing matrix is calculated (Spectral Process tab). The tab shows a disabled message until it is.
@@ -85,9 +92,9 @@ Optional: the compiled kernels (`bundled_plugins/build_autospectral_opt_kernel.p
 
 Honeychrome looks for plugins in `Experiments/plugins` in the user's home folder (`~/Experiments/plugins`). It creates the folder on first launch.
 
-The install scripts in this repository (`install_honeychrome.sh` for macOS, `install_honeychrome.ps1` for Windows; steps in `INSTALL_GUIDE.md`) install or update Honeychrome's `autospectral` branch with its compiled kernels and copy the plugin files below for you; run the same command again to update. To install the plugin by hand:
+The install scripts in this repository (`install_honeychrome.sh` for macOS, `install_honeychrome.ps1` for Windows; steps in `INSTALL_GUIDE.md`) install or update Honeychrome's `autospectral` branch with its compiled kernels, check that the plugin's Honeychrome imports are all present, and copy the plugin files below for you; run the same command again to update. To install the plugin by hand:
 
-1. Copy these 23 files into `~/Experiments/plugins/`, keeping them in the same folder:
+1. Copy these 27 files into `~/Experiments/plugins/`, keeping them in the same folder:
 
    ```
    flowcode_unmix_tab.py
@@ -98,6 +105,7 @@ The install scripts in this repository (`install_honeychrome.sh` for macOS, `ins
    flowcode_export.py
    flowcode_analysis.py
    flowcode_stats.py
+   flowcode_count_cache.py
    flowcode_analysis_page.py
    flowcode_view_stack.py
    flowcode_figure_panel.py
@@ -105,7 +113,10 @@ The install scripts in this repository (`install_honeychrome.sh` for macOS, `ins
    flowcode_gating.py
    flowcode_gating_view.py
    flowcode_phenotype.py
-   flowcode_phenotypes.csv
+   flowcode_phenotype_shift.py
+   flowcode_tag_correction.py
+   flowcode_shift_view.py
+   flowcode_shift_plots.py
    flowcode_pathways.py
    flowcode_go_signed_sets.csv.gz
    flowcode_mgi_gene_names.csv.gz
@@ -115,7 +126,7 @@ The install scripts in this repository (`install_honeychrome.sh` for macOS, `ins
    flowcode_gene_groups_metab.csv
    ```
 
-   Only `*_tab.py` files are discovered. The tab puts its own folder on `sys.path` and imports the others, and the data tables (`.csv`, `.csv.gz`) are read from beside the modules, so all of them must sit side by side. Copy files, not symlinks.
+   Only `*_tab.py` files are discovered. The tab puts its own folder on `sys.path` and imports the others, and the data tables (`.csv`, `.csv.gz`) are read from beside the modules, so all of them must sit side by side. Copy files, not symlinks. `flowcode_phenotypes.csv`, from earlier versions, is no longer read (phenotypes come from Honeychrome's cell-type database) and can be deleted.
 
 2. Start Honeychrome from your Python environment:
 
@@ -139,7 +150,7 @@ If the tab does not appear, check `~/Experiments/honeychrome.log`. A missing com
 
 ## 3. Using it in the app
 
-Open the **FlowCode** tab. The six sections are listed down the left side; the main window's sample list is hidden while the tab is open. Each has a help toggle at the top and a status line: `Done`, `Needs re-run: <reason>` or `Waiting for section N`. Sections 3 to 6 split into a row of tabs (e.g. Combo frequencies, Assess correction); the open tab is remembered. In sections 4 and 5 the whole page scrolls: scroll past the controls at the top and the tabs fill the window. Every Advanced settings tab, and the Statistics, inclusion-rule and figure options of section 6, have a **Restore defaults** button (greyed when everything is at its default). Figures have a **Size** slider, **⤢ Pop Out** (a resizable window with the matplotlib toolbar) and **Export Graphic**. Work through them in order.
+Open the **FlowCode** tab. The six sections are listed down the left side; the main window's sample list is hidden while the tab is open. Each has a help toggle at the top and a status line: `Done`, `Needs re-run: <reason>` or `Waiting for section N`. Sections 3 to 6 split into a row of tabs (e.g. Combo frequencies, Assess correction); the open tab is remembered. In sections 4 and 5 the whole page scrolls: scroll past the controls at the top and the tabs fill the window. Every Advanced settings tab, and the Statistics, inclusion-rule and figure options of section 6, have a **Restore defaults** button (greyed when everything is at its default). Figures have a **Size** slider, **⤢ Pop Out** (a resizable window with the matplotlib toolbar) and **Export Graphic**, and figure options set in the **Options** side panel (grid lines, the title and panel titles, font sizes, the background, and the axis ranges of volcano plots), kept with the experiment and used on screen, in Pop Out, in Export Graphic and in the exported report alike. Work through them in order.
 
 ### Section 1: Inputs
 
@@ -153,6 +164,7 @@ Open the **FlowCode** tab. The six sections are listed down the left side; the m
 
 - **Tag channels.** Unmixed channels whose antigen is a known tag are ticked automatically (exact match on the canonical name, so `S` and `C` do not match CD4 or SSC). Tick or untick others by hand. The **Nearest tag** column is the other tag with the most similar reference spectrum; it becomes the default y-axis of the threshold plot.
 - **Combinations.** A table with Include, Name, Tag 1–3 and (after section 4) the backbone event count. Without a CSV the plugin lists all C(n, 3) triplets with names such as `HA_V5_AU1`. Untick **Include** to drop a combination: its events are then reported as unresolved. Names become exported channels `FC <name>`, so they must be unique, non-empty and free of commas. **Save combinations CSV** writes the R format.
+- **Several libraries** (Advanced options). For samples transduced with different guide libraries on the same tags. Each library has its own combinations CSV (the section 1 CSV becomes Library 1, and section 1's picker is disabled), and each sample is assigned to one library, or to *Other* for samples that belong to none (FMOs, for example). Debarcoding uses every triplet of every library, so combinations are named by their triplet (`FC AU1_C_FLAG`), and the guide names come from each library's CSV. **Assign by pattern** matches each library's sample-name pattern (a regular expression, case-insensitive) against the sample names; the default pattern finds the library's number, letter or name after `Librar`, directly or after a space or underscore (`Library1`, `Library 1`, `Library_1`, but not `Library10`). It runs once on its own when *Several libraries* is first ticked, for samples without a library. *Label* is the name shown in the results. With *Merge guides with the same name* (on by default), a guide name used by several libraries (a non-targeting control, for example) is one guide in the Analysis. The export is refused for selected samples without a library. In section 6, pairing and expanded clones are worked out within each library, a mouse never spans two libraries, and the pathway and gene-group tests treat each library as its own unit (6.6).
 
 ### Section 3: Gates & Thresholds
 
@@ -205,21 +217,27 @@ With *No FRET backbone* ticked in section 1:
 - **Tandem tags.** Tick the tags on tandem fluorophores to check for sample-specific breakdown (5.7).
 - **Combination calibration.** *Calibrate each combination's correction per sample (out-of-span)*, on by default, rescales each combination's error model by what the sample itself shows (5.8). *Brightness-dependent calibration* (off by default) lets the scale change with tag brightness. The z threshold (3), minimum out-of-span share (0.05) and minimum singlet events per combination (40) are here too. It applies only with the `combo` correction and FRET correction. After an export the result line lists, per sample, the combinations calibrated out of those identifiable, the five largest changes and the combinations that could not be calibrated.
 
+- **FRET correction overrides** (Advanced settings). Replace a combination's FRET/error correction in every exported sample: *Off* removes it and *Scaled* multiplies it (1 is the backbone's model). Either takes the place of that combination's per-sample calibration, and the tandem breakdown is estimated on the overridden correction. They are meant for a backbone whose model does not fit the samples, such as FRET controls from another experiment: a combination whose correction moves a gating marker that the uncorrected data show no sign of needing, or makes a marker depend on tag brightness within the combination. Overrides are kept by the combination's tags, so renaming it keeps them, and are recorded in `FlowCode_run.json` and the `FLOWCODEOVERRIDES` keyword.
+
 Press **Unmix and export**. With a slow method (spectral variants, or the noise model without its compiled kernel) a probe estimates the run time and asks you to confirm before starting; it is rough, and the real time can differ by a factor of 2 or more. When Honeychrome runs one heavy job at a time, the export is refused, with the running job named, while another one holds the application.
 
 ### Section 6: Analysis
 
 **Gating** (first tab, view only): the experiment's Unmixed Data plots and gates, drawn with Honeychrome's own plot widget, over the FlowCode-unmixed events of the sample picked in the main window's sample browser (shown on this tab only). Choose the view (*Uncorrected*: the experiment's own unmix of the raw file through the same plan; *FlowCode standard*; *FlowCode calibrated*: with the per-sample combination calibration) and what to highlight in pink (barcoded events, nothing, one combination, or the events of a ticked phenotype with membership at least one half). The table gives each gate's % of its parent, its events and the highlighted events changing side against the uncorrected view, which is unmixed as well for that comparison. Membership is the counts' own (`SampleGating.memberships`, sample overrides included), and the view the counts use reads their live-unmix cache; the other views are cached too. Plots, axes and gates cannot be changed here: edit them in the main window.
 
-**Source**: *Live unmix* (default) FlowCode-unmixes each sample's raw file with the current characterisation and the experiment's method, exactly as section 5 would export it, without writing files; the unmixed values are cached in `cache/flowcode_unmixed` (pruned with the App Settings' unmixing cache size), so changing the population later does not unmix again. *Exported files* reads the files section 5 wrote. Counts from the two sources are identical for the same inputs. Saved counts say which source they came from and are marked out of date when the samples, the unmixing, the population or the gating change.
+**Source**: *Live unmix* (default) FlowCode-unmixes each sample's raw file with the current characterisation and the experiment's method, exactly as section 5 would export it, without writing files; the unmixed values are cached in `cache/flowcode_unmixed` (pruned with the App Settings' unmixing cache size), so changing the population later does not unmix again. *Exported files* reads the files section 5 wrote. Counts from the two sources are identical for the same inputs. Saved counts say which source they came from and are marked out of date when the samples, the unmixing, the population or the gating change. Each exported file is linked to its sample by its `FLOWCODESOURCE` keyword, or by the export's file name; files exported with a different combination table, or with an earlier characterisation, are listed but not used unless ticked.
 
-**Populations**: tick one or more gates of the unmixed gating tree; each ticked gate is counted as a population of its own, in one pass over the samples (e.g. CD8 and Tconv, or Naive, Activated and Resident). Counting also sums each combination's marker intensities (every fluorophore of the spectral model except the FlowCode tags, on the experiment's display scale) into `cache/flowcode_analysis/marker_sums.npz` for the marker test.
+**Other experiments** (with *Exported files*): the export folders (section 5) of other experiments of the same study, typically the other days of a cohort acquired over several days (see [Cohorts acquired over several days](#cohorts-acquired-over-several-days)). **Add folder…** lists every FlowCode export under the folder. Their files are counted with this experiment's samples, named by their file names (with the acquisition date, else the folder, added when a name is taken), and gated with this experiment's unmixed gates: the template boundaries, since sample overrides exist only for this experiment's samples. A file is used only when it has the same combination table (`FLOWCODECOMBOS`) and every unmixed channel of this experiment; with several libraries, its `FLOWCODELIBRARY` must name a library of this experiment. The Gating tab, *Live unmix* and phenotypes use this experiment's samples only; the phenotype shift uses the linked files, without its spillover correction (which needs *Live unmix*).
 
-**Phenotypes**: populations without a gate, listed under the gating tree. A phenotype is a marker definition (`CD4 Treg`: CD3+ CD4+ FoxP3+ CD8- CD19-) from the plugin's `flowcode_phenotypes.csv` (same columns as Honeycluster's `drc_cell_type_database.csv`, whose rows are listed too; a plugin row hides a bundled row with the same cell type and species). Each definition is resolved against the antigens typed into the spectral model through the marker database's synonyms: a positive marker the panel lacks, or a marker on two fluorophores, leaves it unresolved (greyed, with the reason in its tooltip); a negative marker the panel lacks is left unchecked and said so; the panel's viability dye is added as a negative marker when there is one. Ticked, a phenotype is counted as a population of its own from the live unmix: every event inside the FlowCode Singlets and Cells gates gets, per listed marker, the probability of being positive, a logistic soft threshold in units of the sample's negative SD (the AF library's envelope null variance at the event's AF abundance plus the spillover spread at its abundances, as the AF assignment uses them; one half at 3 SD, 0.12 at 2 SD, 0.88 at 4 SD), and its membership is the product of those probabilities (positives) and their complements (negatives). The counts per combination are the memberships summed, so `in population`, `barcoded` and the counts are fractional; the marker sums are membership-weighted. The probability says "above the negative" only (no high/intermediate levels), scatter has no probability (the FlowCode gates do that), and the markers are taken as independent. Phenotypes need *Live unmix* (exported files carry no negative model), and counts that include one run the Frequencies and Markers tests only: the Counts test needs whole events and is withheld with a note. The resolution of each counted phenotype is written to `settings.txt`. Definitions can be added by editing `flowcode_phenotypes.csv` (canonical marker names, or any synonym the marker database knows). *Split each phenotype by congenic marker* counts each ticked phenotype as its CD45.1+ CD45.2- and CD45.1- CD45.2+ variants when the panel carries both. Pathways and Gene groups are built on the Counts test, so they are not run on counts that include a phenotype.
+**Acquisition date**: when the samples were acquired on more than one day (the files' `$DATE`, read from the raw files with *Live unmix* and from the exported files otherwise), a covariate *acquisition date* is filled in on the Groups tab and ticked under *Adjust for*, so that day-to-day differences in staining, acquisition and FlowCode processing are not taken for group effects. When samples are paired by mouse and each mouse was acquired on one day, the pairing already accounts for the day, and the covariate is left out of the model. When every sample of one group was acquired on one day and another group on another, day and group cannot be told apart, and the statistics say so. Values typed by hand are kept; removing the covariate stops the filling.
+
+**Populations**: tick one or more gates of the unmixed gating tree; each ticked gate is counted as a population of its own, in one pass over the samples (e.g. CD8 and Tconv, or Naive, Activated and Resident). Counting also sums each combination's marker intensities (every fluorophore of the spectral model except the FlowCode tags, on the experiment's display scale) into `cache/flowcode_analysis/marker_sums.npz` for the marker test. Only the gate boundaries come from the experiment: they are applied to the FlowCode-corrected events, with each sample's own gate overrides. To make counting again fast, the first count keeps, for each sample, only what counting uses: the events inside the gate above every counted population that is drawn on scatter, Time or the viability dye (usually the viable gate), with the channels gates are drawn on (and, for barcoded events, the marker channels), in `cache/flowcode_analysis/count_events`. Later counts read only these, so redrawing gates below that gate, or ticking other populations under it, needs no unmixing; a sample is read in full again when its file, the unmixing, that gate or a gate above it changes, or a gate is drawn on a channel that was not kept. Counts with a phenotype ticked read every sample in full.
+
+**Phenotypes**: populations without a gate, listed under the gating tree. A phenotype is a marker definition (`CD4 Treg`: CD3+ CD4+ FoxP3+ CD8- CD19-) from Honeychrome's cell-type database (`drc_cell_type_database.csv`, the definitions Honeycluster and Automated Gating use). Each definition is resolved against the antigens typed into the spectral model through the marker database's synonyms. Only the markers on the panel have a say: a marker the panel lacks, of either sign, is left unchecked and said so, and a marker on two fluorophores leaves the definition unresolved (greyed, with the reason in its tooltip); the panel's viability dye is added as a negative marker when there is one. Definitions that read the same on the panel (alpha-beta and gamma-delta T cells on a panel without the TCRs, for example) are one phenotype, named by its signs and its members; its tooltip says which markers would separate them. Ticked, a phenotype is counted as a population of its own from the live unmix: every event inside the FlowCode Singlets and Cells gates gets, per listed marker, the probability of being positive, a logistic soft threshold in units of the sample's negative SD (the AF library's envelope null variance at the event's AF abundance plus the spillover spread at its abundances, as the AF assignment uses them; one half at 3 SD, 0.12 at 2 SD, 0.88 at 4 SD), and its membership is the product of those probabilities (positives) and their complements (negatives). The counts per combination are the memberships summed, so `in population`, `barcoded` and the counts are fractional; the marker sums are membership-weighted. The probability says "above the negative" only (no high/intermediate levels), scatter has no probability (the FlowCode gates do that), and the markers are taken as independent. Phenotypes need *Live unmix* (exported files carry no negative model), and counts that include one run the Frequencies and Markers tests only: the Counts test needs whole events and is withheld with a note. The resolution of each counted phenotype is written to `settings.txt`. New definitions belong in Honeychrome's cell-type database (canonical marker names, or any synonym the marker database knows). *Split each phenotype by congenic marker* counts each ticked phenotype as its CD45.1+ CD45.2- and CD45.1- CD45.2+ variants when the panel carries both. Pathways and Gene groups are built on the Counts test, so they are not run on counts that include a phenotype.
 
 **Groups**: when no sample has a group, groups and a pairing variable are suggested from the sample names (repeated fields separated by spaces or underscores) and applied; **Undo** removes them and **Suggest groupings…** shows every field found. Covariates are set in their own table. The groups are a table with a sample-name pattern (regular expression, case-insensitive) and a colour each. *Assign by pattern* gives every listed sample the first group whose pattern matches its name. Double-click a colour to change it; group colours are saved with the experiment and used in every figure (volcano direction ramps, heatmap group bars, fold-change bars, PCA, QC, combination plots).
 
-**Statistics**: *Counts* is a negative-binomial GLM per combination with the sample's library size as offset; each sample is weighted by its cell number, so small samples count for less. The *quasi-likelihood F test* (default) shrinks the dispersions towards a common value and corrects for low counts. On random splits of inbred mice with plenty of events (BATF chimeras, where nothing differed) it gave 3–7 % false positives at p < 0.05 instead of 5 %; with about 100 barcoded cells per sample (e.g. brain) about 6–7 %, where a fold-change threshold with TREAT keeps the hits reliable; on gated populations of a human cohort 7–11 % for populations under 100 events, because donors vary more than the model allows for. The *Wald test* uses each combination's own dispersion and is not recommended (21–31 % on the same mice, 10–13 % on the human cohort). *Frequencies* is a moderated linear model on log2 % of the library size (half an event added to every count). *Normalisation* sets the library size: *Robust* (default) rescales the barcoded events by a trimmed ratio of sums, so a few expanded clones do not push every other combination down; *Total* is the barcoded events; *Control* uses the chosen control combinations (names with "non-targeting" are ticked first), without their own expanded clones. Pairing (e.g. by mouse) enters as a blocking term, and *Split by* runs the same comparisons within each level of a covariate. FDR is Benjamini-Hochberg within each comparison; with *TREAT* the p-value tests |log2FC| above the threshold rather than any change.
+**Statistics**: *Counts* is a negative-binomial GLM per combination with the sample's library size as offset; each sample is weighted by its cell number, so small samples count for less. The *quasi-likelihood F test* (default) fits each comparison on the samples of its two groups, gives each combination a dispersion (its extra sample-to-sample noise) taken from the combinations with similar counts, so that rare combinations are not treated as quieter than they are, and corrects for low counts. On random splits of inbred mice with plenty of events (BATF chimeras, where nothing differed) it gave 3–6 % false positives at p < 0.05 instead of 5 %, and 2–4 % on FlowCode mice with tissue labels swapped within each mouse; with about 100 barcoded cells per sample (e.g. brain) 5 % on average and at most 7 % in one tissue, where a fold-change threshold with TREAT keeps the hits reliable; on gated populations of a human cohort 7–10 % for populations under 100 events, because donors vary more than the model allows for. The *Wald test* uses each combination's own dispersion and is not recommended (21–31 % on the same mice, 10–13 % on the human cohort). *Frequencies* is a moderated linear model on log2 % of the library size (half an event added to every count). *Normalisation* sets the library size: *Robust* (default) rescales the barcoded events by a trimmed ratio of sums, so a few expanded clones do not push every other combination down; *Total* is the barcoded events; *Control* uses the chosen control combinations (names with "non-targeting" are ticked first), without their own expanded clones. Pairing (e.g. by mouse) enters as a blocking term, and *Split by* runs the same comparisons within each level of a covariate. FDR is Benjamini-Hochberg within each comparison; with *TREAT* the p-value tests |log2FC| above the threshold rather than any change.
 
 **Check hits: leave one out** (after a run with significant results) asks whether a hit rests on one mouse. The statistics are run again once without each mouse (each sample when there is no pairing), with library sizes and expanded clones worked out again, and every significant result is judged again in each refit at the current thresholds, with each refit's own FDR. The results table gains *leave one out* (e.g. ⚠ 4/6: significant in 4 of 6 refits), the range of log2FC over the refits and the *most influential* mouse, the one whose removal moves the log2FC most, with the log2FC without it; that mouse is drawn in red when the combination is plotted. ⚠ means the hit lost significance, or changed direction, without some mouse. A hit that changes direction, or shrinks towards zero, without one mouse rests on that mouse: check its samples. A borderline hit lost without any of several mice mostly reflects the loss of power with one mouse fewer. Changing the thresholds judges the refits again without running them; running statistics again clears the check. It takes about one statistics run per mouse.
 
@@ -233,13 +251,27 @@ Press **Unmix and export**. With a slow method (spectral variants, or the noise 
 
 **Gene groups** (tick *Gene groups*; needs the Counts test with the quasi-likelihood F test and a gene-group table): does a family of knockouts, taken together, change the counts, for example whether integrin knockouts as a whole are lost from the gut? In **Gene groups…**, tick a built-in table of the lab's libraries (Homing, Treg transcription factors OTB01, Metabolism) or load a CSV with a `gene` and a `group` column (optional `colour`, #rrggbb, and `area`, which gives groups shades of one colour per area); the dialog shows each combination's group and sets the order and colours of the groups. With no table loaded, ticking *Gene groups* picks the built-in table that covers at least 80 % of the guides, when there is one. The table is kept with the experiment, so a newer built-in table in a later plugin version changes nothing until it is ticked again. A combination's group comes from a gene set by hand in **Gene names…**, then its own name, then its MGI symbol; the others are unassigned and not tested. Every guide counts the same way, so a group's *score* is the mean of −z over its guides: for *Gut vs Spleen*, a positive score means the group's knockouts are depleted in the gut, so the family is needed for the cells to be there. The *competitive* test (CAMERA) is the test of direction; the *any-change* test asks whether anything happens in the family in either direction (one strongly changed guide is enough, and a shift of the whole library can pass it too); the *self-contained* test is listed in the table. Groups use the pathways' *min. members* and *rotations*, and a group may hold more than half of a library. Results: *Guide allocation* (the libraries' guides per group, pooled, shown as soon as a table is loaded), *Gene group spider* (one spoke per group, one line per comparison against the reference group, at most six, **Spider comparisons…** chooses others; outside the dashed ring the knockouts are depleted; a filled point passes the competitive FDR, a ringed one the any-change FDR), *Gene group table* and *Gene group members* (double-click a point or a table row).
 
+**Phenotype shift** (its own tab, after Results): has the mix of phenotypes among a guide's cells changed, beyond what its tags predict in the same mouse? The counts test asks whether a guide has more or fewer cells and the marker test whether a marker is brighter or dimmer; this asks whether the guide's cells have become a different kind of cell. Counting is not needed first: the run reads (with *Live unmix*, unmixes) the samples itself. Tick the populations in Data (each is clustered on its own) and set the sample groups in Groups (each group, a tissue for example, is tested on its own with one sample per mouse); then choose the *Reference* (the tag model by default, as the marker test), the number of *Clusters* (consensus metaclusters of a 10 × 10 FlowSOM grid, 5 to 20, default 20) and the clustering *Channels* (by default the panel's markers without the tags, the viability dye, congenic markers and the channels of the gates that define the populations), and press **Run phenotype shift**. Each guide in each mouse gets a cluster fingerprint (the share of its cells in each cluster), and the test asks whether the mice agree on the direction in which the guide's fingerprint differs from its reference: chance points a different way in each mouse, a real shift the same way in every mouse. Results per population and group: the *shift angle* (the size of the shift, 0° for none, 90° when the guide's cells sit in entirely different clusters), z, p and the Benjamini-Hochberg FDR, and the cluster each guide gains and loses most. Figures: the shift plot, the direction (log2 ratio of the guide's mean share to the reference's per cluster), the *direction map* (guides on the first two principal components of their mean displacements, with arrows showing which clusters each direction moves cells into) and the *summary heatmap* (every guide's shift angle in every group, coloured where significant, following the comparison heatmap's order and rows settings). Double-click a guide in the table, the shift plot or the direction map to show its cluster composition in every mouse beside its reference's. Minimum cells per mouse (10), minimum mice (3) and the FDR (0.1) are settings. **Check calibration** runs the statistics again on 5 shuffles of the guide labels: about 5 % of guides should then pass p < 0.05. With *Correct tag spillover before clustering* (on by default; needs *Live unmix*), each combination's brightness-dependent tag spillover is subtracted from its cells' markers before the populations are gated and clustered, and the coefficients are listed in the *Correction* view; the correction is used by this readout only. The first run keeps the barcoded events and up to 50,000 untransduced events per sample, inside the deepest gate the correction cannot change, in `cache/flowcode_analysis/shift_events` (tens of MB per sample); later runs read only these. Each run is saved when it finishes, shown again when the experiment is reopened, marked *Out of date* when the samples, gates, unmixing, groups or settings have changed, and added to the export when current. Mechanics in [section 7](#7-mechanics-phenotype-shift-and-tag-spillover-correction).
+
 **Saved results**: each statistics run is saved as soon as it finishes, in `cache/flowcode_analysis/stats/` (`data.json` and one CSV per table), and shown again when the experiment is reopened, with the current FDR, |log2FC| and |Δ| thresholds, TREAT, FDR correction and spillover k applied. If the counts or any other Analysis setting (groups, design, tests, normalisation, clone removal, markers, pathways, gene groups, inclusion rules, library setup) has changed since the run, the results are still shown, with an orange *Out of date* note on the Statistics and Results tabs, and the analysis cannot be exported until statistics are run again. Changing a setting during a session clears the results from view, as before; the saved run stays until the next one replaces it.
 
-**Results**: *View* chooses the table or figure shown, listed under the comparison, all comparisons, markers, pathways and gene groups; the arrows beside it step to the previous or next one. Double-click a combination in the results table, a volcano or the fold-change bars to plot it in every sample (*Combination* view: a column per group, a line per mouse, expanded clones hollow); right-click for *Open in a window*. Changing the comparison redraws only that comparison's figures.
+**Results**: *View* chooses the table or figure shown, listed under the comparison, all comparisons, markers, pathways and gene groups; the arrows beside it step to the previous or next one. The *Comparison heatmap* shows every comparison's significant log2 fold changes from the Counts test (from the Frequencies test when Counts is not run); with both tests run, *Comparison heatmap (frequencies)* shows the same from the Frequencies test. Its order (by effect or alphabetical), its number of rows (1 to 3) and the number of PCA loadings drawn are set above the table, with their own **Restore defaults**. Double-click a combination in the results table, a volcano or the fold-change bars to plot it in every sample (*Combination* view: a column per group, a line per mouse, expanded clones hollow); right-click for *Open in a window*. Changing the comparison redraws only that comparison's figures.
 
-**Export analysis** writes a folder named after the populations: the counts (`counts_all_samples.csv`, `counts_analysed.csv`, `percent_of_barcoded.csv` and the R-style `pct_matrix.csv`), `qc.csv`, `samples.csv`, `results.csv`, `library_sizes.csv`, `clones.csv`, `markers.csv`, the pathway tables (`pathways.csv`, `pathway_libraries.csv`, `pathway_members.csv`, `pathway_controls.csv`, `pathway_gene_names.csv`), the gene-group tables (`gene_groups.csv`, `gene_group_libraries.csv`, `gene_group_members.csv`, `gene_group_assignment.csv`, `gene_group_table.csv`, `guide_allocation.csv`), `settings.txt` (with the GO release and MGI GAF date), a PNG per figure and a PDF report. Tables of tests that were not run are left out.
+**Export analysis** writes a folder named after the populations: the counts (`counts_all_samples.csv`, `counts_analysed.csv`, `percent_of_barcoded.csv` and the R-style `pct_matrix.csv`), `qc.csv`, `samples.csv`, `results.csv`, `library_sizes.csv`, `clones.csv`, `markers.csv`, the pathway tables (`pathways.csv`, `pathway_libraries.csv`, `pathway_members.csv`, `pathway_controls.csv`, `pathway_gene_names.csv`), the gene-group tables (`gene_groups.csv`, `gene_group_libraries.csv`, `gene_group_members.csv`, `gene_group_assignment.csv`, `gene_group_table.csv`, `guide_allocation.csv`), `settings.txt` (with the GO release and MGI GAF date, and the phenotype-shift settings), when the phenotype shift is current its tables (`shift_results.csv`, `shift_directions.csv`, `shift_cluster_counts.csv`, `shift_cluster_medians.csv`, and `shift_correction.csv`, `shift_correction_eligibility.csv` and `shift_calibration.csv` when they were made), a PNG per figure (with its figure options) and a PDF report. Tables of tests that were not run are left out.
 
 Section 5 is marked stale ("The spectral model changed since the backbone was characterised") if the spectral model or the saved characterisation no longer matches the current reference spectra. Re-run sections 3 and 4 in that case. A characterisation saved by an older error model is also refused.
+
+### Cohorts acquired over several days
+
+FlowCode cohorts are often acquired over several days, each day with its own single-stained controls, unstained samples and FRET backbone. Honeychrome processes one day per experiment, and the Analysis page brings the days together:
+
+1. Make one experiment per day and run, in each, the spectral model, the AutoSpectral steps and FlowCode sections 1 to 4 on that day's controls, with the same tag panel, the same combinations CSV (or the same libraries) and the same unmixed channels.
+2. Export every day's samples in section 5.
+3. In the experiment chosen for the analysis (any of the days), set section 6's *Source* to *Exported files* and add the other days' export folders under *Other experiments*. Each file is listed with its status; files with another combination table or missing channels are listed but not used.
+4. Draw the unmixed gates in that experiment so they suit every day: the other days' files are gated with its template gates.
+5. Set the groups and pairing as usual. The *acquisition date* covariate is filled in and adjusted for automatically when the days differ, and left out when pairing by mouse already accounts for it.
+
+Each day's FRET correction is fitted on its own backbone, so the days' remaining differences are what the date covariate absorbs. When a whole group was acquired on one day and the other group on another, the day and the group effects cannot be told apart, and the statistics say so: spread groups across days when designing the experiment.
 
 ---
 
@@ -249,14 +281,17 @@ Per exported sample: `<sample> FlowCode (Unmixed).fcs`, uncompensated, with
 
 - the usual unmixed channels, `AF Abundance` and `AF Index`;
 - `FlowCode`: for a barcoded event, the median of the final abundances of its three tags; 0 otherwise;
-- `FC <name>`: one channel per included combination, holding the same value for that combination's events and 0 otherwise. Gate on `FC <name>` > 0 to select a combination;
-- the keywords `FLOWCODEUNMIX` (plugin version) and `FLOWCODECOMBOS` (`FC <name>=TAG_TAG_TAG;…`).
+- `FlowCode ID`: 0 untransduced, 1 to n the combination in table order, n + 1 unresolved;
+- `FC <name>`: one channel per included combination, holding the same value for that combination's events and 0 otherwise. Gate on `FC <name>` > 0 to select a combination. With several libraries the channels are named by triplet (`FC AU1_C_FLAG`) and each channel's `$PnS` is the sample's library's guide name;
+- the keywords `FLOWCODEUNMIX` (plugin version), `FLOWCODECOMBOS` (`FC <name>=TAG_TAG_TAG;…`), `FLOWCODESOURCE` (the experiment sample the file was made from), `FLOWCODECHARACTERISATION` (an identifier of the thresholds, combinations and tag spectra used, which section 6 checks against the current one) and `FLOWCODECALIBRATION`; `FLOWCODEOVERRIDES` (`<name>=<scale>;…`) when FRET correction overrides are set; with several libraries, `FLOWCODELIBRARY`, `FLOWCODELIBRARYLABEL` and `FLOWCODEGUIDES` (`FC <triplet>=<guide>;…`); without FRET correction, `FLOWCODECORRECTION=NONE` and `FLOWCODEWARNING`.
 
 In the output folder:
 
 - `FlowCode_debarcode_summary.csv`: per sample, total events, untransduced, unresolved, rescued (too many), rescued (too few), pairwise corrected, one count column per combination, three columns (beta, z, at median) per ticked tandem tag and, with the calibration, *Calibrated combos* (calibrated / identifiable).
-- `FlowCode_run.json`: backbone, thresholds, settings (the calibration settings included), `calibration` (`on`, `brightness` or `off`), AF profiles per sample, tandem records, and per sample `combo_scales`: for each identifiable combination `s`, `slope`, `se`, `z`, `weight`, `applied`, `share`, `n`, plus the combinations `not_identifiable` and with `too_few` events, and the detector `weighting`.
+- `FlowCode_run.json`: backbone, thresholds, settings (the calibration settings and FRET correction overrides included), `calibration` (`on`, `brightness` or `off`), AF profiles per sample, tandem records, and per sample `combo_scales`: for each identifiable combination `s`, `slope`, `se`, `z`, `weight`, `applied`, `share`, `n`, plus the combinations `not_identifiable` and with `too_few` events, and the detector `weighting`.
 - The FCS keyword `FLOWCODECALIBRATION` (`on`, `brightness` or `off`).
+
+In the experiment's `cache` folder, section 6 keeps `flowcode_unmixed` (live-unmixed values, pruned with the App Settings' unmixing cache size), `flowcode_analysis/count_events` (the events counting uses), `flowcode_analysis/shift_events` (the events the phenotype shift uses), `flowcode_analysis/marker_sums.npz` and the saved statistics and phenotype-shift runs. Deleting these folders loses nothing that running again does not make again; the rest of `cache` holds the characterisation (`flowcode_spectra.npz`) and must be kept.
 
 ---
 
@@ -508,7 +543,72 @@ t    = δ / √( σ² (VIF/m + mean(k)² / (G − m)) )   on min(n − p, G − 
 
 ---
 
-## 7. Differences from the R package
+## 7. Mechanics: phenotype shift and tag spillover correction
+
+### 7.1 Cluster fingerprints
+
+The barcoded cells of each analysed population, pooled over the samples (up to 10,000 per sample for training), are clustered on the display scale with FlowSOM: a 10 × 10 self-organising map, merged into *K* consensus metaclusters (default 20). Every barcoded cell is then assigned to a cluster. For guide g in mouse i, the fingerprint p_gi is the share of the guide's cells in each cluster. The reference fingerprint r_gi comes from the same mouse:
+
+| Reference | Definition |
+|---|---|
+| Tag model (default) | What the guide's three tags predict from the other guides of the mouse: the cluster shares fitted on the tags (one additive term per tag, as the marker test's tag model), within each library. A tag's spillover that moves every combination carrying the tag is then not taken for an effect |
+| Control combinations | The pooled control combinations of the sample (a control is compared with the other controls) |
+| All other barcoded cells | Every other barcoded cell of the sample |
+
+A guide is tested in a group when at least 3 mice have at least 10 of its cells.
+
+### 7.2 The agreement statistic
+
+In words: in one mouse, with 50–100 cells, chance alone moves a fingerprint by about 11–15°, so one mouse cannot show a shift. But chance points a different way in each mouse, while a real shift points the same way in every mouse; the test asks whether the mice agree.
+
+For guide g in mouse i, the displacement over the K clusters is
+
+```
+d_i = (p_gi − r_gi) / (2 √r̄)
+```
+
+with r̄ the pooled cluster shares of the population and sample group, so that every cluster is on the same noise scale and a rare cluster is not drowned by a large one. The agreement between mice is
+
+```
+U = mean over pairs of different mice (i ≠ j) of d_i · d_j
+```
+
+about 0 when the mice point in unrelated directions, positive when they agree. Its spread under no effect is estimated from the products themselves, as if each mouse's sign were flipped at random; z = U / SD is read against a t distribution with (mice − 1) degrees of freedom, one-sided (only agreement is a shift). P-values are adjusted by Benjamini-Hochberg within each population and sample group. With few mice the smallest possible p is limited: z is at most √(pairs of mice), so the smallest p is about 0.017 with 5 mice, 0.006 with 6, 0.002 with 7 and 0.0006 with 8.
+
+The shift angle 2·asin(√|U| / 2), signed like U, is the size: 0° for no shift, negative when the mice disagree, near 90° when the cells have moved to entirely different clusters. The direction is each cluster's mean displacement, shown as the log2 ratio of the guide's mean share to the reference's.
+
+Calibration: on JA_007 label shuffles the test gave 2.7–3.6 % at p < 0.05, and detected 10 % of a guide's cells moving into one cluster about 80 % of the time (5–7 mice, 50–115 cells per guide per mouse). **Check calibration** repeats the shuffle check on the experiment's own data.
+
+### 7.3 Tag spillover correction
+
+In words: a guide's tags cannot change where truly negative cells sit on a marker. If the negative cells of one combination move up or down a marker with how bright that combination's tags are, the movement is spillover or leftover FRET error, not biology. It is measured per combination and marker from the combination's own cells and subtracted cell by cell; cells without tags are not changed.
+
+For one sample group, combination and marker, pooled over the group's mice (up to 2,000 of the combination's cells per mouse in the *fit gate*, by default the viable gate), the marker value y is modelled on the same six tag terms as the backbone's error model (5.4), with a_k the tag's abundance divided by its debarcoding threshold:
+
+```
+y = c0 + b1·a1 + b2·a2 + b3·a3 + b12·a1·a2 + b13·a1·a3 + b23·a2·a3
+```
+
+- **Robust fit.** Tukey biweight (tuning 4.685): cells more than 4.685 robust SDs from the current fit get no weight, so on a marker whose main population is negative the fit follows the negatives and ignores the positives. It starts from a Theil-Sen line through the densest points of ten brightness bins, so a bin whose main peak happens to be the positives cannot tilt it; a small ridge (0.001) keeps the correlated product terms stable. At least 200 cells are needed.
+- **Only where there is evidence.** The coefficients are estimated once per group, so their estimation noise would move a combination's cells the same way in every mouse, which the shift test would read as a consistent shift. A combination's marker is corrected only when its six tag terms are jointly significant (F test of the weighted residual sum of squares against an intercept alone, p below 0.01 by default; 1.0–2.5 % false corrections at p < 0.01 on synthetic negatives without tag dependence).
+- **Which markers.** A marker is corrected only when at least 30 % of the untransduced cells of the *eligibility gate* are negative by the plugin's negative model (phenotype positivity below one half); otherwise its main peak may be the positives, and moving it would erase real expression. The eligibility gate is by default the deepest gate above the populations that still holds 80 % of the barcoded cells of the fit gate (T cells, for example).
+- **Anchored markers.** Markers whose negatives are better seen elsewhere (FoxP3 and Helios by default, absent from CD8 T cells) are fitted on the combination's cells in the *anchor gate* (by default the CD8 T-cell gate) and applied everywhere; anchoring is off without such a gate.
+- **Applying it.** Only the six tag terms are subtracted (c0 is kept), so a cell without tags is unchanged. The coefficients are estimated in a first pass over the samples and applied in a second, before the populations are gated and clustered.
+
+### 7.4 Kept events
+
+The phenotype shift needs only a small part of each sample: the barcoded events and some untransduced ones inside the *selection gate*, the deepest gate above every analysed population (and the fit, eligibility and anchor gates) that is drawn only on channels the correction never changes (scatter, the viability dye, tags). The correction can move an event across a gate drawn on a marker (FoxP3 decides who is a Treg), but not across these, so every event that can end up in a population after correction is kept: the barcoded events, up to 50,000 random untransduced ones (the 30 % check needs no more) and, for each per-sample axis (Time), the event with the largest value, so that per-sample gates are scaled as on the whole sample. They are made again only when the unmixing, the sample's file, or the selection gate and the gates above it change.
+
+### 7.5 Deliberate simplifications
+
+- One robust correction fit per sample group, combination and marker, pooled over the group's samples (no per-sample term), applied only with evidence.
+- Eligibility is judged once per group from the untransduced cells' negative share, with a fixed 30 % rule.
+- Anchoring is a list of markers fitted on one gate, and is off when that gate is missing.
+- The clusters are fitted once per population over all groups, so a phenotype present in only one tissue shares its clusters with the others.
+
+---
+
+## 8. Differences from the R package
 
 - AF libraries come from the AutoSpectral AF tab (extracted on the whole unstained file), not from `get.af.spectra()` on the FlowCode-gated unstained. `AF.Mean` is still taken from the gated unstained.
 - Only the FSC-A/FSC-H singlet pass is applied; the SSC-A/SSC-H pass is not.
