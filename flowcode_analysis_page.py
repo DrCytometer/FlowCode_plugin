@@ -110,6 +110,7 @@ FDR_SCOPES = {'per_comparison': 'Within each comparison', 'global': 'Pooled over
 COUNT_TESTS = {'ql': 'Quasi-likelihood F test (default)', 'wald': 'Wald test (not recommended)'}
 NORMALISATIONS = {'robust': 'Robust (trimmed; clones cannot shift it)', 'total': 'Total barcoded events',
                   'control': 'Control combinations'}
+FREQ_WEIGHTS = {'capped': 'Capped by variation between mice (default)', 'none': 'None (log2 %, all groups at once)'}
 SAMPLE_COLUMN_MAX_WIDTH = 280
 COVARIATE_COLUMN_MIN_WIDTH = 110
 HEATMAP_ORDERS = {'effect': 'By effect', 'alphabetical': 'Alphabetical'}
@@ -128,7 +129,8 @@ GENE_GROUP_FIGURES = ('guide_allocation', 'gene_group_spider', 'gene_group_table
 # Settings put back by the Restore defaults buttons. The design (groups,
 # reference, pairing, covariates, split, chosen markers and controls), the
 # pathway gene names set by hand and the gene-group table are kept.
-STATS_DEFAULT_KEYS = ('run_counts', 'run_freq', 'run_markers', 'counts_method', 'normalisation', 'remove_clones',
+STATS_DEFAULT_KEYS = ('run_counts', 'run_freq', 'run_markers', 'counts_method', 'normalisation', 'freq_weights',
+                      'remove_clones',
                       'clone_min_count', 'clone_min_pct', 'clone_max_levels', 'marker_reference',
                       'marker_spillover', 'marker_spillover_k', 'marker_min_events', 'marker_threshold',
                       'pval_threshold', 'fc_threshold', 'use_treat', 'fdr_scope', 'run_pathways',
@@ -278,7 +280,14 @@ HELP = (
     'not recommended: 21–31 % on the same mice and 10–13 % on the human cohort. With few barcoded cells per '
     'sample (about 100, e.g. brain) the quasi-likelihood test stays close to 5 % (5 % on average, at most 7 % '
     'in one tissue); a fold-change threshold with TREAT keeps the hits reliable. <i>Frequencies</i>: a moderated '
-    'linear model on log2 % of the library size (half an event added to every count). '
+    'linear model on the log2 odds of each combination within the library size, fitted per comparison. With '
+    '<i>Frequencies weights: Capped</i> (default) each sample is weighted by how many cells it rests on, '
+    'capped by how much the mice vary between each other (one value for the experiment, from the comparisons '
+    'with enough cells), so samples with few cells count for little and one mouse\'s expanded clone is not '
+    'taken as precise; on OTB01 Tregs every tissue stayed under 5 % false positives at p < 0.05, with 0.5 '
+    'false hits per comparison in brain (about 40 cells per sample) and the same power as the Counts test. '
+    'With <i>None</i> every sample counts equally on log2 % with half an event added, which gave 16 false '
+    'hits per comparison in brain. The Frequencies test is the one phenotype populations use. '
     '<i>Normalisation</i> sets the library size: <i>Robust</i> (default) rescales the barcoded events by a '
     'trimmed ratio of sums, so a few expanded clones do not push every other combination down; '
     '<i>Total</i> is the barcoded events; <i>Control</i> uses the chosen control combinations (names with '
@@ -2379,7 +2388,7 @@ class AnalysisPage(QWidget):
         defaults_row.addStretch()
         form.addRow(defaults_row)
         self.chk_counts = QCheckBox('Counts (negative binomial GLM, library-size offset)')
-        self.chk_freq = QCheckBox('Frequencies (moderated linear model on log2 % of library size)')
+        self.chk_freq = QCheckBox('Frequencies (moderated linear model on log2 odds within the library size)')
         self.chk_markers = QCheckBox('Markers (each combination against reference cells of its sample)')
         self.chk_markers.setToolTip(
             'For every combination and marker: the mean intensity of the combination\'s cells minus that of '
@@ -2415,8 +2424,20 @@ class AnalysisPage(QWidget):
         self.list_controls.setMaximumHeight(90)
         self.list_controls.setToolTip('Control combinations for Control normalisation.')
         self.lbl_controls = QLabel('Control combinations:')
+        self.cb_freq_weights = QComboBox()
+        for key, text in FREQ_WEIGHTS.items():
+            self.cb_freq_weights.addItem(text, key)
+        self.cb_freq_weights.setToolTip(
+            'How much each sample counts in the Frequencies test. Capped: each comparison is fitted on its two '
+            'groups and each sample is weighted by how many cells it rests on, but never more than the mice agree '
+            'with each other, so a 40-cell brain sample counts for little and one mouse\'s expanded clone is not '
+            'taken as precise. On OTB01 Tregs it kept every tissue under 5 % false positives at p < 0.05 and '
+            'matched the Counts test\'s power. None: every sample counts equally on log2 % with half an event, '
+            'fitted on all groups at once; it gives many false hits in tissues with few cells (16 per comparison '
+            'in brain at about 40 cells per sample).')
         form.addRow('Counts test:', self.cb_count_test)
         form.addRow('Normalisation:', self.cb_norm)
+        form.addRow('Frequencies weights:', self.cb_freq_weights)
         form.addRow(self.lbl_controls, self.list_controls)
         self.chk_clones = QCheckBox('Remove expanded clones')
         self.chk_clones.setToolTip(
@@ -2616,6 +2637,9 @@ class AnalysisPage(QWidget):
             lambda _i: self._on_stat_setting('counts_method', self.cb_count_test.currentData(), refit=True))
         self.cb_norm.currentIndexChanged.connect(
             lambda _i: self._on_stat_setting('normalisation', self.cb_norm.currentData(), refit=True))
+        self.cb_freq_weights.currentIndexChanged.connect(
+            lambda _i: self._on_stat_setting('freq_weights', None if self.cb_freq_weights.currentData() == 'none'
+                                             else self.cb_freq_weights.currentData(), refit=True))
         self.list_controls.itemChanged.connect(self._on_controls_changed)
         self.chk_clones.toggled.connect(lambda v: self._on_stat_setting('remove_clones', bool(v), refit=True))
         self.sb_clone_count.valueChanged.connect(
@@ -2713,6 +2737,7 @@ class AnalysisPage(QWidget):
             self.counts_note.setVisible(soft)
             self.cb_count_test.setCurrentIndex(max(self.cb_count_test.findData(s['counts_method']), 0))
             self.cb_norm.setCurrentIndex(max(self.cb_norm.findData(s['normalisation']), 0))
+            self.cb_freq_weights.setCurrentIndex(max(self.cb_freq_weights.findData(s['freq_weights'] or 'none'), 0))
             self._fill_controls()
             self.chk_clones.setChecked(bool(s['remove_clones']))
             self.sb_clone_count.setValue(int(s['clone_min_count']))
@@ -3549,6 +3574,7 @@ class AnalysisPage(QWidget):
                       use_treat=bool(s['use_treat']), fdr_scope=s['fdr_scope'],
                       run_counts=self.run_counts(), run_freq=bool(s['run_freq']),
                       counts_method=s['counts_method'], normalisation=s['normalisation'],
+                      freq_weights=s['freq_weights'],
                       control_combos=list(s.get('control_combos') or []),
                       clone_filter=({'min_count': int(s['clone_min_count']),
                                      'min_pct': float(s['clone_min_pct']),
@@ -4762,7 +4788,8 @@ class AnalysisPage(QWidget):
         lines += ['', 'Statistics:']
         tests = [n for k, n in (
             ('run_counts', f"Counts (NB GLM, {fst.COUNT_TEST_NAMES[s['counts_method']]})"),
-            ('run_freq', 'Frequencies (moderated LM, log2 % of library size)'),
+            ('run_freq', fst.FREQ_TEST_NAMES[s['freq_weights']]
+             + ('' if s['freq_weights'] else ', log2 % of library size')),
             ('run_markers', 'Markers (moderated t of combination minus reference, cluster-first FDR)'))
             if (self.run_counts() if k == 'run_counts' else s[k])]
         pair_key, split_key = s.get(self._design_key('pairing')), s.get(self._design_key('split_by'))

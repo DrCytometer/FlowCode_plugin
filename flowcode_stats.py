@@ -13,10 +13,15 @@ over the analysed combinations. The tests are Honeychrome's shared ones
   as offset: weights each sample by its cell number, so small samples count
   for less. The default. Tested by a quasi-likelihood F test (default) or
   the Wald test.
-* Frequencies — moderated linear model on log2 % of barcoded events, half
-  an event added to every count. With a small group the half-event floor
-  moves with the library size, so prefer Counts when samples differ much
-  in size.
+* Frequencies — moderated linear model per comparison on the log2 odds of
+  each combination within the library size, with a prior count that is the
+  same share of every sample, each sample weighted by its counting
+  precision capped by the variation between samples shared by the
+  experiment (``differential_stats.run_moderated``, ``weights='capped'``).
+  Shallow samples (e.g. 40 barcoded cells in brain) count for little and
+  one mouse's expanded clone is not taken as precise. ``freq_weights=None``
+  gives the earlier unweighted fit on log2 % with half an event, over every
+  group at once. Population contrasts use the unweighted fit.
 
 Library sizes (``differential_stats.library_sizes``): *Robust* (default)
 rescales each sample's barcoded events by a trimmed ratio of sums, so a few
@@ -93,10 +98,12 @@ DEFAULTS = {
     'fdr_scope': 'per_comparison',
     'counts_method': 'ql',
     'normalisation': 'robust',
+    'freq_weights': 'capped',
 }
 
 CLONE_DEFAULTS = {'min_count': 200, 'min_pct': 10.0, 'max_levels': 2}
 COUNT_TEST_NAMES = {'ql': 'quasi-likelihood F test', 'wald': 'Wald test'}
+FREQ_TEST_NAMES = {'capped': 'Frequencies (moderated LM, capped weights)', None: 'Frequencies (moderated LM)'}
 NORMALISATION_NAMES = {'robust': 'robust (trimmed ratio of sums)', 'total': 'total barcoded events',
                        'control': 'control combinations'}
 _NON_TARGETING = re.compile(r'non[\s_-]*target', re.IGNORECASE)
@@ -200,6 +207,7 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
                    use_treat: bool = False, fdr_scope: str = 'per_comparison',
                    run_counts: bool = True, run_freq: bool = False,
                    counts_method: str = 'ql', normalisation: str = 'robust',
+                   freq_weights: str | None = 'capped',
                    control_combos: list | None = None, clone_filter: dict | None = None,
                    strata: dict | None = None, within_strata: bool = True,
                    clone_groups: dict | None = None, clone_reference: str | None = None,
@@ -218,6 +226,7 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
     covariates  : adjustment covariates indexed by sample, or None.
     split_by    : {sample: level} to run the comparisons within each level.
     counts_method : 'ql' or 'wald' (``differential_stats.run_glm_counts``).
+    freq_weights  : 'capped' or None (Frequencies test, module docstring).
     normalisation : 'robust', 'total' or 'control' (library sizes).
     control_combos: the control combinations for 'control'.
     clone_filter  : None, or {'min_count', 'min_pct', 'max_levels'} to remove
@@ -329,8 +338,14 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
                                               {f'{o} vs {b}': comparison_label(b, o, level) for b, o in contrasts},
                                               counts_method))
             if run_freq:
-                res = ds.run_moderated(log2_all.loc[used], group_vec, contrasts, contrast_mode,
-                                       pval_threshold, fc_threshold, **common)
+                if freq_weights:
+                    res = ds.run_moderated(None, group_vec, contrasts, contrast_mode, pval_threshold,
+                                           fc_threshold, weights=freq_weights, counts_df=sub,
+                                           library=size.values, **common)
+                    notes.extend(n for n in res.attrs.get('notes', []) if n.startswith('Frequencies:'))
+                else:
+                    res = ds.run_moderated(log2_all.loc[used], group_vec, contrasts, contrast_mode,
+                                           pval_threshold, fc_threshold, **common)
                 frames['freq'].append(_relabel(res, level))
         except RuntimeError as exc:
             notes.append(f"Comparisons{where} not made: {exc}")
@@ -385,6 +400,7 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
         'library_labels': labels if libraries else None,
         'counts_method': counts_method,
         'normalisation': normalisation,
+        'freq_weights': freq_weights,
         'notes': notes,
     }
 
@@ -817,7 +833,8 @@ def results_table(stats: dict) -> pd.DataFrame | None:
     after a leave-one-out check, its columns on the significant rows."""
     frames = []
     counts_name = f"Counts (NB GLM, {COUNT_TEST_NAMES.get(stats.get('counts_method') or 'wald')})"
-    for key, name in (('counts', counts_name), ('freq', 'Frequencies (moderated LM)')):
+    freq_name = FREQ_TEST_NAMES.get(stats.get('freq_weights'), FREQ_TEST_NAMES[None])
+    for key, name in (('counts', counts_name), ('freq', freq_name)):
         if stats.get(key) is not None:
             table = stats[key].assign(test=name)
             loo = leave_one_out_columns(stats, key)

@@ -138,6 +138,7 @@ ANALYSIS_DEFAULTS = {
     'fdr_scope': 'per_comparison',
     'counts_method': 'ql',
     'normalisation': 'robust',
+    'freq_weights': 'capped',
     'control_combos': None,
     'remove_clones': False,
     'clone_min_count': 200,
@@ -193,6 +194,8 @@ def analysis_settings(stored: dict | None) -> dict:
     k = out['marker_spillover_k']
     if k != 'auto' and not (isinstance(k, (int, float)) and not isinstance(k, bool) and k >= 0):
         out['marker_spillover_k'] = 'auto'
+    if out['freq_weights'] not in (None, 'capped'):
+        out['freq_weights'] = ANALYSIS_DEFAULTS['freq_weights']
     if out['pathway_evidence'] not in PATHWAY_EVIDENCE:
         out['pathway_evidence'] = ANALYSIS_DEFAULTS['pathway_evidence']
     if not isinstance(out['pathway_names'], dict):
