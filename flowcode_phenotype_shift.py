@@ -89,8 +89,9 @@ Libraries
 Deliberate simplifications of this first version
     * one clustering per population, on up to 10,000 barcoded events per
       sample, after correction;
-    * the correction is used by this readout only (not by the counts,
-      marker test, phenotype populations or exports);
+    * the correction is used by this readout and its immune states
+      (``flowcode_fsea``) only (not by the counts, marker test, phenotype
+      populations or exports);
     * the calibration check is five within-sample label shuffles, run on
       demand.
 
@@ -112,6 +113,7 @@ import pandas as pd
 from scipy import stats
 
 import flowcode_analysis as fa
+import flowcode_fsea as ffsea
 import flowcode_tag_correction as ftc
 
 SEED = 20261105
@@ -141,6 +143,7 @@ SHIFT_DEFAULTS = {
     'min_mice': 3,
     'fdr': 0.1,
     'evidence_p': 0.01,
+    'fsea': None,
 }
 FORMAT_VERSION = 1
 RESULT_COLUMNS = ('population', 'group', 'guide', 'mice', 'median_cells', 'angle_deg', 'U', 'z', 'p', 'q',
@@ -154,6 +157,7 @@ def shift_settings(stored: dict | None) -> dict:
     wrong kind are put back to their defaults)."""
     out = deepcopy(SHIFT_DEFAULTS)
     if not isinstance(stored, dict):
+        out['fsea'] = ffsea.fsea_settings(None)
         return out
     for key, value in stored.items():
         if key in out:
@@ -168,6 +172,7 @@ def shift_settings(stored: dict | None) -> dict:
     for key in ('fit_gate', 'eligibility_gate', 'anchor_gate'):
         if not isinstance(out[key], str):
             out[key] = ''
+    out['fsea'] = ffsea.fsea_settings(out['fsea'])
     return out
 
 
@@ -757,7 +762,9 @@ def run(job: dict, load, progress=None, cache: dict | None = None) -> dict:
            (sample → ``NegativeModel`` or None), 'fit_gate',
            'eligibility_candidates', 'eligibility_gate' ('' for automatic),
            'anchor_gate', 'anchored', and for the statistics 'feature_of',
-           'library_of', 'triplet_tags', 'tag_names', 'controls'.
+           'library_of', 'triplet_tags', 'tag_names', 'controls'; with
+           'fsea' (``flowcode_fsea.panel_library``) the positivity scores
+           of the immune-state markers are kept and tested too.
     load : sample → (events, pnn), FlowCode-unmixed.
     cache: 'dir', 'source_keys' and 'keep' for ``prepare_events``: each
            sample is read in full only when its kept events are not in the
@@ -794,6 +801,8 @@ def run(job: dict, load, progress=None, cache: dict | None = None) -> dict:
     held = {pop: [] for pop in populations}
     combos = None
     fixers = {}
+    fsea_spec = job.get('fsea') if settings['fsea']['enabled'] else None
+    store = ffsea.new_scores(fsea_spec) if fsea_spec else None
     for i, key in enumerate(samples):
         progress(step + i, total, Path(key).stem)
         events, pnn, ids, combos = _sample_events(source, key, combos)
@@ -812,6 +821,14 @@ def run(job: dict, load, progress=None, cache: dict | None = None) -> dict:
                 raise ValueError(f'{Path(key).stem}: gate "{pop}" could not be applied')
             m = np.asarray(mem[pop], dtype=bool) & barcoded
             held[pop].append((_display(events[m], pnn, channels, job['transforms']), (ids[m] - 1).astype(np.int16)))
+        if store:
+            model = job['negative_model'](key)
+            if model is None:
+                notes.append(f'{Path(key).stem}: no negative model, so the immune states were not tested.')
+                store = None
+            else:
+                ffsea.score_sample(store, fsea_spec, key, events, pnn, ids, n, mem, model, list(job['fluors']),
+                                   job['af_channel'])
         del events
     _bundled_on_path()
     import flowsom_consensus as fsc
@@ -854,11 +871,12 @@ def run(job: dict, load, progress=None, cache: dict | None = None) -> dict:
               'triplet_tags': {c: list(t) for c, t in (job.get('triplet_tags') or {}).items()},
               'tag_names': list(job.get('tag_names') or []), 'controls': list(job.get('controls') or [])}
     results, direction, stat_notes = analyse(counts, design, settings)
+    fsea = ffsea.finish(store, fsea_spec, design, settings['fsea'], settings) if store else None
     progress(total, total, '')
     return {'settings': settings, 'channels': channels, 'populations': [p for p in populations if p in counts],
             'design': design, 'counts': counts, 'clusters': clusters, 'cells': cells, 'results': results,
             'direction': direction, 'correction': correction, 'notes': notes + stat_notes, 'calibration': None,
-            'stat_notes': stat_notes, 'kept': kept}
+            'stat_notes': stat_notes, 'kept': kept, 'fsea': fsea}
 
 
 def _bundled_on_path():
@@ -1010,4 +1028,6 @@ def write_tables(folder, result: dict) -> list:
         put('shift_correction.csv', corr['table'])
         put('shift_correction_eligibility.csv', corr['eligibility'])
     put('shift_calibration.csv', result.get('calibration'))
+    if result.get('fsea'):
+        written += ffsea.write_tables(folder, result['fsea'])
     return written

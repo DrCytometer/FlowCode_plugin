@@ -3,8 +3,9 @@ flowcode_shift_view.py
 ----------------------
 The *Phenotype shift* tab of the FlowCode Analysis page: settings, the run,
 saved results and the figures of the per-guide phenotype shift
-(flowcode_phenotype_shift.py, figures in flowcode_shift_plots.py). It uses
-the page's samples (Data), populations (each ticked gate of Data) and
+(flowcode_phenotype_shift.py, figures in flowcode_shift_plots.py), and the
+per-guide immune states made in the same run (flowcode_fsea_view.py). It
+uses the page's samples (Data), populations (each ticked gate of Data) and
 sample groups (Groups). Not named ``*_tab.py``, so the plugin loader does
 not load it as a tab of its own.
 """
@@ -28,6 +29,8 @@ from honeychrome.view_components.help_toggle_widget import WheelBlocker
 
 import flowcode_analysis as fa
 import flowcode_figure_panel as fcfp
+import flowcode_fsea as ffsea
+import flowcode_fsea_view as ffv
 import flowcode_phenotype_shift as fsh
 import flowcode_shift_plots as fsp
 import flowcode_tag_correction as ftc
@@ -39,7 +42,7 @@ TASK = 'analysis_shift'
 TASK_CHECK = 'analysis_shift_check'
 TASK_RESTORE = 'analysis_shift_restore'
 TASK_FIGURES = 'analysis_shift_figures'
-TASKS = (TASK, TASK_CHECK, TASK_RESTORE, TASK_FIGURES)
+TASKS = (TASK, TASK_CHECK, TASK_RESTORE, TASK_FIGURES, ffv.TASK)
 AUTO = ''
 OFF = '\x1foff'
 
@@ -118,7 +121,7 @@ HELP = (
     'It is marked <i>Out of date</i> when the samples, gates, unmixing, groups or settings have changed since. '
     'Double-click a guide in the table, shift plot or direction map to show its cluster composition in every '
     'mouse beside its reference\'s.</p>'
-)
+) + ffv.HELP
 
 
 def _label(text: str = '', style: str = _HINT_STYLE) -> QLabel:
@@ -182,6 +185,7 @@ class ShiftSection(QWidget):
         self._figures_pending = False
         self._composition = None
         self._panel_cache = None
+        self.fsea = ffv.FseaViews(self)
         outer = QVBoxLayout(self)
         outer.setSpacing(8)
         outer.addWidget(fcfp.scrolling_help(HELP))
@@ -198,7 +202,8 @@ class ShiftSection(QWidget):
         self.settings_box.setVisible(shown)
         self.run_btn = QPushButton('Run phenotype shift')
         self.run_btn.setToolTip('Unmix (or read) every used sample, correct it, gate the populations, cluster them '
-                                'and test every guide. Holds the heavy-job gate.')
+                                'and test every guide, and its immune states when they are on. Holds the heavy-job '
+                                'gate.')
         self.run_btn.clicked.connect(self.start)
         self.check_btn = QPushButton('Check calibration (5 label shuffles)')
         self.check_btn.setToolTip('Shuffle the guide labels among the barcoded cells of each sample five times and '
@@ -266,6 +271,8 @@ class ShiftSection(QWidget):
         self.cluster_table = CopyableTableWidget([], [])
         self.cluster_table.view_section = 'Details'
         self.views.addTab(self.cluster_table, 'Clusters')
+        self.fsea.add_views(self.views)
+        self.panels[ffv.HEATMAP_KEY] = self.fsea.heatmap
         outer.addWidget(self.views, stretch=1)
         self.figure_msg = _label('')
         outer.addWidget(self.figure_msg)
@@ -366,6 +373,7 @@ class ShiftSection(QWidget):
         self.sb_fdr.valueChanged.connect(lambda v: self._set('fdr', float(v)))
         self.list_channels.itemChanged.connect(lambda _it: self._set_list('channels', self.list_channels))
         self.list_anchored.itemChanged.connect(lambda _it: self._set_list('anchor_markers', self.list_anchored))
+        form.addRow(self.fsea.settings_box)
         return box
 
     def _on_settings_toggled(self, hidden: bool):
@@ -422,6 +430,7 @@ class ShiftSection(QWidget):
         self.result = {**result, 'settings': settings, 'results': results, 'direction': direction,
                        'notes': kept + notes, 'stat_notes': notes, 'calibration': None}
         self._set_result(self.result, self._saved_inputs, fresh=False, when='statistics updated')
+        self.fsea.start_reanalyse()
 
     def _restore_defaults(self):
         self.page.settings['shift'] = fsh.shift_settings(None)
@@ -513,7 +522,10 @@ class ShiftSection(QWidget):
         snapshot = snapshot or self.page._gating_snapshot()
         live = self.page.is_live()
         unmixing = self.page.plugin.live_unmixing_signature(list(files)) if live else None
-        settings = {k: v for k, v in self.settings.items() if k not in STATS_KEYS}
+        settings = {k: v for k, v in self.settings.items() if k not in STATS_KEYS and k != 'fsea'}
+        settings['fsea'] = ffsea.scoring_key(self.settings['fsea'])
+        if settings['fsea']['enabled']:
+            settings['fsea']['resolved_roots'] = self.fsea.resolved_roots()
         payload = {'counts': fa.counts_signature(files, self.populations(), snapshot.signature(), unmixing),
                    'groups': self.sample_groups(), 'settings': settings, 'live': live,
                    'library': self.page._library_setup_key(),
@@ -589,6 +601,7 @@ class ShiftSection(QWidget):
                 for g in gate_names:
                     combo.addItem(g, g)
                 combo.setCurrentIndex(max(combo.findData(s[key]), 0))
+            self.fsea.refresh()
         finally:
             self._filling = False
         self.defaults_btn.setEnabled(s != fsh.shift_settings(None))
@@ -613,6 +626,7 @@ class ShiftSection(QWidget):
         if self.settings['correction'] and resolved['notes']:
             text += ' ' + ' '.join(resolved['notes'])
         self.lbl_scope.setText(text)
+        self.fsea._update_rows_label()
 
     def _update_buttons(self):
         running = any(self.page.plugin.task_running(t) for t in (TASK, TASK_CHECK))
@@ -683,6 +697,19 @@ class ShiftSection(QWidget):
             what = 'Reading where needed,'
         cache = {'dir': fsh.events_path(page._controller().experiment_dir), 'source_keys': source_keys,
                  'keep': fsh.UNTRANSDUCED_KEEP}
+        spec = None
+        if settings['fsea']['enabled']:
+            if not live:
+                notes.append('The immune states were not tested: they need Live unmix (the negative model).')
+            else:
+                try:
+                    spec = self.fsea.spec()
+                except Exception as exc:
+                    notes.append(f'The immune states were not tested: {exc}')
+                if spec is not None and not spec['markers']:
+                    notes.append('The immune states were not tested: no library row can be measured in the '
+                                 'populations on this panel.')
+                    notes += list(spec['notes'])
         job = {'samples': keys, 'group_of': groups, 'populations': resolved['populations'], 'snapshot': snapshot,
                'transforms': snapshot.transforms, 'channels': resolved['channels'], 'settings': settings,
                'combo_fluors': combo_fluors, 'combo_tags': dict(zip(design.combo_names, design.combo_tags)),
@@ -692,7 +719,8 @@ class ShiftSection(QWidget):
                'eligibility_candidates': resolved['candidates'], 'eligibility_gate': resolved['eligibility_gate'],
                'anchor_gate': resolved['anchor_gate'], 'anchored': resolved['anchored'], 'feature_of': feature_of,
                'library_of': library_of, 'triplet_tags': dict(zip(design.combo_names, design.combo_tags)),
-               'tag_names': list(design.tags), 'controls': list(page.settings.get('control_combos') or [])}
+               'tag_names': list(design.tags), 'controls': list(page.settings.get('control_combos') or []),
+               'fsea': spec}
         return job, load, cache, notes + (resolved['notes'] if settings['correction'] else []), what
 
     def _live_loader(self, inputs: dict, files: dict) -> tuple:
@@ -771,11 +799,17 @@ class ShiftSection(QWidget):
 
         def work(progress):
             calibration = fsh.shuffle_check(result, progress=progress)
+            saved = {**result, 'calibration': calibration}
+            fsea_calibration = None
+            if result.get('fsea'):
+                fsea_calibration = ffsea.shuffle_check(result['fsea'], result['design'], result['settings'],
+                                                       progress=progress)
+                saved['fsea'] = {**result['fsea'], 'calibration': fsea_calibration}
             try:
-                fsh.save_result(path, {**result, 'calibration': calibration}, inputs)
+                fsh.save_result(path, saved, inputs)
             except Exception:
                 logger.exception('FlowCode phenotype shift: could not save the calibration check')
-            return calibration
+            return calibration, fsea_calibration
 
         if self.page.plugin._start_task(TASK_CHECK, work):
             self.check_status.setText('Checking calibration…')
@@ -807,9 +841,12 @@ class ShiftSection(QWidget):
             self._release()
             self._set_result(result['result'], result['inputs'], fresh=True)
         elif key == TASK_CHECK:
+            calibration, fsea_calibration = result
             if self.result is not None:
-                self.result['calibration'] = result
-            self.check_status.setText(fsp.calibration_text(result) or 'No test in the shuffles.')
+                self.result['calibration'] = calibration
+                if self.result.get('fsea'):
+                    self.result['fsea'] = {**self.result['fsea'], 'calibration': fsea_calibration}
+            self.check_status.setText(self._calibration_text(calibration, fsea_calibration))
         elif key == TASK_RESTORE:
             if result is None or self.result is not None:
                 return
@@ -817,8 +854,12 @@ class ShiftSection(QWidget):
             self._set_result(res, inputs, fresh=False, when=when)
             if any(res['settings'].get(k) != self.settings[k] for k in STATS_KEYS):
                 self._reanalyse()
+            elif self.fsea.needs_reanalysis(res):
+                self.fsea.start_reanalyse()
         elif key == TASK_FIGURES:
             self._on_figures(result)
+        elif key == ffv.TASK:
+            self.fsea.on_finished(result)
         self._update_buttons()
 
     def on_error(self, key, message):
@@ -832,6 +873,8 @@ class ShiftSection(QWidget):
             logger.warning('FlowCode phenotype shift: could not read the saved results: %s', message)
         elif key == TASK_FIGURES:
             self.figure_msg.setText(f'Figures failed: {message}')
+        elif key == ffv.TASK:
+            self.figure_msg.setText(f'The immune states could not be tested again: {message}')
         self._update_buttons()
 
     def on_progress(self, key, n, total, text):
@@ -849,13 +892,13 @@ class ShiftSection(QWidget):
         head = 'Done' if fresh else f'Saved results ({when})'
         self.status.setStyleSheet(_DONE_STYLE if fresh else _HINT_STYLE)
         text = (f"{head}: {len(res)} guide test(s) in {len(result['populations'])} population(s), "
-                f"{n_sig} significant (q < {result['settings']['fdr']:g}).")
+                f"{n_sig} significant (q < {result['settings']['fdr']:g}).{self.fsea.status_text(result)}")
         if self.page.uncorrected():
             self.status.setStyleSheet('color: #d62728; font-weight: bold;')
             text += ' (no FRET correction)'
         self.status.setText(text)
         corr = result.get('correction')
-        note_lines = list(result.get('notes') or [])
+        note_lines = list(result.get('notes') or []) + self.fsea.notes(result)
         if corr:
             table = corr['table']
             applied = int((table['status'] == ftc.STATUS_OK).sum()) if not table.empty else 0
@@ -872,12 +915,21 @@ class ShiftSection(QWidget):
                                  f"median {100 * float(np.median(share)):.1f}% of each sample; "
                                  f"{kept['read']} sample(s) read in full this run, the others from the cache.")
         self.notes.setText('\n'.join(note_lines))
-        self.check_status.setText(fsp.calibration_text(result.get('calibration')))
+        self.check_status.setText(self._calibration_text(result.get('calibration'),
+                                                         (result.get('fsea') or {}).get('calibration')))
         suggested = {p: c.get('suggested_k') for p, c in result['clusters'].items()}
         self.lbl_k.setText('Suggested (consensus stability): ' + ', '.join(
             f'{p} {k}' for p, k in suggested.items() if k) if any(suggested.values()) else '')
         self._fill_choices()
         self.show_result()
+
+    @staticmethod
+    def _calibration_text(calibration, fsea_calibration) -> str:
+        text = fsp.calibration_text(calibration) or 'No test in the shuffles.'
+        if fsea_calibration is not None and not fsea_calibration.empty:
+            text += '\nImmune states: ' + fsp.calibration_text(fsea_calibration).replace('significant guide',
+                                                                                     'call')
+        return text if calibration is not None else ''
 
     def _fill_choices(self):
         result = self.result
@@ -903,6 +955,7 @@ class ShiftSection(QWidget):
             table.setColumnCount(0)
         for panel in list(self.panels.values()) + [self.composition_panel]:
             panel.clear()
+        self.fsea.clear()
         self.figure_msg.setText('')
 
     def current(self) -> tuple:
@@ -944,6 +997,7 @@ class ShiftSection(QWidget):
         med.insert(0, 'phenotype', [desc.get(c, c) for c in med.index])
         med.insert(0, 'cluster', list(med.index))
         _fill_table(self.cluster_table, med.reset_index(drop=True), {'events': '{:d}'})
+        self.fsea.show(pop, group)
         self.start_figures()
         if self._composition is not None:
             self.show_composition(self._composition)
@@ -969,6 +1023,11 @@ class ShiftSection(QWidget):
         is_dark = self.page.plugin.is_dark()
         makers = self._makers(result, pop, group, k, desc, labels, fdr, is_dark)
         makers[SUMMARY_KEY] = self._summary_maker(result, fdr, is_dark, self.page.settings)
+        heatmap = self.fsea.heatmap_maker(result, pop, group, fdr, is_dark)
+        if heatmap is not None:
+            makers[ffv.HEATMAP_KEY] = heatmap
+        else:
+            self.fsea.heatmap.clear()
 
         def work(_progress):
             out = {}
@@ -1011,13 +1070,14 @@ class ShiftSection(QWidget):
         errors = []
         for key, item in result['figures'].items():
             panel = self.panels[key]
-            title = SUMMARY_TITLE if key == SUMMARY_KEY else dict(FIGURES)[key]
+            title = {SUMMARY_KEY: SUMMARY_TITLE, ffv.HEATMAP_KEY: ffv.HEATMAP_TITLE}.get(key) or dict(FIGURES)[key]
             if item['fig'] is None:
                 errors.append(f"{title}: {item['error']}")
                 panel.clear()
                 continue
             pop, group = result['shown']
             panel.name = ('phenotype shift summary heatmap' if key == SUMMARY_KEY
+                          else f'{pop} - {group} - immune-state heatmap' if key == ffv.HEATMAP_KEY
                           else f'{pop} - {group} - phenotype shift {title.lower()}')
             fig, make = self.page._stamped(item['fig'], item['make'])
             panel.set_figure(fig, make=make)
@@ -1094,7 +1154,7 @@ class ShiftSection(QWidget):
                 makers = self._makers(result, pop, group, k, desc, labels, fdr, is_dark)
                 for key, title in FIGURES:
                     out.append((f'Phenotype shift {pop} {group} - {title.lower()}', makers[key]))
-        return out
+        return out + self.fsea.export_figures(result, is_dark)
 
     def write_tables(self, folder) -> list:
         return fsh.write_tables(folder, self.result) if self.exportable() else []
@@ -1122,4 +1182,5 @@ class ShiftSection(QWidget):
         cal = fsp.calibration_text(r.get('calibration'))
         if cal:
             lines += ['  calibration check:'] + [f'    {line}' for line in cal.splitlines()]
+        lines += self.fsea.settings_lines(r)
         return '\n'.join(lines)
