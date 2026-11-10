@@ -300,8 +300,20 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
     analysed, denom_used, library, clones = _prepare_counts(
         counts.loc[samples], denominator.loc[samples], pairing, normalisation, control_combos, clone_filter,
         notes, strata, clone_groups, clone_reference, libraries, labels)
+    empty = [s for s in samples if not library[s] > 0]
+    if empty:
+        notes.append(f"Left out {len(empty)} sample(s) with no barcoded events left (library size 0): "
+                     f"{', '.join(str(s).rsplit('/', 1)[-1] for s in empty)}.")
+        samples = [s for s in samples if s not in empty]
+        analysed, denom_used, library = analysed.loc[samples], denom_used.loc[samples], library.loc[samples]
+        unit_level = {s: unit_level[s] for s in samples}
+        levels = list(dict.fromkeys(unit_level.values())) if samples else [None]
+        if libraries:
+            libraries = {s: libraries[s] for s in samples}
     removed = analysed.isna() & counts.loc[samples].notna()
-    log2_all = ds.log2_frequencies(analysed, library.values)
+    # Half an event in every sample: the unweighted fit cannot discount shallow samples, whose
+    # empty combinations a prior scaled to the library size would turn into extreme values.
+    log2_all = ds.log2_frequencies(analysed, library.values, share_prior=False)
     if libraries and feature_libraries:
         small = _small_library_groups(samples, unit_level, groups, order, libraries, feature_libraries,
                                       list(analysed.columns), labels, notes)
@@ -388,7 +400,7 @@ def run_statistics(counts: pd.DataFrame, denominator: pd.Series, groups: dict, *
         'counts_values': counts.loc[kept] if run_counts else None,
         'freq': results['freq'],
         'freq_values': (100.0 * counts.loc[kept].div(denominator.loc[kept], axis=0)),
-        'log2_values': ds.log2_frequencies(counts.loc[kept], library.loc[kept].values),
+        'log2_values': ds.log2_frequencies(counts.loc[kept], library.loc[kept].values, share_prior=False),
         'removed': removed.loc[kept],
         'denominator': denom_used.loc[kept],
         'library_sizes': library.loc[kept],
