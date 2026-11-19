@@ -262,11 +262,8 @@ class GatingSection(QWidget):
             return
         view = self.view_combo.currentData()
         views = [view] + ([fcg.VIEW_UNCORRECTED] if view != fcg.VIEW_UNCORRECTED else [])
-        counted = [k for k in page.used_files() if not fa.is_linked(k)]
-        keys = counted if key in counted else [key]
         try:
-            # the counted samples' unmixing signature, so the view the counts use shares their cache
-            inputs = {v: plugin.live_unmix_inputs(keys, fcg.VIEW_OVERRIDES[v]) for v in views}
+            inputs = {v: plugin.live_unmix_inputs([key], fcg.VIEW_OVERRIDES[v]) for v in views}
         except ValueError as exc:
             self.status.setText(f'Cannot unmix: {exc}')
             return
@@ -306,7 +303,8 @@ class GatingSection(QWidget):
                 return
             records = [plugin.state.gates[n] for n in fcs.GATE_NAMES if n in plugin.state.gates]
             phenotype = (resolved, model, records)
-        cache_keys = {v: fce.live_cache_key(inputs[v]['signature'], key, fce.file_signature(raw_path)) for v in views}
+        cache_keys = {v: fce.live_cache_key(inputs[v]['sample_signatures'][key], key, fce.file_signature(raw_path))
+                      for v in views}
         steps = len(views) + 1
 
         def focus_of(view_events, pnn, n_combos):

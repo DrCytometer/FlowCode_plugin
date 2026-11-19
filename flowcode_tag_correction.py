@@ -38,12 +38,23 @@ Only where there is evidence
     their estimation noise would move a combination's cells the same way
     in every mouse, which the shift test would read as a consistent shift.
     A combination's marker is therefore corrected only when its six tag
-    terms are jointly significant, p below 0.01 by default: an F test
-    comparing the weighted residual sum of squares of the fit with that of
-    an intercept alone, both with the final biweight weights (the cells the
-    fit follows). On synthetic negatives with no tag dependence it gave
-    1.0–2.5 % at p < 0.01, against 5–10 % for a Wald test with a sandwich
-    covariance, which underestimates the spread of the product terms.
+    terms are jointly significant: an F test comparing the weighted
+    residual sum of squares of the fit with that of an intercept alone,
+    both with the final biweight weights (the cells the fit follows). On
+    synthetic negatives with no tag dependence it gave 1.0–2.5 % at
+    p < 0.01, against 5–10 % for a Wald test with a sandwich covariance,
+    which underestimates the spread of the product terms.
+
+    A group has one fit per combination and marker, hundreds in all, so a
+    threshold on each fit's own p-value lets a few through by chance, more
+    of them the larger the panel and the library. The p-values of a
+    group's fits are therefore adjusted together (Benjamini–Hochberg) and
+    a fit is applied when its adjusted value is below the evidence
+    threshold, 0.01 by default: of the corrections applied, about 1 in 100
+    is expected to be a chance fit, however many fits there are. On
+    synthetic mice with nothing planted (8 mice, 56 combinations, 280 fits)
+    the shift test then gave 5.1 % at p < 0.05, the same as without the
+    correction; a threshold of 0.01 on each fit's own p-value gave 8.9 %.
 
 Which markers
     A marker is corrected only when at least 30 % of the untransduced cells
@@ -291,14 +302,18 @@ def estimate(fit_cells: dict, anchor_cells: dict, fluors: list, eligible: dict, 
     eligible    : {group: set of eligible fluorophores}.
     anchored    : fluorophores fitted on the anchor cells.
     combo_tags  : {combination: its three tag names}, for the table.
-    evidence_p  : a fit is applied only when the Wald p-value of its six
-                  tag terms is below this (1 applies every fit).
+    evidence_p  : a fit is applied only when the p-value of its six tag
+                  terms, adjusted over the group's fits
+                  (Benjamini–Hochberg), is below this.
 
     One row per group, combination and marker: 'cells' (cells fitted),
     'anchored', 'status' (``STATUSES``), 'alpha' and 'gamma' (the starting
-    line), 'evidence_p' and the six coefficients ``TERM_COLUMNS`` (NaN
+    line), 'evidence_p' (the fit's own p-value), 'evidence_q' (adjusted
+    over the group's fits) and the six coefficients ``TERM_COLUMNS`` (NaN
     unless corrected).
     """
+    from honeychrome.controller_components.moderated_stats import bh_adjust
+
     anchored = set(anchored)
     rows = []
     for (group, combo), cells in fit_cells.items():
@@ -315,10 +330,10 @@ def estimate(fit_cells: dict, anchor_cells: dict, fluors: list, eligible: dict, 
                 (status, start, six, p), n = (STATUS_NOT_ELIGIBLE, None, None, np.nan), len(values)
             elif anchor:
                 n = len(a_values)
-                status, start, six, p = fit_marker(a_values[:, j], a_amounts, evidence_p) if n else none
+                status, start, six, p = fit_marker(a_values[:, j], a_amounts, np.inf) if n else none
             else:
                 n = len(values)
-                status, start, six, p = fit_marker(values[:, j], amounts, evidence_p) if n else none
+                status, start, six, p = fit_marker(values[:, j], amounts, np.inf) if n else none
             row.update({'cells': int(n), 'status': status,
                         'alpha': np.nan if start is None else start[0],
                         'gamma': np.nan if start is None else start[1], 'evidence_p': p})
@@ -327,7 +342,16 @@ def estimate(fit_cells: dict, anchor_cells: dict, fluors: list, eligible: dict, 
             rows.append(row)
     columns = ['group', 'combination', 'tags', 'fluor', 'anchored', 'cells', 'status', 'alpha', 'gamma',
                'evidence_p', *TERM_COLUMNS]
-    return pd.DataFrame(rows, columns=columns)
+    table = pd.DataFrame(rows, columns=columns)
+    table.insert(columns.index('evidence_p') + 1, 'evidence_q', np.nan)
+    for _group, index in table.groupby('group', sort=False).groups.items():
+        fitted = index[(table.loc[index, 'status'] == STATUS_OK).to_numpy()]
+        q = bh_adjust(table.loc[fitted, 'evidence_p'].to_numpy(float))
+        table.loc[fitted, 'evidence_q'] = q
+        chance = fitted[~(q < evidence_p)]
+        table.loc[chance, 'status'] = STATUS_NO_EVIDENCE
+        table.loc[chance, list(TERM_COLUMNS)] = np.nan
+    return table
 
 
 @dataclass

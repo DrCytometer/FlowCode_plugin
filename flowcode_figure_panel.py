@@ -3,9 +3,16 @@ flowcode_figure_panel.py
 ------------------------
 A matplotlib figure on a FlowCode page (section 4 figures, section 6
 results): the main app's ScalableFigureWidget (Pop Out, Export Graphic and
-a Size slider) with Export Graphic writing ``<folder>/<name>.<format>``, and
-the pop-out window, which draws a fresh copy of the figure from its maker
-and resizes it with the window (as Honeycluster's Pop Out does).
+a Size slider) with Export Graphic writing ``<folder>/<name>.<format>`` at
+the app's export resolution, and the pop-out window, which draws a fresh
+copy of the figure from its maker and resizes it with the window (as
+Honeycluster's Pop Out does); its Save button starts in the same folder.
+Saved files are reported in the main window's status bar.
+
+Each exportable figure has a Fit to width box that sizes it to the width of
+the page and follows the page as the window is resized. It is checked by
+default; whether it is checked is remembered per figure (``figure_key``, or
+the panel's first name), so a figure can be kept at its own size.
 
 Message figures ("Run the characterisation…") are shown at their own size
 without the controls.
@@ -26,12 +33,13 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QSizePolicy, QVBoxLayout, QWidget
 
 import honeychrome.settings as hc_settings
 from honeychrome.view_components.scalable_figure_widget import (
-    ScalableFigureWidget, initial_scale_for, scrollable_canvas_class,
+    ScalableFigureWidget, figure_toolbar, initial_scale_for, report_saved,
+    scrollable_canvas_class,
 )
 
 _HINT_STYLE = 'color: grey; font-style: italic;'
@@ -39,6 +47,8 @@ OPTIONS_SCOPE = 'flowcode'
 HELP_HEIGHT_FRACTION = 0.45
 HELP_MIN_HEIGHT = 160
 _INVALID_NAME_CHARS = re.compile(r'[\\/:*?"<>|]')
+# The FlowCode plugin's store for UI toggles (as in flowcode_unmix_tab).
+_SETTINGS_ORG, _SETTINGS_APP = 'honeychrome', 'plugin_FlowCodeUnmix'
 
 
 def scrolling_help(text: str) -> QWidget:
@@ -92,12 +102,15 @@ def _connect_hover(canvas, fig):
         canvas.mpl_connect('motion_notify_event', handler)
 
 
-def open_figure_window(parent: QWidget, fig, title: str, connect=None) -> QDialog:
+def _file_stem(name: str) -> str:
+    return _INVALID_NAME_CHARS.sub('_', name).strip() or 'figure'
+
+
+def open_figure_window(parent: QWidget, fig, title: str, connect=None, folder='') -> QDialog:
     """Show *fig* (a figure of its own) in a window with the matplotlib
     toolbar; the figure is redrawn at the window's size. *connect*, when
-    given, is called with the window's canvas and the figure."""
-    from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
-
+    given, is called with the window's canvas and the figure. The toolbar's
+    Save button starts in *folder*, with *title* as the file name."""
     width, height = fig.get_size_inches() * fig.get_dpi()
     dialog = QDialog(parent)
     dialog.setWindowTitle(title)
@@ -110,7 +123,7 @@ def open_figure_window(parent: QWidget, fig, title: str, connect=None) -> QDialo
     layout = QVBoxLayout(dialog)
     layout.setContentsMargins(4, 4, 4, 4)
     layout.setSpacing(4)
-    layout.addWidget(NavigationToolbar2QT(canvas, dialog))
+    layout.addWidget(figure_toolbar(canvas, dialog, folder, _file_stem(title)))
     layout.addWidget(canvas, stretch=1)
     screen = parent.screen() if parent is not None else None
     if screen is not None:
@@ -136,6 +149,7 @@ class FigurePanel(QWidget):
     def __init__(self, name: str, folder_fn, parent=None, options_store=None):
         super().__init__(parent)
         self.name = name
+        self._first_name = name
         self._folder_fn = folder_fn
         self._options_store = options_store
         self.figure = None
@@ -162,6 +176,16 @@ class FigurePanel(QWidget):
         key = str(getattr(self, 'figure_key', None) or self.name).split(' ')[0]
         return fo.FigureOptionsRef(store, OPTIONS_SCOPE, key)
 
+    def _fit_width_key(self) -> str:
+        return f"figure_fit_width/{getattr(self, 'figure_key', None) or self._first_name}"
+
+    def _fit_width_setting(self) -> bool:
+        value = QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(self._fit_width_key(), True)
+        return str(value).lower() == 'true'
+
+    def _save_fit_width(self, checked: bool):
+        QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue(self._fit_width_key(), bool(checked))
+
     @property
     def canvas(self):
         return None if self.view is None else getattr(self.view, 'canvas', self.view)
@@ -177,7 +201,8 @@ class FigurePanel(QWidget):
             self.view = _PanelFigure(self, fig, title=self.name, experiment_dir='',
                                      pop_out=self.pop_out if make is not None else None,
                                      initial_scale=initial_scale_for(fig), parent=self,
-                                     options=self.options_ref())
+                                     options=self.options_ref(), fit_width=self._fit_width_setting())
+            self.view.fitWidthToggled.connect(self._save_fit_width)
             self.holder.addWidget(self.view, stretch=1)
         else:
             self.view = scrollable_canvas_class()(fig)
@@ -205,20 +230,19 @@ class FigurePanel(QWidget):
             self.view = None
 
     def file_path(self) -> Path:
-        stem = _INVALID_NAME_CHARS.sub('_', self.name).strip() or 'figure'
-        return Path(self._folder_fn()) / f'{stem}.{hc_settings.graphics_export_format_retrieved}'
+        return Path(self._folder_fn()) / f'{_file_stem(self.name)}.{hc_settings.graphics_export_format_retrieved}'
 
     def export(self):
         if self.figure is None or not self.exportable:
             return
         path = self.file_path()
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            self.figure.savefig(path, bbox_inches='tight', facecolor=self.figure.get_facecolor())
+            self.view.save_full_size(path)
         except (OSError, ValueError) as exc:
             self.export_msg.setText(f'Could not export: {exc}')
             return
         self.export_msg.setText(f'Saved {path}')
+        report_saved(self, path)
 
     def pop_out(self):
         if self._make is None:
@@ -238,4 +262,5 @@ class FigurePanel(QWidget):
         if fig is None:
             QMessageBox.warning(self, 'Pop Out', f'The figure could not be drawn: {error}')
             return
-        open_figure_window(self, fig, self.name, connect=self.connect_canvas)
+        open_figure_window(self, fig, self.name, connect=self.connect_canvas,
+                           folder=self._folder_fn())

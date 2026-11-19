@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem, QPushButton, QSpinBox, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
+from honeychrome.view_components.copyable_table_widget import CopyableTableWidget, SortableTableItem
 from honeychrome.view_components.help_toggle_widget import WheelBlocker
 
 import flowcode_analysis as fa
@@ -50,6 +50,7 @@ _ERROR_STYLE = 'color: #d62728;'
 _DONE_STYLE = 'color: #2ca02c;'
 _WARN_STYLE = 'color: #cc6600;'
 _HINT_STYLE = 'color: grey; font-style: italic;'
+_PRIMARY_BUTTON_STYLE = 'QPushButton { font-weight: bold; font-size: 14pt; }'
 STALE_TEXT = ('Out of date: these saved results were made with other samples, gates, unmixing, groups or settings. '
               'Run again to update them.')
 FIGURES = (('shift_plot', 'Shift plot'), ('direction_map', 'Direction map'), ('heatmap', 'Heatmap'))
@@ -106,8 +107,11 @@ HELP = (
     'populations are gated and clustered; cells without tags are untouched. A marker is corrected only when at '
     'least 30 % of the untransduced cells of the <i>eligibility gate</i> are negative (by default the deepest gate '
     'that still holds 80 % of the barcoded cells, e.g. T cells), and a combination\'s marker only when its tag '
-    'dependence is significant (p below the evidence threshold, 0.01), so estimation noise is not added where '
-    'there is nothing to correct. <i>Anchored markers</i> (Foxp3 and Helios by default) are fitted on the '
+    'dependence is significant: the p-values of a group\'s fits (one per combination and marker, hundreds in '
+    'all) are adjusted together (Benjamini–Hochberg) and a fit is applied when its adjusted value is below the '
+    '<i>Evidence FDR</i> (0.01: about 1 in 100 of the corrections applied is expected to be a chance fit), so '
+    'estimation noise is not added where there is nothing to correct. A correction fitted by chance would move '
+    'that combination\'s cells the same way in every mouse and be read as a shift. <i>Anchored markers</i> (Foxp3 and Helios by default) are fitted on the '
     'combination\'s CD8 T cells, where they are absent, and applied everywhere; without a CD8 gate the anchoring '
     'is off. The coefficients are listed in the <i>Correction</i> view. The correction is used by this readout '
     'only.</p>'
@@ -139,7 +143,7 @@ def _no_wheel(*widgets):
 
 
 def _item(text) -> QTableWidgetItem:
-    it = QTableWidgetItem(str(text))
+    it = SortableTableItem(str(text))
     it.setFlags(it.flags() & ~Qt.ItemIsEditable)
     return it
 
@@ -201,6 +205,7 @@ class ShiftSection(QWidget):
         self.settings_btn.setChecked(not shown)
         self.settings_box.setVisible(shown)
         self.run_btn = QPushButton('Run phenotype shift')
+        self.run_btn.setStyleSheet(_PRIMARY_BUTTON_STYLE)
         self.run_btn.setToolTip('Unmix (or read) every used sample, correct it, gate the populations, cluster them '
                                 'and test every guide, and its immune states when they are on. Holds the heavy-job '
                                 'gate.')
@@ -339,8 +344,10 @@ class ShiftSection(QWidget):
         self.sb_evidence.setRange(0.0001, 1.0)
         self.sb_evidence.setSingleStep(0.005)
         self.sb_evidence.setToolTip('A combination\'s marker is corrected only when the p-value of its tag '
-                                    'dependence is below this (1 corrects every fit).')
-        form.addRow('Evidence p below:', self.sb_evidence)
+                                    'dependence, adjusted over the group\'s fits (Benjamini–Hochberg), is '
+                                    'below this. Larger values correct more fits and let more chance fits '
+                                    'through, which the shift test reads as shifts.')
+        form.addRow('Evidence FDR below:', self.sb_evidence)
         self.sb_min_cells = QSpinBox()
         self.sb_min_cells.setRange(1, 100000)
         self.sb_min_cells.setToolTip('A guide (or its reference) with fewer cells in a mouse has no value there.')
@@ -727,8 +734,8 @@ class ShiftSection(QWidget):
         import flowcode_export as fce
         import flowcode_phenotype as fp
 
-        unmixing = inputs['signature']
-        cache_keys = {k: fce.live_cache_key(unmixing, k, fce.file_signature(p)) for k, p in files.items()}
+        cache_keys = {k: fce.live_cache_key(inputs['sample_signatures'][k], k, fce.file_signature(p))
+                      for k, p in files.items()}
         fluor_names = list(inputs['layout'].fluor_names)
 
         def load(key):
@@ -1176,7 +1183,7 @@ class ShiftSection(QWidget):
             g = corr['gates']
             lines.append(f"    fit gate {g['fit']}, eligibility gate {g['eligibility']}, anchor gate "
                          f"{g['anchor'] or 'off'}, anchored {', '.join(g['anchored']) or 'none'}, "
-                         f"evidence p < {s['evidence_p']}")
+                         f"evidence FDR < {s['evidence_p']} (Benjamini-Hochberg over each group's fits)")
         for note in r.get('notes') or []:
             lines.append(f'  note: {note}')
         cal = fsp.calibration_text(r.get('calibration'))

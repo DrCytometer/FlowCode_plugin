@@ -76,6 +76,7 @@ log2FC most is reported and drawn in red in the combination plot.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from datetime import datetime
@@ -2198,7 +2199,8 @@ def default_export_folder(root, population: str, when: datetime | None = None) -
 def write_analysis_folder(folder, *, population: str, raw_counts: pd.DataFrame, meta: pd.DataFrame,
                           qc: pd.DataFrame, filtered, stats: dict | None, sample_table: pd.DataFrame,
                           settings_text: str, figures: list, sample_labels: dict | None = None,
-                          progress=None, no_fret: bool = False, fdr_threshold: float = 0.05) -> list:
+                          progress=None, no_fret: bool = False, fdr_threshold: float = 0.05,
+                          run_record: dict | None = None) -> list:
     """
     Write one analysis into *folder*:
 
@@ -2224,6 +2226,8 @@ def write_analysis_folder(folder, *, population: str, raw_counts: pd.DataFrame, 
       ``gene_group_table.csv`` (the table used) and
       ``guide_allocation.csv`` — the gene-group analysis (when run);
     * ``settings.txt`` — population, gates, rules, test settings, notes;
+    * ``analysis_run.json`` — *run_record*: the analysis settings and the
+      debarcoding, FRET correction and unmixing behind the counts, as data;
     * ``figures/`` — a PNG per figure, and ``<population> report.pdf`` with
       a title page, the settings, the QC table, every figure and the
       results tables.
@@ -2303,6 +2307,12 @@ def write_analysis_folder(folder, *, population: str, raw_counts: pd.DataFrame, 
     settings_path = folder / 'settings.txt'
     settings_path.write_text(settings_text, encoding='utf-8')
     written.append(settings_path)
+    if run_record is not None:
+        record_path = folder / 'analysis_run.json'
+        record_path.write_text(json.dumps(run_record, indent=2,
+                                          default=lambda v: v.tolist() if hasattr(v, 'tolist') else str(v)),
+                               encoding='utf-8')
+        written.append(record_path)
 
     pdf_path = folder / f"{drc_report.sanitize_filename(population, 'population')} report.pdf"
     from flowcode_state import NO_FRET_WARNING
@@ -2328,7 +2338,7 @@ def write_analysis_folder(folder, *, population: str, raw_counts: pd.DataFrame, 
             if no_fret:
                 stamp_invalid(fig)
             png = fig_dir / f"{drc_report.sanitize_filename(name)}.png"
-            fig.savefig(png, dpi=200, bbox_inches='tight', facecolor=fig.get_facecolor())
+            fig.savefig(png, dpi=300, bbox_inches='tight', facecolor=fig.get_facecolor())
             written.append(png)
             pdf.savefig(fig, bbox_inches='tight')
         if results is not None:

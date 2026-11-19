@@ -25,6 +25,9 @@ Sections
                 whether each guide's cells move to other phenotypes
                 (cluster fingerprints against the tag model), with its own
                 settings, run and figures (flowcode_shift_view.py)
+    Synopsis    every readout per guide across the groups: the atlas, the
+                guide dossiers and the written synopsis
+                (flowcode_synopsis_view.py)
     Export      CSV tables, figures and a PDF report in a folder named after
                 the populations
 
@@ -76,7 +79,7 @@ from PySide6.QtWidgets import (
 import honeychrome.settings as hc_settings
 from honeychrome.controller_components import differential_stats as ds
 from honeychrome.view_components import suggest_groupings_dialog as sgd
-from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
+from honeychrome.view_components.copyable_table_widget import CopyableTableWidget, SortableTableItem
 from honeychrome.view_components.help_toggle_widget import WheelBlocker
 
 import flowcode_analysis as fa
@@ -87,6 +90,7 @@ import flowcode_gene_groups as fgg
 import flowcode_pathways as fpw
 import flowcode_shift_view as fshv
 import flowcode_stats as fst
+import flowcode_synopsis_view as fsyv
 import flowcode_view_stack as fvs
 from flowcode_state import NO_FRET_WARNING, OTHER_LIBRARY, library_label
 
@@ -101,6 +105,7 @@ _DONE_STYLE = 'color: #2ca02c;'
 _WARN_STYLE = 'color: #cc6600;'
 _HINT_STYLE = 'color: grey; font-style: italic;'
 _INVALID_STYLE = 'color: #d62728; font-weight: bold;'
+_PRIMARY_BUTTON_STYLE = 'QPushButton { font-weight: bold; font-size: 14pt; }'
 
 CONTRAST_MODES = {'reference': 'Each group against a reference', 'pairwise': 'Every pair of groups'}
 COMPARE = {'groups': 'Sample groups (within each population)', 'populations': 'Populations (within each sample)'}
@@ -146,7 +151,7 @@ RESTORE_TOOLTIP = 'Put these settings back to their default values.'
 # again to saved results.
 STATS_INPUT_EXCLUDED = ('heatmap_order', 'heatmap_rows', 'n_loadings', 'export_root', 'group_colors',
                         'group_patterns', 'counts', 'gene_group_file', 'gene_group_areas', 'gene_group_colours',
-                        'gene_group_order', 'gene_group_comparisons', 'shift') + THRESHOLD_KEYS
+                        'gene_group_order', 'gene_group_comparisons', 'shift', 'synopsis') + THRESHOLD_KEYS
 RESTORING_TEXT = 'Reading the saved results.'
 STALE_TEXT = ('Out of date: these saved results were made with other counts or settings. Run statistics again '
               'to update them.')
@@ -268,7 +273,10 @@ HELP = (
     '(a regular expression, case-insensitive): <b>Assign by pattern</b> gives every listed sample the first '
     'group whose pattern matches its name. Double-click a group\'s colour to change it; the colours are used '
     'in every figure.</p>'
-    '<p><b>Statistics.</b> <i>Counts</i>: a negative-binomial GLM per combination with the sample\'s '
+    '<p><b>Statistics.</b> The Counts, Markers, Pathways and Gene groups tests are ticked by default, and the '
+    'Frequencies test is not. Tick <b>Advanced settings</b> to show the Frequencies test, the options of each '
+    'test, the normalisation, clone removal, the covariates adjusted for and the significance thresholds; '
+    'hidden settings still apply. <i>Counts</i>: a negative-binomial GLM per combination with the sample\'s '
     'library size as offset; each sample is weighted by its cell number, so small samples count for '
     'less. The <i>quasi-likelihood F test</i> (default) fits each comparison on the samples of its two groups, '
     'and gives each combination a dispersion (its extra sample-to-sample noise) taken from the combinations '
@@ -389,6 +397,10 @@ HELP = (
     'from what its tags predict in the same mouse, how large the shift is (the shift angle) and towards which '
     'clusters, for each ticked population and sample group; it has its own settings, run, help and saved '
     'results, and is added to the export when current.</p>'
+    '<p><b>Synopsis</b> (tab after Phenotype shift): what each guide does across every group, from the results '
+    'already made here: an atlas of guides against groups (cell numbers as colour, phenotype calls as dots), a '
+    'dossier per guide and a written synopsis. It tests nothing itself, has its own help, and is added to the '
+    'export.</p>'
     '<p><b>Gating</b> (first tab, view only): the experiment\'s Unmixed Data plots and gates over the '
     'FlowCode-unmixed events of the sample picked in the sample browser, gated exactly as the counts (sample '
     'overrides included), in three views: <i>Uncorrected</i> (the experiment\'s own unmix of the raw file), '
@@ -442,7 +454,7 @@ def _label(text: str = '', style: str = _HINT_STYLE) -> QLabel:
 
 
 def _item(text, editable: bool = False, data=None) -> QTableWidgetItem:
-    item = QTableWidgetItem('' if text is None else str(text))
+    item = SortableTableItem('' if text is None else str(text))
     flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
     if editable:
         flags |= Qt.ItemIsEditable
@@ -544,6 +556,8 @@ class AnalysisPage(QWidget):
         self._build_results(self._add_section('Results', scroll=False))
         self.shift_view = fshv.ShiftSection(self)
         self.section_tabs.addTab(self.shift_view, 'Phenotype shift')
+        self.synopsis_view = fsyv.SynopsisSection(self)
+        self.section_tabs.addTab(self.synopsis_view, fsyv.TITLE)
         self._build_export(self._add_section('Export'))
         titles = [self.section_tabs.tabText(i) for i in range(self.section_tabs.count())]
         opened = str(plugin.qsettings.value(f'open_section_{SECTION}_title', 'Data') or 'Data')
@@ -560,6 +574,7 @@ class AnalysisPage(QWidget):
             update()
         if self.gating_view.is_shown():
             self.gating_view.on_shown()
+        self.synopsis_view.refresh()
 
     def reset_session(self):
         """Forget everything held for the previous experiment."""
@@ -591,6 +606,7 @@ class AnalysisPage(QWidget):
         self._clear_figure_tabs()
         self._show_auto_note(None)
         self.shift_view.reset_session()
+        self.synopsis_view.reset_session()
 
     # -- frame ---------------------------------------------------------------
 
@@ -730,6 +746,8 @@ class AnalysisPage(QWidget):
         if name.startswith('Sample PCA'):
             return 'sample_pca'
         tail = name.rsplit(' - ', 1)[-1]
+        if name.startswith('Synopsis '):
+            return 'synopsis_atlas' if tail == 'atlas' else 'synopsis_dossier'
         if name.startswith('Markers '):
             return f'marker_{tail}'
         if tail.startswith('pathway '):
@@ -1151,6 +1169,7 @@ class AnalysisPage(QWidget):
 
         run = QHBoxLayout()
         self.count_btn = QPushButton('Count events')
+        self.count_btn.setStyleSheet(_PRIMARY_BUTTON_STYLE)
         self.count_btn.clicked.connect(self.start_count)
         run.addWidget(self.count_btn)
         self.count_status = _label('')
@@ -1546,7 +1565,8 @@ class AnalysisPage(QWidget):
         unmixing = inputs['signature']
         signature = fa.counts_signature(files, gates, snapshot.signature(), unmixing,
                                         [res.signature_parts() for res in phenotypes.values()])
-        cache_keys = {key: fce.live_cache_key(unmixing, key, fce.file_signature(path)) for key, path in files.items()}
+        cache_keys = {key: fce.live_cache_key(inputs['sample_signatures'][key], key, fce.file_signature(path))
+                      for key, path in files.items()}
         folder, fluors, viability = self._compact_inputs()
 
         def unmixed(key):
@@ -1867,6 +1887,7 @@ class AnalysisPage(QWidget):
         self.group_defs.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.group_defs.setSelectionMode(QAbstractItemView.SingleSelection)
         self.group_defs.setMaximumHeight(170)
+        self.group_defs.setSizeAdjustPolicy(QAbstractItemView.AdjustToContents)
         self.group_defs.setToolTip(
             'Double-click a name or pattern to edit it, or a colour to change it. The colours are used '
             'in every figure (volcano direction ramps, heatmap group bars, PCA, QC and per-combination '
@@ -1897,7 +1918,7 @@ class AnalysisPage(QWidget):
             brow.addWidget(b)
         brow.addStretch()
         gl.addLayout(brow)
-        top.addWidget(gbox, stretch=2)
+        top.addWidget(gbox, stretch=2, alignment=Qt.AlignTop)
 
         cbox = QGroupBox('Covariates')
         cl = QVBoxLayout(cbox)
@@ -1912,8 +1933,7 @@ class AnalysisPage(QWidget):
                 crow.addWidget(b)
             crow.addStretch()
             cl.addLayout(crow)
-        cl.addStretch()
-        top.addWidget(cbox, stretch=1)
+        top.addWidget(cbox, stretch=1, alignment=Qt.AlignTop)
         lay.addLayout(top)
 
         auto = QHBoxLayout()
@@ -2261,7 +2281,9 @@ class AnalysisPage(QWidget):
                                     + ', '.join(table['unmatched'][:10]))
 
     def _on_export_table(self):
-        path, _f = QFileDialog.getSaveFileName(self, 'Export groups and covariates', 'flowcode_samples.csv',
+        from honeychrome.view_components.scalable_figure_widget import start_path
+        path, _f = QFileDialog.getSaveFileName(self, 'Export groups and covariates',
+                                               start_path(self.analysis_root(), 'flowcode_samples.csv'),
                                                'CSV (*.csv)')
         if path:
             self.sample_table_frame().to_csv(path)
@@ -2376,7 +2398,29 @@ class AnalysisPage(QWidget):
         row = QHBoxLayout()
         left = QWidget()
         left.setMaximumWidth(480)
-        form = QFormLayout(left)
+        column = QVBoxLayout(left)
+        column.setContentsMargins(0, 0, 0, 0)
+        form = QFormLayout()
+        column.addLayout(form)
+        self.chk_advanced = QCheckBox('Advanced settings')
+        self.chk_advanced.setToolTip('Show the settings of each test, the normalisation, clone removal, the '
+                                     'covariates adjusted for and the significance thresholds. Hidden settings '
+                                     'still apply.')
+        column.addWidget(self.chk_advanced)
+        self.advanced_box = QWidget()
+        advanced = QVBoxLayout(self.advanced_box)
+        advanced.setContentsMargins(0, 0, 0, 0)
+        sections = {}
+        for title in ('Frequencies test', 'Counts test', 'Expanded clones', 'Markers', 'Pathways and gene groups',
+                      'Design', 'Thresholds'):
+            box = QGroupBox(title)
+            sections[title] = QFormLayout(box)
+            advanced.addWidget(box)
+        column.addWidget(self.advanced_box)
+        shown = str(self.plugin.qsettings.value('analysis_stats_advanced', 'false')).lower() == 'true'
+        self.chk_advanced.setChecked(shown)
+        self.advanced_box.setVisible(shown)
+        self.chk_advanced.toggled.connect(self._on_advanced_toggled)
         self.stats_defaults_btn = QPushButton('Restore defaults')
         self.stats_defaults_btn.setToolTip(
             'Put the tests, normalisation, clone, marker and threshold settings back to their default values. '
@@ -2401,7 +2445,7 @@ class AnalysisPage(QWidget):
         self.counts_note.setWordWrap(True)
         self.counts_note.setVisible(False)
         form.addRow(self.counts_note)
-        form.addRow(self.chk_freq)
+        sections['Frequencies test'].addRow(self.chk_freq)
         form.addRow(self.chk_markers)
         self.cb_count_test = QComboBox()
         for key, text in COUNT_TESTS.items():
@@ -2435,10 +2479,10 @@ class AnalysisPage(QWidget):
             'matched the Counts test\'s power. None: every sample counts equally on log2 % with half an event, '
             'fitted on all groups at once; it gives many false hits in tissues with few cells (16 per comparison '
             'in brain at about 40 cells per sample).')
-        form.addRow('Counts test:', self.cb_count_test)
-        form.addRow('Normalisation:', self.cb_norm)
-        form.addRow('Frequencies weights:', self.cb_freq_weights)
-        form.addRow(self.lbl_controls, self.list_controls)
+        sections['Counts test'].addRow('Counts test:', self.cb_count_test)
+        sections['Counts test'].addRow('Normalisation:', self.cb_norm)
+        sections['Frequencies test'].addRow('Frequencies weights:', self.cb_freq_weights)
+        sections['Counts test'].addRow(self.lbl_controls, self.list_controls)
         self.chk_clones = QCheckBox('Remove expanded clones')
         self.chk_clones.setToolTip(
             'The lab R rule: in each non-reference group, a combination whose % of barcoded in a sample is '
@@ -2457,8 +2501,8 @@ class AnalysisPage(QWidget):
             clone_row.addWidget(QLabel(text))
             clone_row.addWidget(w)
         clone_row.addStretch()
-        form.addRow(self.chk_clones)
-        form.addRow(clone_row)
+        sections['Expanded clones'].addRow(self.chk_clones)
+        sections['Expanded clones'].addRow(clone_row)
         self.cb_marker_ref = QComboBox()
         for key, text in MARKER_REFERENCES.items():
             self.cb_marker_ref.addItem(text, key)
@@ -2502,12 +2546,12 @@ class AnalysisPage(QWidget):
         spill_row.addStretch()
         self.marker_widgets = [self.cb_marker_ref, self.list_markers, self.sb_marker_events, self.sb_marker_delta,
                                self.chk_marker_spill, self.chk_marker_k_auto, self.sb_marker_spill]
-        form.addRow('Marker reference:', self.cb_marker_ref)
-        form.addRow('Markers:', self.list_markers)
-        form.addRow(marker_row)
-        form.addRow(spill_row)
+        sections['Markers'].addRow('Marker reference:', self.cb_marker_ref)
+        sections['Markers'].addRow('Markers:', self.list_markers)
+        sections['Markers'].addRow(marker_row)
+        sections['Markers'].addRow(spill_row)
         self.lbl_marker_k = _label('')
-        form.addRow(self.lbl_marker_k)
+        sections['Markers'].addRow(self.lbl_marker_k)
         form.addRow(self.lbl_markers)
         self.chk_pathways = QCheckBox('Pathways (signed GO Biological Process sets, from the Counts test)')
         self.chk_pathways.setToolTip(
@@ -2540,8 +2584,8 @@ class AnalysisPage(QWidget):
         self.pathway_widgets = [self.sb_pathway_size, self.sb_pathway_rotations, self.cb_pathway_evidence]
         self.lbl_pathways = _label('')
         form.addRow(self.chk_pathways)
-        form.addRow(pathway_row)
-        form.addRow('GO evidence:', self.cb_pathway_evidence)
+        sections['Pathways and gene groups'].addRow(pathway_row)
+        sections['Pathways and gene groups'].addRow('GO evidence:', self.cb_pathway_evidence)
         form.addRow(self.lbl_pathways)
         self.chk_gene_groups = QCheckBox('Gene groups (families of guides from a table, from the Counts test)')
         self.chk_gene_groups.setToolTip(
@@ -2559,12 +2603,15 @@ class AnalysisPage(QWidget):
         self.btn_spider_comparisons.clicked.connect(self._on_spider_comparisons)
         group_row = QHBoxLayout()
         group_row.addWidget(self.btn_gene_groups)
-        group_row.addWidget(self.btn_spider_comparisons)
         group_row.addStretch()
+        spider_row = QHBoxLayout()
+        spider_row.addWidget(self.btn_spider_comparisons)
+        spider_row.addStretch()
         self.lbl_gene_groups = _label('')
         form.addRow(self.chk_gene_groups)
         form.addRow(group_row)
         form.addRow(self.lbl_gene_groups)
+        sections['Pathways and gene groups'].addRow(spider_row)
         self.cb_compare = QComboBox()
         for key, text in COMPARE.items():
             self.cb_compare.addItem(text, key)
@@ -2597,17 +2644,17 @@ class AnalysisPage(QWidget):
         form.addRow(self.chk_pop_contrasts)
         form.addRow('Pair samples by:', self.cb_pairing)
         form.addRow('Split by:', self.cb_split)
-        form.addRow('Adjust for:', self.list_adjust)
+        sections['Design'].addRow('Adjust for:', self.list_adjust)
         self.sb_p = _float_spin(0.0001, 0.5, 4, 0.01)
         self.sb_fc = _float_spin(0.0, 10.0, 2, 0.1)
         self.chk_treat = QCheckBox('TREAT: test |log2FC| above the threshold')
         self.cb_fdr = QComboBox()
         for key, text in FDR_SCOPES.items():
             self.cb_fdr.addItem(text, key)
-        form.addRow('FDR threshold:', self.sb_p)
-        form.addRow('|log2FC| threshold:', self.sb_fc)
-        form.addRow(self.chk_treat)
-        form.addRow('FDR correction:', self.cb_fdr)
+        sections['Thresholds'].addRow('FDR threshold:', self.sb_p)
+        sections['Thresholds'].addRow('|log2FC| threshold:', self.sb_fc)
+        sections['Thresholds'].addRow(self.chk_treat)
+        sections['Thresholds'].addRow('FDR correction:', self.cb_fdr)
         for w in (self.cb_mode, self.cb_reference, self.cb_pairing, self.cb_split, self.cb_fdr,
                   self.cb_count_test, self.cb_norm, self.sb_clone_count, self.sb_clone_pct,
                   self.sb_clone_levels, self.cb_compare, self.cb_ref_pop, self.cb_marker_ref,
@@ -2616,6 +2663,7 @@ class AnalysisPage(QWidget):
         row.addWidget(left)
         right = QVBoxLayout()
         self.run_btn = QPushButton('Run statistics')
+        self.run_btn.setStyleSheet(_PRIMARY_BUTTON_STYLE)
         self.run_btn.clicked.connect(self.start_stats)
         right.addWidget(self.run_btn)
         self.stats_status = _label('')
@@ -2692,6 +2740,10 @@ class AnalysisPage(QWidget):
         self.chk_treat.toggled.connect(lambda v: self._on_stat_setting('use_treat', bool(v)))
         self.cb_fdr.currentIndexChanged.connect(
             lambda _i: self._on_stat_setting('fdr_scope', self.cb_fdr.currentData()))
+
+    def _on_advanced_toggled(self, checked: bool):
+        self.advanced_box.setVisible(checked)
+        self.plugin.qsettings.setValue('analysis_stats_advanced', 'true' if checked else 'false')
 
     def compare_mode(self) -> str:
         """'populations' when populations are compared (several counted),
@@ -4628,7 +4680,8 @@ class AnalysisPage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, 'Marker', f'The figure could not be drawn: {exc}')
             return
-        fcfp.open_figure_window(self, fig, self._figure_name('marker_combination', f'Marker: {feature}'))
+        fcfp.open_figure_window(self, fig, self._figure_name('marker_combination', f'Marker: {feature}'),
+                                folder=self.analysis_root())
 
     def _on_results_double_clicked(self, row: int, _col: int):
         for j in range(self.results_table.columnCount()):
@@ -4689,7 +4742,8 @@ class AnalysisPage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, 'Combination', f'The figure could not be drawn: {exc}')
             return
-        fcfp.open_figure_window(self, fig, self._figure_name('combination', f'Combination: {combination}'))
+        fcfp.open_figure_window(self, fig, self._figure_name('combination', f'Combination: {combination}'),
+                                folder=self.analysis_root())
 
     def on_figures_error(self, message):
         self.figure_msg.setText(f'Figures failed: {message}')
@@ -4713,6 +4767,7 @@ class AnalysisPage(QWidget):
             row.addWidget(b)
         lay.addLayout(row)
         self.export_btn = QPushButton('Export analysis')
+        self.export_btn.setStyleSheet(_PRIMARY_BUTTON_STYLE)
         self.export_btn.clicked.connect(self.start_export)
         lay.addWidget(self.export_btn)
         self.export_status = _label('')
@@ -4861,6 +4916,49 @@ class AnalysisPage(QWidget):
             lines += [f'  Note: {n}' for n in (self.filtered.notes if self.filtered else []) + (stats.get('notes') or [])]
         return '\n'.join(lines) + '\n'
 
+    def run_record(self) -> dict:
+        """Record of the analysis for analysis_run.json: its settings, samples
+        and populations, and the FlowCode state (debarcoding, thresholds, FRET
+        correction) with the unmixing behind the counts, as data."""
+        from honeychrome import __version__ as hc_version
+        import flowcode_state as fcs
+
+        s = self.settings
+        files = self.used_files()
+        saved = s.get('counts') or {}
+        flowcode = self.plugin.state.to_json()
+        flowcode.pop('analysis', None)
+        groups = s.get('sample_groups') or {}
+        record = {
+            'schema': 'flowcode_analysis_run',
+            'schema_version': 1,
+            'time': datetime.now().isoformat(timespec='seconds'),
+            'honeychrome_version': hc_version,
+            'plugin_version': fcs.PLUGIN_VERSION,
+            'experiment': str(self._controller().experiment_dir),
+            'fret_correction': not self.uncorrected(),
+            'populations': self.counted_populations(),
+            'phenotypes': self.counted_phenotypes(),
+            'counts': {k: saved.get(k) for k in ('time', 'source', 'method', 'signature', 'errors')},
+            'samples': [{'sample': key, 'name': self._name(key), 'file': str(path), 'group': groups.get(key, ''),
+                         **({'library': self.library_of(key)} if self.multi_library() else {})}
+                        for key, path in files.items()],
+            'analysis_settings': {k: v for k, v in s.items() if k != 'counts'},
+            'comparisons': list(self.stats['comparisons']) if self.stats is not None else [],
+            'flowcode': flowcode,
+        }
+        if saved.get('source') == fa.SOURCE_LIVE:
+            record['live_unmixing'] = self.plugin.live_unmixing_signature(list(files))
+        else:
+            exports = {}
+            for folder in [self.export_folder()] + [Path(f) for f in s.get('linked_folders') or []]:
+                try:
+                    exports[str(folder)] = json.loads((Path(folder) / fcs.RUN_FILE).read_text(encoding='utf-8'))
+                except (OSError, ValueError):
+                    exports[str(folder)] = None
+            record['exports'] = exports
+        return record
+
     def start_export(self):
         if self.counts is None or self.filtered is None:
             self.export_status.setText('Count events first (Data).')
@@ -4882,7 +4980,8 @@ class AnalysisPage(QWidget):
         groups = self._unit_groups()
         colours = self.group_colours()
         qc, filtered, counts, meta = self.qc, self.filtered, self.counts, self.meta
-        settings_text = self.settings_text() + self.shift_view.settings_text()
+        settings_text = self.settings_text() + self.shift_view.settings_text() + self.synopsis_view.settings_text()
+        run_record = self.run_record()
         sample_table = self.sample_table_frame()
 
         figures = []
@@ -4964,6 +5063,10 @@ class AnalysisPage(QWidget):
                                             groups=True)))
 
         figures += self.shift_view.export_figures(is_dark)
+        # The synopsis leads the report, after the QC figure.
+        synopsis_figures, synopsis_tables = self.synopsis_view.export_plan(is_dark)
+        lead = 1 if qc is not None else 0
+        figures = figures[:lead] + synopsis_figures + figures[lead:]
         store = self.figure_options_store()
         if store is not None:
             from honeychrome.view_components import figure_options as fo
@@ -4977,8 +5080,8 @@ class AnalysisPage(QWidget):
                                                 qc=qc, filtered=filtered, stats=stats, sample_table=sample_table,
                                                 settings_text=settings_text, figures=figures, sample_labels=labels,
                                                 progress=progress, no_fret=no_fret,
-                                                fdr_threshold=float(s['pval_threshold']))
-            written = list(written) + list(shift_tables(folder))
+                                                fdr_threshold=float(s['pval_threshold']), run_record=run_record)
+            written = list(written) + list(shift_tables(folder)) + list(synopsis_tables(folder))
             progress(len(figures), len(figures), '')
             return written
 
@@ -5003,15 +5106,23 @@ class AnalysisPage(QWidget):
     # =====================================================================
 
     def on_task_finished(self, key, result):
+        if key in fsyv.TASKS:
+            self.synopsis_view.on_finished(key, result)
+            return
         if key in fshv.TASKS:
             self.shift_view.on_finished(key, result)
+            self.synopsis_view.refresh()
             return
         {'analysis_count': self.on_count_finished, 'analysis_stats': self.on_stats_finished,
          'analysis_figures': self.on_figures_finished, 'analysis_export': self.on_export_finished,
          'analysis_loo': self.on_loo_finished, 'analysis_restore': self.on_restore_finished,
          fcgv.TASK: self.gating_view.on_finished}[key](result)
+        self.synopsis_view.refresh()
 
     def on_task_error(self, key, message):
+        if key in fsyv.TASKS:
+            self.synopsis_view.on_error(key, message)
+            return
         if key in fshv.TASKS:
             self.shift_view.on_error(key, message)
             return
@@ -5065,6 +5176,7 @@ class AnalysisPage(QWidget):
         self._restore_saved_stats()
         self.gating_view.refresh()
         self.shift_view.refresh()
+        self.synopsis_view.refresh()
         self.root_label.setText(str(self.analysis_root()))
         self._update_default_buttons()
         self.refresh_status()

@@ -129,7 +129,7 @@ ANALYSIS_DEFAULTS = {
     'adjust': [],
     'split_by': '',
     'run_counts': True,
-    'run_freq': True,
+    'run_freq': False,
     'contrast_mode': 'reference',
     'reference': '',
     'pval_threshold': 0.05,
@@ -174,6 +174,7 @@ ANALYSIS_DEFAULTS = {
     'gene_group_order': [],
     'gene_group_comparisons': [],
     'shift': {},
+    'synopsis': {},
 }
 PATHWAY_EVIDENCE = ('all', 'experimental')
 

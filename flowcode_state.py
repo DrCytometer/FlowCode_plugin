@@ -106,6 +106,9 @@ DEFAULT_SETTINGS = {
     'combo_overrides': {},
 }
 
+# Written beside each export: what the export used.
+RUN_FILE = 'FlowCode_run.json'
+
 SECTION3_SETTINGS = ('backbone_max_events', 'unstained_max_events', 'cell_weight')
 SECTION4_SETTINGS = ('rescue_toomany', 'rescue_flat_threshold', 'rescue_gate_frac', 'rescue_toofew',
                      'rescue_toofew_flat_threshold', 'rescue_toofew_gate_frac', 'rescue_toofew_min_z',

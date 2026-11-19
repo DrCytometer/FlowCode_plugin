@@ -103,13 +103,14 @@ SAMPLE_COLUMN_MAX_WIDTH = 280
 EXPORT_SUBDIR = 'FlowCode Unmixed'
 EXPORT_NAME_SUFFIX = ' FlowCode'
 SUMMARY_FILE = 'FlowCode_debarcode_summary.csv'
-RUN_FILE = 'FlowCode_run.json'
+RUN_FILE = fcs.RUN_FILE
 
 _ERROR_STYLE = 'color: #d62728;'
 _WARN_STYLE = 'color: #cc6600;'
 _DONE_STYLE = 'color: #2ca02c;'
 _HINT_STYLE = 'color: grey; font-style: italic;'
 _INVALID_STYLE = 'color: #d62728; font-weight: bold;'
+_PRIMARY_BUTTON_STYLE = 'QPushButton { font-weight: bold; font-size: 14pt; }'
 
 # Debarcoding without FRET correction (no FRET backbone).
 BACKBONE_TITLE = 'Backbone'
@@ -2097,7 +2098,8 @@ class TagsPage(_Page):
         except ValueError as exc:
             _set_message(self.combo_msg, [str(exc)])
             return
-        start = str(Path(self.plugin.controller.experiment_dir) / 'combinations.csv')
+        from honeychrome.view_components.scalable_figure_widget import start_path
+        start = start_path(Path(self.plugin.controller.experiment_dir) / OUTPUT_SUBDIR, 'combinations.csv')
         path, _ = QFileDialog.getSaveFileName(self, 'Save FlowCode combinations', start, 'CSV files (*.csv)')
         if path:
             fcc.write_combinations_csv(path, design)
@@ -2707,6 +2709,7 @@ class GatesPage(_Page):
         grp = QGroupBox('Backbone and matched unstained')
         lay = QHBoxLayout(grp)
         self.load_btn = QPushButton('Load events')
+        self.load_btn.setStyleSheet(_PRIMARY_BUTTON_STYLE)
         self.load_btn.clicked.connect(lambda: self.plugin.load_events())
         self.load_status = QLabel('')
         self.load_status.setWordWrap(True)
@@ -2743,6 +2746,7 @@ class GatesPage(_Page):
         self.panel.control_layout(2).addWidget(self.counts)
         row = QHBoxLayout()
         self.confirm_btn = QPushButton('Confirm gates')
+        self.confirm_btn.setStyleSheet(_PRIMARY_BUTTON_STYLE)
         self.confirm_btn.setToolTip('Unmix the gated events in the debarcoding space and set starting thresholds.')
         self.confirm_btn.clicked.connect(lambda: self.plugin.compute_debarcode_space(confirm=True))
         self.confirm_status = QLabel('')
@@ -2926,6 +2930,7 @@ class CharacterisePage(_Page):
         lay = QVBoxLayout(grp)
         row = QHBoxLayout()
         self.run_btn = QPushButton('Debarcode and identify FRET spillover')
+        self.run_btn.setStyleSheet(_PRIMARY_BUTTON_STYLE)
         self.run_btn.clicked.connect(lambda: self.plugin.characterise())
         self.figures_btn = QPushButton('Show event figures')
         self.figures_btn.setToolTip('Reload and unmix the gated backbone to rebuild the panel expression and the '
@@ -3286,6 +3291,7 @@ class ExportPage(_Page):
         lay.addWidget(self.method_line)
         row = QHBoxLayout()
         self.run_btn = QPushButton('Unmix and export')
+        self.run_btn.setStyleSheet(_PRIMARY_BUTTON_STYLE)
         self.run_btn.clicked.connect(lambda: self.plugin.start_export())
         self.run_status = QLabel('')
         self.run_status.setWordWrap(True)
@@ -5514,7 +5520,10 @@ class PluginWidget(QWidget):
         """What a worker needs to FlowCode-unmix *keys* as section 5 would
         export them (``flowcode_export.live_sample_events``); with
         *overrides*, as it would with those section 5 settings
-        (``export_job``). Raises ValueError when it cannot. Main thread."""
+        (``export_job``). 'signature' covers all of *keys* (the run's
+        inputs); 'sample_signatures' covers each sample alone, so a sample's
+        cache key does not change with the other samples in the run. Raises
+        ValueError when it cannot. Main thread."""
         if self.section_status(4)[0] != 'done':
             raise ValueError('Characterise the backbone in section 4 first.')
         fc = self.export_spectra()
@@ -5525,11 +5534,12 @@ class PluginWidget(QWidget):
             raise ValueError('The AF libraries could not be read.')
         plan, af_by_sample, unmix_fn, extra_channels, _keywords, _tandems = job
         signature = self.live_unmixing_signature(keys, overrides)
+        sample_signatures = {key: self.live_unmixing_signature([key], overrides) for key in keys}
         from honeychrome import settings as app_settings
         max_bytes = int(getattr(app_settings, 'unmixing_cache_gb_retrieved', 8)) * 1024 ** 3
         return {'layout': layout, 'plan': plan, 'af_by_sample': af_by_sample, 'unmix_fn': unmix_fn,
                 'pnn': fce.export_pnn(layout, extra_channels), 'n_extra': len(extra_channels),
-                'signature': signature, 'max_cache_bytes': max_bytes}
+                'signature': signature, 'sample_signatures': sample_signatures, 'max_cache_bytes': max_bytes}
 
     def _on_unmixing_method_changed(self):
         if self._active and self._available():
