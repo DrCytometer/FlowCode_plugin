@@ -82,16 +82,18 @@ def _with_overrides(gating, sample_key: str, overrides: dict):
     return gating
 
 
-def plot_data(events: np.ndarray, pnn: list, sample_key: str, snapshot, plots: list, fluorescence: list) -> dict:
+def plot_data(events: np.ndarray, pnn: list, sample_key: str, snapshot, plots: list, fluorescence: list,
+              spectral_model: list | None = None) -> dict:
     """
     ``data_for_cytometry_plots`` of one sample's FlowCode-unmixed *events*
     (columns *pnn*): *plots* (the experiment's Unmixed Data plot list; plots
     on channels missing from *pnn* are left out), the snapshot's gating and
     the sample's transforms, the gate membership the counts use, the
     statistics and histograms. *fluorescence* names the fluorescence
-    channels (ribbon plots).
+    channels (ribbon plots). *spectral_model* (the experiment's controls)
+    gives the axis labels their antigens, as on the Unmixed Data plots.
     """
-    from honeychrome.controller_components.functions import calc_hists, calc_stats
+    from honeychrome.controller_components.functions import build_display_label_map, calc_hists, calc_stats
     import honeychrome.settings as hc_settings
 
     pnn = list(pnn)
@@ -106,7 +108,7 @@ def plot_data(events: np.ndarray, pnn: list, sample_key: str, snapshot, plots: l
     membership = snapshot.memberships(sample_key, events, pnn)
     data = {
         'pnn': pnn,
-        'pnn_labels': {},
+        'pnn_labels': build_display_label_map(pnn, spectral_model),
         'fluoro_indices': [pnn.index(ch) for ch in fluorescence if ch in pnn],
         'lookup_tables': {},
         'event_data': events,

@@ -280,6 +280,7 @@ class GatingSection(QWidget):
         plots = [dict(p) for p in (getattr(experiment, 'cytometry', None) or {}).get('plots') or []]
         unmixed = experiment.settings['unmixed']
         fluorescence = [unmixed['event_channels_pnn'][i] for i in unmixed.get('fluorescence_channel_ids') or []]
+        spectral_model = list(experiment.process.get('spectral_model') or [])
         highlight = self.highlight_combo.currentData()
         phenotype = None
         name = fcg.highlighted_phenotype(highlight)
@@ -325,7 +326,7 @@ class GatingSection(QWidget):
             progress(len(views), steps, 'gating')
             pnn = inputs[view]['pnn']
             n_combos = len(fa.combo_names_in_file(pnn))
-            data = fcg.plot_data(events[view], pnn, key, snapshot, plots, fluorescence)
+            data = fcg.plot_data(events[view], pnn, key, snapshot, plots, fluorescence, spectral_model)
             focus = focus_of(events[view], pnn, n_combos)
             reference = None
             if view != fcg.VIEW_UNCORRECTED:
