@@ -57,6 +57,8 @@ from pathlib import Path
 
 import numpy as np
 
+from honeychrome.controller_components import experiment_paths
+
 import flowcode_analysis as fa
 import flowcode_phenotype_shift as fsh
 
@@ -65,7 +67,7 @@ VERSION = 1
 
 def cache_folder(experiment_dir) -> Path:
     """Folder of the compact events, in the experiment's cache."""
-    return Path(experiment_dir) / 'cache' / 'flowcode_analysis' / 'count_events'
+    return experiment_paths.cache_dir(experiment_dir, 'flowcode_analysis', 'count_events')
 
 
 def storing_gate(snapshot, gates, fluors, viability) -> str | None:

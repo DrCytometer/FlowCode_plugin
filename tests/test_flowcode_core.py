@@ -213,6 +213,22 @@ def test_combinations_csv_round_trip_and_errors(tmp_path):
         fc.read_combinations_csv(bad)
 
 
+def test_combinations_csv_without_header(tmp_path):
+    path = tmp_path / 'library.csv'
+    path.write_text('Atf3,AU1,Flag,V5,\nBatf,AU1,HA,Ollas,\n\nCebpa,AU1,HA,S,\n', encoding='utf-8')
+    assert fc.read_combinations_csv(path) == [
+        ('Atf3', ('AU1', 'Flag', 'V5')), ('Batf', ('AU1', 'HA', 'Ollas')), ('Cebpa', ('AU1', 'HA', 'S'))]
+
+    single = tmp_path / 'single.csv'
+    single.write_text('Ahr,AU1,Flag,Ollas\n', encoding='utf-8')
+    assert fc.read_combinations_csv(single) == [('Ahr', ('AU1', 'Flag', 'Ollas'))]
+
+    bad = tmp_path / 'bad_headerless.csv'
+    bad.write_text('Atf3,AU1,Flag,V5\n\nBatf,AU1,HA,\n', encoding='utf-8')
+    with pytest.raises(ValueError, match='line\\(s\\) 3'):
+        fc.read_combinations_csv(bad)
+
+
 def test_validate_combo_names():
     assert fc.validate_combo_names(['GATA-3', 'Tbet'], ['PE', 'FSC-A']) == []
     problems = fc.validate_combo_names(['A,B', 'Tbet', 'Tbet', ' ', 'Foxp3'], ['FC Foxp3'])
@@ -1107,6 +1123,36 @@ def test_unmix_staged_rescues_dimmed_events_unless_saturated():
     assert not np.any(np.isin(rescued, again.diagnostics['rescue_toofew']['similarity']['idx']))
 
 
+def test_staged_export_fn_debarcodes_with_the_sample_thresholds(monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    design = _design(10)
+    bb = _backbone(design)
+    spectra = _characterise(design, bb).spectra
+    sample = _backbone(design, n_per_combo=200, seed=11)
+    unmix = _identity_unmix(bb['spectra'], bb['af_mean'])
+    monkeypatch.setattr(fc, 'af_only_unmix', lambda raw, *a, **k: unmix(raw))
+    pnn = ('FSC-A', 'SSC-A') + DETECTORS
+    raw_chunk = np.column_stack([np.full((len(sample['raw']), 2), 10.0), sample['raw']])
+    gate = {'x': 'FSC-A', 'y': 'SSC-A', 'vertices_raw': [[0, 0], [50, 0], [50, 100], [0, 100]]}
+    settings = {'tag_shift_min_n': 100, 'correction': 'combo', 'regressor': 'fixed'}
+    af = SimpleNamespace(spectra=np.zeros((2, N_DET)))
+    higher = np.asarray(spectra.thresholds, dtype=float) * 4.0
+
+    def run(fc_spectra, thresholds=None):
+        unmix_fn = fc.staged_export_fn(fc_spectra, bb['spectra'], FLUORS, lambda raw, af, _key=None: unmix(raw),
+                                       [gate], pnn, settings, thresholds=thresholds)
+        unmix_fn.prepare(sample['raw'], raw_chunk, af)
+        return unmix_fn(sample['raw'], raw_chunk, af)
+
+    plain = run(spectra)
+    np.testing.assert_array_equal(run(spectra, spectra.thresholds)['extra'], plain['extra'])
+    moved = run(spectra, higher)
+    np.testing.assert_array_equal(moved['extra'], run(replace(spectra, thresholds=higher))['extra'])
+    assert np.any(moved['extra'][:, 1] != plain['extra'][:, 1])
+
+
 def test_staged_export_fn_returns_the_exporter_columns_and_counts(monkeypatch):
     from types import SimpleNamespace
 
@@ -1207,13 +1253,14 @@ def test_summaries_add_up_and_write_one_row_per_sample(tmp_path):
     with open(tmp_path / 's.csv', newline='') as fh:
         rows = list(csv.reader(fh))
     assert rows[0] == list(fc.SUMMARY_COLUMNS) + list(design.combo_names)
-    assert rows[1] == ['One', '8', '2', '1', '1', '3', '3', '2', '1', '2', '0']
-    assert rows[2][0] == 'Two' and rows[2][7:] == ['0', '0', '2', '0']
+    assert rows[1] == ['One', '8', '2', '1', '1', '3', '0', '3', '2', '1', '2', '0']
+    assert rows[2][0] == 'Two' and rows[2][8:] == ['0', '0', '2', '0']
     fc.write_debarcode_summary_csv(tmp_path / 'w.csv', [('One', total)], design, warning='Invalid')
     with open(tmp_path / 'w.csv', newline='') as fh:
         rows = list(csv.reader(fh))
     assert rows[0][-1] == 'Warning' and rows[1][-1] == 'Invalid' and rows[1][:-1] == ['One', '8', '2', '1', '1',
-                                                                                     '3', '3', '2', '1', '2', '0']
+                                                                                     '3', '0', '3', '2', '1', '2',
+                                                                                     '0']
 
 
 def test_rename_combos_maps_by_tag_set():
@@ -1971,6 +2018,35 @@ def test_debarcoding_in_blocks_equals_one_pass_and_rows_slice_it():
                                   np.intersect1d(picked, whole['dc'].rescued_toofew))
 
 
+def test_second_debarcoding_after_the_correction_recalls_only_unbarcoded_events():
+    design = _tt_design()
+    char = _cal_char(design)
+    raw, _codes, _clean = _cal_events(design, seed=2)
+    too_few = fc.TooFewSettings.from_settings(char.settings)
+    unmix = _tt_unmix()
+    args = (raw, char, _tt_spectra(), list(TT_FLUORS), unmix, _transform, None, char.thresholds, True, 0.9,
+            0.5, 100, 'fixed', too_few)
+    first = fc._debarcode(*args)
+    second = fc._debarcode(*args, second_pass=True)
+    ids1, ids2 = first['dc'].ids, second['dc'].ids
+    barcoded = (ids1 >= 1) & (ids1 <= design.n_combos)
+    np.testing.assert_array_equal(ids2[barcoded], ids1[barcoded])
+
+    corrected = fc.apply_error_correction(raw, first['tag_abundances'], ids1, design, char.combo_error,
+                                          char.pair_model, char.thresholds, 'combo',
+                                          tag_baseline=first['tag_baseline'])['raw']
+    out = unmix(corrected)
+    tag_cols = [list(TT_FLUORS).index(f) for f in design.fluors]
+    again = fc.debarcode_rescue(out['unmixed'][:, tag_cols], char.thresholds, design, _transform,
+                                reference_median=char.combo_raw_median, floor=char.rescue_floor, too_few=too_few,
+                                af_scale=out['af_scale'], usable=fc.unsaturated_mask(raw, char),
+                                reference_background=char.tag_background)
+    np.testing.assert_array_equal(ids2[~barcoded], again.ids[~barcoded])
+    gained = np.flatnonzero(~barcoded & (again.ids >= 1) & (again.ids <= design.n_combos))
+    np.testing.assert_array_equal(second['dc'].rescued_corrected, gained)
+    np.testing.assert_array_equal(fc._debarcode(*args, second_pass=True, correction='none')['dc'].ids, ids1)
+
+
 def test_prepare_debarcodes_the_sample_once_and_the_chunks_reuse_it():
     from types import SimpleNamespace
 
@@ -1990,7 +2066,8 @@ def test_prepare_debarcodes_the_sample_once_and_the_chunks_reuse_it():
     raw_all = np.column_stack([scatter, raw])
     gate = {'x': 'FSC-A', 'y': 'SSC-A', 'vertices_raw': [[0, 0], [50, 0], [50, 50], [0, 50]]}
     unmix_fn = fc.staged_export_fn(char, _tt_spectra(), TT_FLUORS, lambda r, af, _key=None: unmix(r), [gate], pnn,
-                                   {'correction': 'combo'}, on_block=blocks.append, debarcode_fn=debarcode,
+                                   {'correction': 'combo', 'debarcode_after_correction': False},
+                                   on_block=blocks.append, debarcode_fn=debarcode,
                                    calibration_record=gate, on_scales=seen.append)
     af = SimpleNamespace(spectra=_cal_af())
     unmix_fn.prepare(raw, raw_all, af, 'sample.fcs')

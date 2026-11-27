@@ -34,7 +34,7 @@ from pathlib import Path
 
 import numpy as np
 
-PLUGIN_VERSION = '0.4.1'
+PLUGIN_VERSION = '0.7.0'
 PROCESS_KEY = 'flowcode_unmix'
 
 SINGLETS_GATE = 'FlowCode Singlets'
@@ -71,8 +71,11 @@ DEFAULT_SETTINGS = {
     'threshold_max_events': 50_000,
     'threshold_min_delta_bic': 10.0,
     'threshold_display_max_events': 200_000,
+    'sample_threshold_max_events': 20_000,  # gated events read per sample for the sample thresholds
     'cell_weight': None,                # in the section 3 run record only
     'debarcode_method': 'r1',           # 'r1' (per-cell AF) or 'experiment' (the experiment's method)
+    'af_abundance': 'clamped',          # per-cell AF abundance: 'clamped', 'noise_aware' or 'noise_aware_bend'
+    'debarcode_af': False,              # af_abundance also in the per-cell AF debarcoding unmix
     # section 4
     'rescue_toomany': True,
     'rescue_flat_threshold': 0.9,
@@ -92,6 +95,7 @@ DEFAULT_SETTINGS = {
     # section 5
     'tag_shift_min_n': 100,
     'correction': 'combo',
+    'debarcode_after_correction': True,  # debarcode untransduced and unresolved events again after the correction
     'regressor': 'fixed',
     'export_include_controls': False,
     'tandem_tags': None,
@@ -115,7 +119,7 @@ SECTION4_SETTINGS = ('rescue_toomany', 'rescue_flat_threshold', 'rescue_gate_fra
                      'rescue_toofew_min_frac', 'rescue_toofew_af_ratio', 'rescue_toofew_n0', 'fit_min_fold',
                      'min_cells_per_combo', 'spill_ridge')
 SECTION5_SETTINGS = ('tag_shift_min_n', 'correction', 'regressor', 'tandem_tags', 'tandem_z_min',
-                     'tandem_min_combos', 'tandem_max_events')
+                     'tandem_min_combos', 'tandem_max_events', 'debarcode_after_correction')
 # Per-sample combination calibration (section 5): a run input of its own, so
 # that exports made before it existed say why they need a re-run.
 CALIBRATION_SETTINGS = ('calib_combos', 'calib_brightness', 'calib_z_min', 'calib_min_share', 'calib_min_events')
@@ -147,10 +151,21 @@ _REASONS = {
     'samples': 'sample selection changed',
     'output': 'output folder changed',
     'debarcode': 'debarcoding unmix changed',
+    'debarcode_af': 'AF abundance of the debarcoding unmix changed',
+    'af_abundance': 'AF abundance changed',
     'method': 'unmixing method changed',
     'no_fret': 'FRET correction switched on or off',
     'libraries': 'libraries or library assignments changed',
+    'sample_thresholds': 'sample debarcoding thresholds changed',
 }
+
+# Where the samples' debarcoding thresholds come from: the backbone's
+# (section 3 Thresholds), the automatic thresholds of the pooled samples, or
+# thresholds the user sets on the pooled samples.
+SAMPLE_THRESHOLDS_BACKBONE = 'backbone'
+SAMPLE_THRESHOLDS_AUTO = 'auto'
+SAMPLE_THRESHOLDS_INDIVIDUAL = 'individual'
+SAMPLE_THRESHOLD_MODES = (SAMPLE_THRESHOLDS_BACKBONE, SAMPLE_THRESHOLDS_AUTO, SAMPLE_THRESHOLDS_INDIVIDUAL)
 
 # Library of a sample that belongs to none (e.g. an FMO).
 OTHER_LIBRARY = 'Other'
@@ -223,6 +238,14 @@ class FlowCodeState:
     gates: dict = field(default_factory=dict)
     thresholds: dict = field(default_factory=dict)
     y_channels: dict = field(default_factory=dict)
+    # Sample debarcoding thresholds: their source (SAMPLE_THRESHOLD_MODES),
+    # the samples they are set on (None: every candidate), {tag:
+    # threshold_record} of the pooled samples, and the inputs they were set
+    # with (``sample_threshold_inputs``).
+    sample_threshold_mode: str = SAMPLE_THRESHOLDS_AUTO
+    sample_threshold_keys: list | None = None
+    sample_thresholds: dict = field(default_factory=dict)
+    sample_thresholds_inputs: dict | None = None
     settings: dict = field(default_factory=lambda: dict(DEFAULT_SETTINGS))
     output_folder: str | None = None
     export_samples: list | None = None
@@ -271,6 +294,11 @@ class FlowCodeState:
             merged['correction'] = 'pairwise'
         state.settings = merged
         state.completed = {str(k): v for k, v in (state.completed or {}).items()}
+        # states saved before sample thresholds existed debarcoded the samples with the backbone's
+        if 'sample_threshold_mode' not in data:
+            state.sample_threshold_mode = SAMPLE_THRESHOLDS_BACKBONE
+        if state.sample_threshold_mode not in SAMPLE_THRESHOLD_MODES:
+            state.sample_threshold_mode = SAMPLE_THRESHOLDS_AUTO
         return state
 
     # -- backbone ------------------------------------------------------------
@@ -343,6 +371,9 @@ class FlowCodeState:
             'settings3': _digest({k: self.settings.get(k) for k in SECTION3_SETTINGS}),
             'debarcode': (None if self.settings.get('debarcode_method', 'r1') == 'r1'
                           else _digest(['experiment', self.unmixing_inputs.get('token')])),
+            'debarcode_af': (_digest(self.settings.get('af_abundance'))
+                             if self.settings.get('debarcode_af')
+                             and self.settings.get('af_abundance', 'clamped') != 'clamped' else None),
         }
         if section == 3:
             inputs['gates'] = _digest({name: self.gates.get(name, {}).get('vertices_raw')
@@ -353,6 +384,8 @@ class FlowCodeState:
             inputs['thresholds'] = _digest({t: v.get('raw') for t, v in sorted(self.thresholds.items())})
             inputs['settings4'] = _digest({k: self.settings.get(k) for k in SECTION4_SETTINGS})
             inputs['no_fret'] = _digest('no FRET correction') if self.no_fret else None
+            af_abundance = self.settings.get('af_abundance', 'clamped')
+            inputs['af_abundance'] = None if af_abundance == 'clamped' else _digest(af_abundance)
         if section >= 5:
             inputs['combo_names'] = _digest([[row['name'], sorted(row['tags'])]
                                              for row in self.included_combos()])
@@ -368,7 +401,36 @@ class FlowCodeState:
             inputs['libraries'] = (_digest([[lib.get('name'), lib.get('label'), lib.get('combos')]
                                             for lib in self.libraries] + [self.sample_libraries])
                                    if self.multi_library else None)
+            tags = [self.tag_names.get(ch, ch) for ch in self.tag_channels()]
+            inputs['sample_thresholds'] = (None if self.sample_threshold_mode == SAMPLE_THRESHOLDS_BACKBONE
+                                           else _digest([self.sample_threshold_mode,
+                                                         self.sample_threshold_values(tags)]))
         return inputs
+
+    def sample_threshold_values(self, tags) -> list | None:
+        """The samples' debarcoding thresholds (raw units) of *tags*, in that
+        order: None when the backbone's are re-used or a tag has none. The
+        automatic mode gives each tag's automatic threshold, the individual
+        mode the one the user set."""
+        if self.sample_threshold_mode == SAMPLE_THRESHOLDS_BACKBONE:
+            return None
+        key = 'auto_raw' if self.sample_threshold_mode == SAMPLE_THRESHOLDS_AUTO else 'raw'
+        records = [self.sample_thresholds.get(t) for t in tags]
+        if any(rec is None or rec.get(key) is None for rec in records):
+            return None
+        return [float(rec[key]) for rec in records]
+
+    def sample_threshold_inputs(self, fingerprint: str | None, af_lists: dict) -> dict:
+        """Digest of what the sample thresholds' events depend on: the
+        debarcoding space (section 3's inputs), the samples, their AF
+        libraries (*af_lists*: {sample key: AF profile names}) and the events
+        read per sample."""
+        return {
+            'section3': _digest(self.section_inputs(3, fingerprint)),
+            'samples': _digest(sorted(af_lists)),
+            'af_lists': _digest({k: list(v) for k, v in sorted(af_lists.items())}),
+            'events': _digest(self.settings.get('sample_threshold_max_events')),
+        }
 
     def with_combo_override(self, key: str, scale) -> dict:
         """A new ``combo_overrides`` setting with the combination *key*
@@ -427,7 +489,9 @@ def _is_bead(samples: dict, key: str, name: str) -> bool:
 
 
 def _is_unstained(key: str, name: str, tagged: set) -> bool:
-    return key in tagged or 'unstained' in key.lower() or 'unstained' in str(name).lower()
+    from honeychrome.controller_components.unstained_selection import is_unstained_name
+
+    return key in tagged or is_unstained_name(str(name), key)
 
 
 # AutoSpectral naming of single-stain control files: "<well> <marker> <fluor> (Cells|Beads)"
@@ -437,7 +501,7 @@ _CONTROL_NAME = re.compile(r'\((cells|beads)\)', re.IGNORECASE)
 def unstained_candidates(samples: dict) -> list:
     """
     Keys of unstained cell samples, in experiment order: tagged as unstained
-    or with 'unstained' in the path or name, excluding beads (the AutoSpectral
+    or named as unstained ("Unstained", or "Unst" in the tube name), excluding beads (the AutoSpectral
     Optimization rules).
     """
     all_samples = samples.get('all_samples') or {}
@@ -454,7 +518,8 @@ def control_sample_keys(samples: dict) -> set:
     file name is that of a tagged control (a copy of the reference group
     elsewhere in the raw folder), or when it is named as AutoSpectral names
     controls, "(Cells)" or "(Beads)" at the end. It is unstained when tagged
-    as unstained or 'unstained' is in its path or name.
+    as unstained or named as unstained ("Unstained", or "Unst" in the tube
+    name).
     """
     all_samples = samples.get('all_samples') or {}
     controls = set(samples.get('single_stain_controls') or [])
@@ -549,14 +614,6 @@ def export_af_assignments(sample_af_profiles: dict, keys, debarcode_names) -> di
     for key in keys:
         out[key] = export_af_profile_names(out.get(key), debarcode_names)
     return out
-
-
-def af_assignment_gaps(sample_af_profiles: dict, keys, debarcode_names, af_profiles: dict) -> list:
-    """Keys whose AutoSpectral AF assignment lacks a stored profile the
-    thresholds were set with."""
-    needed = [n for n in (debarcode_names or []) if n in (af_profiles or {})]
-    return [key for key in keys
-            if any(n not in set((sample_af_profiles or {}).get(key) or []) for n in needed)]
 
 
 # ---------------------------------------------------------------------------
@@ -854,8 +911,9 @@ def gate_record(x_channel: str, y_channel: str, vertices_raw, source: str, note:
     }
 
 
-# Threshold methods set by the user, kept when the gates are confirmed again.
-USER_THRESHOLD_METHODS = ('manual', 'imported')
+# Threshold methods set by the user, kept when the gates are confirmed again
+# ('backbone': a sample threshold the user kept at the backbone's value).
+USER_THRESHOLD_METHODS = ('manual', 'imported', 'backbone')
 
 
 def threshold_record(raw: float, method: str, delta_bic: float | None, auto_raw: float | None = None,

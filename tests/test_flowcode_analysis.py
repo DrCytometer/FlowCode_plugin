@@ -313,6 +313,34 @@ def test_qc_table(counted):
     assert qc.loc[key, 'top_share_pct'] == pytest.approx(100.0 * counts.loc[key].max() / counts.loc[key].sum())
 
 
+def test_pct_unresolved_is_a_share_of_tag_positive_events():
+    assert fa.pct_unresolved(75, 25) == pytest.approx(25.0)
+    assert np.isnan(fa.pct_unresolved(10, None))
+    assert np.isnan(fa.pct_unresolved(0, 0))
+
+
+def test_high_unresolved_flags_outliers_within_their_group():
+    pcts = {'a': 60.0, 'b': 62.0, 'c': 61.0, 'd': 90.0, 'e': 20.0, 'f': 22.0, 'g': 60.0}
+    groups = {'a': 'Blood', 'b': 'Blood', 'c': 'Blood', 'd': 'Blood', 'e': 'Spleen', 'f': 'Spleen', 'g': 'Spleen'}
+    flagged = fa.high_unresolved(pcts, groups)
+    assert set(flagged) == {'d', 'g'}
+    assert fa.high_unresolved({'a': 10.0, 'b': 80.0}, {'a': 'x', 'b': 'x'}) == {}
+
+
+def test_group_qc_summary_gives_medians_per_group():
+    rows = [{'group': 'Brain', 'in_population': 100, 'barcoded': 10, 'pct_barcoded': 10.0, 'pct_unresolved': 50.0,
+             'flagged': False},
+            {'group': 'Brain', 'in_population': 300, 'barcoded': 30, 'pct_barcoded': 10.0, 'pct_unresolved': 70.0,
+             'flagged': True},
+            {'group': 'Spleen', 'in_population': 1000, 'barcoded': 200, 'pct_barcoded': 20.0,
+             'pct_unresolved': 40.0, 'flagged': False}]
+    out = fa.group_qc_summary(rows).set_index('group')
+    assert list(out.index) == ['Brain', 'Spleen']
+    assert out.loc['Brain', 'samples'] == 2 and out.loc['Brain', 'median_barcoded'] == 20
+    assert out.loc['Brain', 'median_pct_unresolved'] == 60 and out.loc['Brain', 'high_unresolved'] == 1
+    assert fa.group_qc_summary([]).empty
+
+
 # ---------------------------------------------------------------------------
 # Statistics
 # ---------------------------------------------------------------------------

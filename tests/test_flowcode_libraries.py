@@ -333,7 +333,7 @@ def test_debarcode_summary_lists_the_library_and_out_of_library_events(tmp_path)
     with open(tmp_path / 's.csv', newline='') as fh:
         out = list(csv.reader(fh))
     assert out[0] == list(fcc.SUMMARY_COLUMNS) + ['Library', 'Out of library'] + list(names)
-    assert out[1][7:9] == ['Library 1', '1'] and out[2][7:9] == ['Other', '']
+    assert out[1][8:10] == ['Library 1', '1'] and out[2][8:10] == ['Other', '']
     fcc.write_debarcode_summary_csv(tmp_path / 'one.csv', [('a', base)], d)
     with open(tmp_path / 'one.csv', newline='') as fh:
         assert next(csv.reader(fh)) == list(fcc.SUMMARY_COLUMNS) + list(names)

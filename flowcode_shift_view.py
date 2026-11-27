@@ -682,7 +682,9 @@ class ShiftSection(QWidget):
         thresholds = {}
         fc = plugin.saved_spectra()
         if fc is not None:
-            thresholds = {f: float(t) for f, t in zip(fc.design.fluors, np.asarray(fc.thresholds, dtype=float))}
+            sample_thresholds = plugin.sample_debarcode_thresholds(fc)
+            values = fc.thresholds if sample_thresholds is None else sample_thresholds
+            thresholds = {f: float(t) for f, t in zip(fc.design.fluors, np.asarray(values, dtype=float))}
         if settings['correction'] and not thresholds:
             settings['correction'] = False
             notes.append('The spillover correction was skipped: no saved characterisation (section 4) gives the '

@@ -67,6 +67,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from honeychrome.controller_components import experiment_paths
 from honeychrome.controller_components.per_sample_gating_functions import SampleGating
 
 logger = logging.getLogger(__name__)
@@ -893,7 +894,7 @@ def library_features(counts: pd.DataFrame, meta: pd.DataFrame, sample_library: d
 
 
 def marker_cache_path(experiment_dir) -> Path:
-    return Path(experiment_dir) / 'cache' / 'flowcode_analysis' / MARKERS_FILE
+    return experiment_paths.state_dir(experiment_dir, 'flowcode_analysis', MARKERS_FILE)
 
 
 def save_marker_sums(path, signature: str, records_by_pop: dict, populations: list):
@@ -1032,11 +1033,86 @@ def gini(values) -> float:
     return float(2.0 * np.sum(ranks * x) / (n * total) - (n + 1.0) / n)
 
 
+# A sample's unresolved share is flagged when it lies more than this many
+# robust SDs (1.4826 x the median absolute deviation, at least
+# UNRESOLVED_MIN_SPREAD percentage points) above its group's median; groups
+# with fewer than UNRESOLVED_MIN_SAMPLES values are not judged.
+UNRESOLVED_FLAG_SDS = 3.0
+UNRESOLVED_MIN_SPREAD = 1.0
+UNRESOLVED_MIN_SAMPLES = 3
+
+
+def pct_unresolved(barcoded, unresolved) -> float:
+    """Unresolved events as a percentage of the tag-positive events
+    (barcoded + unresolved); NaN when unresolved is unknown (files without
+    a FlowCode ID channel) or there are none."""
+    try:
+        b, u = float(barcoded), float(unresolved)
+    except (TypeError, ValueError):
+        return float('nan')
+    total = b + u
+    return 100.0 * u / total if np.isfinite(total) and total > 0 else float('nan')
+
+
+def high_unresolved(pcts: dict, groups: dict) -> dict:
+    """
+    {sample: group's flag threshold} for the samples of *pcts* ({sample: %
+    unresolved}) whose value is above their group's (*groups*: {sample:
+    group}) median by more than UNRESOLVED_FLAG_SDS robust SDs. The robust SD
+    is 1.4826 x the median absolute deviation (the SD a normal distribution
+    with that MAD has), floored at UNRESOLVED_MIN_SPREAD percentage points so
+    that near-identical samples do not flag a small difference.
+    """
+    by_group = {}
+    for key, value in pcts.items():
+        if value is not None and np.isfinite(value):
+            by_group.setdefault(groups.get(key, ''), []).append(key)
+    out = {}
+    for keys in by_group.values():
+        if len(keys) < UNRESOLVED_MIN_SAMPLES:
+            continue
+        values = np.array([pcts[k] for k in keys], dtype=float)
+        median = float(np.median(values))
+        spread = max(1.4826 * float(np.median(np.abs(values - median))), UNRESOLVED_MIN_SPREAD)
+        threshold = median + UNRESOLVED_FLAG_SDS * spread
+        out.update({k: threshold for k, v in zip(keys, values) if v > threshold})
+    return out
+
+
+def group_qc_summary(rows: list) -> pd.DataFrame:
+    """
+    One row per group from *rows* (dicts with 'group', 'in_population',
+    'barcoded', 'pct_barcoded', 'pct_unresolved' and 'flagged'), in the order
+    groups first appear: the number of samples, the medians of the events in
+    the population, the barcoded events, % barcoded (the transduction rate)
+    and % unresolved, and the number of samples flagged for a high
+    unresolved share.
+    """
+    columns = ['group', 'samples', 'median_in_population', 'median_barcoded', 'median_pct_barcoded',
+               'median_pct_unresolved', 'high_unresolved']
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    df = pd.DataFrame(rows)
+    out = []
+    for group, part in df.groupby('group', sort=False):
+        out.append({
+            'group': group,
+            'samples': len(part),
+            'median_in_population': part['in_population'].astype(float).median(),
+            'median_barcoded': part['barcoded'].astype(float).median(),
+            'median_pct_barcoded': part['pct_barcoded'].astype(float).median(),
+            'median_pct_unresolved': part['pct_unresolved'].astype(float).median(),
+            'high_unresolved': int(part['flagged'].sum()),
+        })
+    return pd.DataFrame(out, columns=columns)
+
+
 def qc_table(counts: pd.DataFrame, meta: pd.DataFrame, display_names: dict | None = None) -> pd.DataFrame:
     """
     One row per sample: events in the file and the population, barcoded
     events and their share of the population, untransduced and unresolved
-    events (new exports only), the Gini coefficient of the barcode
+    events (new exports only) with the unresolved share of the tag-positive
+    events (``pct_unresolved``), the Gini coefficient of the barcode
     distribution and the most frequent combination with its share.
     High Gini or a dominant combination points to clonal expansion. With
     several libraries (``library_features``) the library and the events
@@ -1059,6 +1135,7 @@ def qc_table(counts: pd.DataFrame, meta: pd.DataFrame, display_names: dict | Non
             'pct_barcoded': 100.0 * barcoded / pop if pop else float('nan'),
             'untransduced': meta.loc[key, 'untransduced'],
             'unresolved': meta.loc[key, 'unresolved'],
+            'pct_unresolved': pct_unresolved(barcoded, meta.loc[key, 'unresolved']),
             'gini': gini(row.values),
             'top_combination': top,
             'top_share_pct': 100.0 * float(row.max()) / barcoded if barcoded > 0 else float('nan'),

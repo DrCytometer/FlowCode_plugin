@@ -112,6 +112,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from honeychrome.controller_components import experiment_paths
+
 import flowcode_analysis as fa
 import flowcode_fsea as ffsea
 import flowcode_tag_correction as ftc
@@ -582,7 +584,7 @@ def keep_events(events: np.ndarray, pnn: list, sample_key: str, snapshot, gate: 
 
 def events_path(experiment_dir) -> Path:
     """Folder of the kept events, in the experiment's cache."""
-    return Path(experiment_dir) / 'cache' / 'flowcode_analysis' / 'shift_events'
+    return experiment_paths.cache_dir(experiment_dir, 'flowcode_analysis', 'shift_events')
 
 
 def events_key(source_key: str, gate: str | None, chain_signature: str, keep: int | None) -> str:
@@ -971,8 +973,8 @@ def counts_table(result: dict) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def result_path(experiment_dir) -> Path:
-    """Folder of the last phenotype-shift run, in the experiment's cache."""
-    return Path(experiment_dir) / 'cache' / 'flowcode_analysis' / 'shift'
+    """Folder of the last phenotype-shift run, in the experiment's state folder."""
+    return experiment_paths.state_dir(experiment_dir, 'flowcode_analysis', 'shift')
 
 
 def save_result(path, result: dict, inputs: str, when=None):

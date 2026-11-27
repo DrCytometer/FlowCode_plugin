@@ -7,14 +7,18 @@ flowcode_synopsis_plots.py). It runs nothing of its own. It reads the
 statistics shown on the Results tab (counts, frequencies, markers, gene
 groups) and the run shown on the Phenotype shift tab (shift and immune
 states), and is put together again, on a worker, when the tab is shown and
-one of them, or a choice on this tab, has changed.
+one of them, or a choice on this tab, has changed. The one thing it runs,
+on request, is the comparison of guides with each other in the Guide dossier
+(flowcode_similarity.py), which runs the statistics again on halves of the
+data and is kept with the statistics.
 
 Views
     Overview        the summary in words and one row per guide with its
                     evidence class, call counts and sentence
     Atlas           groups × guides: accumulation as colour, phenotype
                     calls as dots
-    Guide dossier   one guide across the groups, one panel per readout
+    Guide dossier   one guide across the groups, one panel per readout, and
+                    the guides most like it in cell numbers
     Calls           one row per guide and group
 
 Not named ``*_tab.py``, so the plugin loader does not load it as a tab of
@@ -26,14 +30,18 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+import pandas as pd
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QScrollArea, QSplitter, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSplitter, QVBoxLayout, QWidget,
 )
 
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget
 
+import flowcode_analysis as fa
 import flowcode_figure_panel as fcfp
+import flowcode_similarity as fsim
+import flowcode_stats as fst
 import flowcode_synopsis as fsy
 import flowcode_synopsis_plots as fsyp
 import flowcode_view_stack as fvs
@@ -41,13 +49,19 @@ import flowcode_view_stack as fvs
 logger = logging.getLogger(__name__)
 
 TASK = 'analysis_synopsis'
-TASKS = (TASK,)
+TASK_SIMILAR = 'analysis_synopsis_similar'
+TASKS = (TASK, TASK_SIMILAR)
 TITLE = 'Synopsis'
 _WARN_STYLE = 'color: #cc6600;'
 _HINT_STYLE = 'color: grey; font-style: italic;'
 STALE_TEXT = ('Out of date: the statistics or the phenotype shift shown here were made with other counts, samples '
               'or settings. Run them again to update the synopsis.')
 EMPTY_TEXT = 'Run statistics (Statistics tab) or the phenotype shift (Phenotype shift tab) first.'
+SIMILAR_HINT = ('Find similar guides lists the guides whose cell numbers change across the groups most like this '
+                'guide\'s, and how often each pairing holds in half the data. It runs the statistics again about '
+                f'{2 * fsim.N_SPLITS} times.')
+SIMILAR_NEEDS = 'Similar guides need current statistics with a baseline group, and the counts they were made from.'
+SIMILAR_RUNNING = 'Comparing the guides, on all the data and on random halves of it.'
 GUIDE_HEADERS = {
     'gene_group': 'gene group', 'groups_more': 'more cells (groups)', 'groups_fewer': 'fewer cells (groups)',
     'groups_tests_agree': 'counts and frequencies agree (groups)', 'groups_shift': 'shift (groups)',
@@ -84,6 +98,18 @@ HELP = (
     '<p><b>Guide dossier.</b> One guide across the groups, panels sharing the group axis: the fold change with its '
     '95% interval for both tests (filled: called), the guide\'s cells counted in the group, the shift angle, the '
     'immune-state scores and the markers with a call (ringed: called; grey: not tested).</p>'
+    '<p><b>Similar guides</b> (under the dossier). Knockouts of genes that work together tend to change cell '
+    'numbers in the same places. <i>Find similar guides</i> gives every guide a pattern, its gain or loss in each '
+    'group comparison (as a z-score, so uncertain values count little), and lists the five guides whose pattern '
+    'rises and falls most like this guide\'s (<i>similarity</i>: a correlation, 1 identical, 0 unrelated, negative '
+    'opposite). It uses the test chosen in <i>Cells from</i>. Two safeguards: similarity that comes from two '
+    'guides sharing FlowCode tags is estimated over all pairs of guides and taken out, and the comparison is '
+    'repeated on random halves of the data (half the levels of the pairing factor, such as mice; half of each '
+    'group\'s samples when unpaired). The last column counts the halves in which the partner is again among the '
+    'five most similar; the line above the table says how often that happens by chance and how well two halves '
+    'agree overall (0: nothing repeats). Trust a partner that holds in most halves; with few samples many do not. '
+    'Only cell numbers are compared: markers and the phenotype shift are not used. The result is saved with the '
+    'statistics and is made again only when you ask. Double-click a partner for its dossier.</p>'
     '<p><b>Overview.</b> The summary in words, and one row per guide. The <i>class</i> says which kinds of result '
     'exist for the guide: accumulation and phenotype, accumulation only, phenotype only, or no call. It does not '
     'say how the gene works. The columns beside it count the groups with a call per readout, the groups where the '
@@ -100,7 +126,8 @@ HELP = (
     'population of its own and shares its population\'s phenotype readouts.</p>'
     '<p><b>Export.</b> The Export tab adds <tt>synopsis.txt</tt>, <tt>synopsis_guides.csv</tt> and '
     '<tt>synopsis_calls.csv</tt>, the atlas of each population, and the dossier of every guide with both an '
-    'accumulation and a phenotype call. Any other dossier can be saved from its own Export Graphic button.</p>'
+    'accumulation and a phenotype call; <tt>synopsis_similar_guides.csv</tt> when similar guides were found. Any '
+    'other dossier can be saved from its own Export Graphic button.</p>'
     '<p><b>Glossary.</b> <i>Baseline</i>: the group the cell numbers of every other group are compared with. '
     '<i>Call</i>: a result its test found significant at the thresholds set for that test. <i>Not detected</i>: no '
     'cell of the guide in any sample of the group.</p>'
@@ -209,6 +236,20 @@ class SynopsisSection(QWidget):
         row.addWidget(self.cb_guide, stretch=1)
         lay.addLayout(row)
         lay.addWidget(self.dossier, stretch=1)
+        row = QHBoxLayout()
+        self.similar_btn = QPushButton('Find similar guides')
+        self.similar_btn.setToolTip('List the guides whose cell numbers change across the groups most like this '
+                                    'guide\'s, checked on random halves of the data. Kept with the statistics.')
+        self.similar_btn.clicked.connect(self.start_similar)
+        self.similar_status = _label('')
+        row.addWidget(self.similar_btn)
+        row.addWidget(self.similar_status, stretch=1)
+        lay.addLayout(row)
+        self.similar_table = CopyableTableWidget([], [])
+        self.similar_table.setMaximumHeight(170)
+        self.similar_table.setToolTip('Double-click a guide to show its dossier.')
+        self.similar_table.cellDoubleClicked.connect(self._on_table_double_clicked)
+        lay.addWidget(self.similar_table)
         self.views.addTab(self.dossier_view, 'Guide dossier')
         self.calls_table = CopyableTableWidget([], [])
         self.calls_table.setToolTip('Double-click a row to show that guide\'s dossier.')
@@ -293,7 +334,7 @@ class SynopsisSection(QWidget):
 
     def _clear_views(self):
         self.overview.setText('')
-        for table in (self.guide_table, self.calls_table):
+        for table in (self.guide_table, self.calls_table, self.similar_table):
             table.setRowCount(0)
             table.setColumnCount(0)
         for panel in (self.atlas, self.dossier):
@@ -314,10 +355,12 @@ class SynopsisSection(QWidget):
             self.synopsis, self._key = None, None
             self._clear_views()
             self.status.setText(EMPTY_TEXT)
+            self._show_similar()
             return
         self._fill_choices(stats, shift)
         key = self._source_key()
         if key == self._key:
+            self._show_similar()
             return
         self._start(key)
 
@@ -391,7 +434,10 @@ class SynopsisSection(QWidget):
 
     # -- task results -------------------------------------------------------------
 
-    def on_finished(self, _key, result):
+    def on_finished(self, key, result):
+        if key == TASK_SIMILAR:
+            self._on_similar_finished(result)
+            return
         if self._pending or result['key'] != self._source_key():
             self._pending = False
             self._key = None
@@ -402,7 +448,11 @@ class SynopsisSection(QWidget):
         self.figure_msg.setText(f"Atlas: {result['error']}" if result['error'] else '')
         self._show(result)
 
-    def on_error(self, _key, message):
+    def on_error(self, key, message):
+        if key == TASK_SIMILAR:
+            self._show_similar()
+            self.similar_status.setText(f'Similar guides could not be found: {message}')
+            return
         self._pending = False
         self.figure_msg.setText(f'The synopsis could not be put together: {message}')
 
@@ -456,6 +506,7 @@ class SynopsisSection(QWidget):
 
     def draw_dossier(self):
         synopsis, guide = self.synopsis, self.guide
+        self._show_similar()
         if synopsis is None or guide is None:
             self.dossier.clear()
             return
@@ -473,6 +524,127 @@ class SynopsisSection(QWidget):
         self.dossier.name = f"{synopsis['scope']['label']} - {guide} dossier"
         fig, make = self.page._stamped(fig, make)
         self.dossier.set_figure(fig, make=make)
+
+    # -- similar guides -----------------------------------------------------------
+
+    def _similar_result(self) -> dict | None:
+        """The comparison of guides kept with the statistics, or None."""
+        stats = self.page.stats
+        return stats.get('similar_guides') if stats is not None else None
+
+    def _can_compare(self) -> bool:
+        """The statistics are current, have a baseline group, and the counts
+        they were made from are loaded."""
+        page = self.page
+        stats = page.stats
+        return bool(stats is not None and page.filtered is not None and not page._stats_stale
+                    and fsy.available_tests(stats) and not fsy._between_populations(stats))
+
+    def _guide_tags(self, guides: list) -> pd.DataFrame | None:
+        """Guides × tags (1 where the guide carries the tag), or None when
+        the tags of some guide are not known. With several libraries a guide
+        takes the tags of the first library that carries it."""
+        page = self.page
+        tags, _spread, _note = page._marker_tag_inputs(False)
+        if tags is None:
+            return None
+        feature_map = page.feature_map()
+        if feature_map:
+            rows = {}
+            for combos in feature_map.values():
+                for combination, feature in combos.items():
+                    if combination in tags.index and feature not in rows:
+                        rows[feature] = tags.loc[combination]
+            tags = pd.DataFrame(rows).T
+        return tags.loc[guides] if set(guides) <= set(tags.index) else None
+
+    def _similar_call(self) -> dict:
+        """The arguments of ``flowcode_similarity.run`` from the page's
+        current statistics settings, and 'split_by', what the halves are
+        halves of. Raises RuntimeError as ``AnalysisPage._stats_call``."""
+        page = self.page
+        call = page._stats_call()
+        pair_key = page.settings.get(page._design_key('pairing'))
+        if call['pairing']:
+            levels = dict(call['pairing'])
+            split_by = 'sample' if pair_key == fa.PAIR_BY_SAMPLE else str(pair_key)
+        else:
+            levels = {u: page.unit_sample(u) for u in call['counts'].index}
+            split_by = 'sample'
+        return dict(counts=call['counts'], denominator=call['denominator'], groups=call['groups'], levels=levels,
+                    kwargs=call['kwargs'], tags=self._guide_tags([str(c) for c in call['counts'].columns]),
+                    split_by=split_by)
+
+    def start_similar(self):
+        """Compare the guides with each other on a worker thread
+        (``flowcode_similarity.run``); the result is attached to the current
+        statistics and saved with them when it finishes."""
+        page = self.page
+        if not self._can_compare():
+            return
+        test = fsy.resolve_test(page.stats, self.settings['test'])
+        try:
+            call = self._similar_call()
+        except RuntimeError as exc:
+            self.similar_status.setText(str(exc))
+            return
+        inputs = page._stats_inputs()
+        split_by = call.pop('split_by')
+
+        def work(progress):
+            result = fsim.run(call['counts'], call['denominator'], call['groups'], call['levels'], call['kwargs'],
+                              test, tags=call['tags'], progress=progress)
+            result['split_by'] = split_by
+            return {'inputs': inputs, 'result': result}
+
+        if page.plugin._start_task(TASK_SIMILAR, work):
+            self.similar_btn.setEnabled(False)
+            self.similar_status.setText(SIMILAR_RUNNING)
+
+    def on_progress(self, key, n, total, _text):
+        """Progress of the comparison of guides: the split being run."""
+        if key == TASK_SIMILAR and n < total:
+            self.similar_status.setText(f'{SIMILAR_RUNNING} Split {n + 1} of {total}.')
+
+    def _on_similar_finished(self, done):
+        page = self.page
+        if page.stats is None or done['inputs'] != page._stats_inputs():
+            self._show_similar()
+            self.similar_status.setText('Similar guides: discarded, as the counts or settings changed while it ran.')
+            return
+        page.stats['similar_guides'] = done['result']
+        path = fst.stats_path(page._controller().experiment_dir)
+        try:
+            fst.save_stats(path, page.stats, done['inputs'])
+        except Exception:
+            logger.exception('FlowCode synopsis: could not save the similar guides to %s', path)
+        self._show_similar()
+
+    def _show_similar(self):
+        """The partners of the guide shown, from the comparison kept with
+        the statistics, and the state of its button."""
+        result = self._similar_result()
+        running = self.page.plugin.task_running(TASK_SIMILAR)
+        can = self._can_compare()
+        self.similar_btn.setEnabled(can and not running)
+        self.similar_btn.setText('Find similar guides again' if result else 'Find similar guides')
+        scope = self.synopsis['scope'] if self.synopsis is not None else None
+        if not result or scope is None or self.guide is None:
+            self.similar_table.setRowCount(0)
+            self.similar_table.setColumnCount(0)
+            if not running:
+                self.similar_status.setText(SIMILAR_HINT if can else SIMILAR_NEEDS)
+            return
+        mine = fsim.partners(result, scope['level'], self.guide)
+        frame = pd.DataFrame({
+            'similar guide': mine['partner'].astype(str),
+            'similarity': mine['similarity'].astype(float),
+            f"among the {int(result['top'])} most similar (halves)":
+                [f'{int(n)} of {int(total)}' for n, total in zip(mine['halves_in_top'], mine['halves'])],
+            'shared tags': mine['shared_tags'].astype(float)})
+        _fill(self.similar_table, frame, {'similarity': '{:+.2f}', 'shared tags': '{:.0f}'})
+        if not running:
+            self.similar_status.setText(fsim.summary_text(result, scope['level'], result.get('split_by') or 'sample'))
 
     def show_dossier(self, guide: str):
         """Show *guide*'s dossier in the Guide dossier view."""
@@ -540,8 +712,12 @@ class SynopsisSection(QWidget):
                                 lambda synopsis=synopsis, guide=guide: fsyp.dossier_figure(synopsis, guide, is_dark,
                                                                                            '')))
 
+        page = self.page
+        similar = self._similar_result() if not page._stats_stale else None
+        labels = {fsim.level_key(s['scope']['level']): s['scope']['label'] for s in synopses}
+
         def write_tables(folder) -> list:
-            return fsy.write_tables(folder, synopses)
+            return list(fsy.write_tables(folder, synopses)) + fsim.write_table(folder, similar, labels)
         return figures, write_tables
 
     def settings_text(self) -> str:
@@ -559,4 +735,10 @@ class SynopsisSection(QWidget):
                                                    if baseline and test else 'no statistics; phenotype only'))
         lines.append(f"  guide order: {fsy.ORDERS[s['order']].lower()}; calls as made by each test at its own "
                      'thresholds')
+        similar = self._similar_result() if not self.page._stats_stale else None
+        if similar:
+            lines.append(f"  similar guides: cell numbers ({fsy.TESTS.get(similar['test'], similar['test'])} test), "
+                         f"the {int(similar['top'])} most similar per guide, checked on {int(similar['n_splits'])} "
+                         f"random halvings of the data by {similar.get('split_by') or 'sample'}; similarity from "
+                         'shared tags removed where it could be estimated')
         return '\n'.join(lines)

@@ -8,8 +8,8 @@ intensities.
 
 Sections
     Gating      the experiment's unmixed gates over one sample's FlowCode-
-                unmixed events (uncorrected, standard or calibrated), view
-                only (flowcode_gating_view.py)
+                unmixed events (uncorrected, standard or calibrated), editable
+                on the tab's own copy of the gating (flowcode_gating_view.py)
     Data        source (live unmix of the raw files, or the files section 5
                 exported), linked samples, populations (each ticked unmixed
                 gate), combinations and inclusion rules, counting
@@ -81,6 +81,7 @@ from honeychrome.controller_components import differential_stats as ds
 from honeychrome.view_components import suggest_groupings_dialog as sgd
 from honeychrome.view_components.copyable_table_widget import CopyableTableWidget, SortableTableItem
 from honeychrome.view_components.help_toggle_widget import WheelBlocker
+from honeychrome.view_components.focus_mode import mark_focus_chrome
 
 import flowcode_analysis as fa
 import flowcode_count_cache as fcnt
@@ -101,6 +102,7 @@ TITLE = 'Analysis'
 ANALYSIS_SUBDIR = 'FlowCode Analysis'
 
 _ERROR_STYLE = 'color: #d62728;'
+_ERROR_COLOUR = '#d62728'
 _DONE_STYLE = 'color: #2ca02c;'
 _WARN_STYLE = 'color: #cc6600;'
 _HINT_STYLE = 'color: grey; font-style: italic;'
@@ -117,6 +119,12 @@ NORMALISATIONS = {'robust': 'Robust (trimmed; clones cannot shift it)', 'total':
                   'control': 'Control combinations'}
 FREQ_WEIGHTS = {'capped': 'Capped by variation between mice (default)', 'none': 'None (log2 %, all groups at once)'}
 SAMPLE_COLUMN_MAX_WIDTH = 280
+GROUP_QC_HEADERS = ('Group', 'Samples', 'Median in population', 'Median barcoded', 'Median % barcoded',
+                    'Median % unresolved', 'High unresolved')
+GROUP_QC_TOOLTIP = ('Medians over the ticked samples of each group in the population shown. % barcoded is the '
+                    'transduction rate (barcoded events in the population); % unresolved is the share of '
+                    'tag-positive events (barcoded + unresolved) that could not be assigned a combination. '
+                    'The group is the sample\'s group on the Groups tab, else its folder.')
 COVARIATE_COLUMN_MIN_WIDTH = 110
 HEATMAP_ORDERS = {'effect': 'By effect', 'alphabetical': 'Alphabetical'}
 # Figures over every comparison, kept when only the chosen comparison changes.
@@ -215,7 +223,10 @@ HELP = (
     '<tt>cache/flowcode_unmixed</tt> folder, so changing the population later does not unmix again. '
     '<i>Exported files</i> reads the files section 5 wrote: each sample is linked to its file by the '
     '<tt>FLOWCODESOURCE</tt> keyword, or by the export\'s file name, and files exported with a different '
-    'combination table, or with an earlier characterisation, are listed but not used unless ticked.</p>'
+    'combination table, or with an earlier characterisation, are listed but not used unless ticked. The source '
+    'is chosen above the tabs and applies to the Gating tab as well as the counts. When a section 5 export of '
+    'every selected sample completes and each file links to its sample, the page switches to <i>Exported '
+    'files</i> on its own (samples left out of the export do not stop it).</p>'
     '<p><b>Other experiments.</b> When a cohort is acquired over several days, each day with its own '
     'controls, process each day in its own experiment (sections 1 to 5) and export its samples. Then, in one '
     'of these experiments, choose <i>Exported files</i> and add the other days\' export folders under '
@@ -238,7 +249,12 @@ HELP = (
     'events, with each sample\'s own gate overrides, so the population is defined on the data being '
     'analysed. Gates whose edge lies on a tag channel or a FRET-affected marker can catch slightly '
     'different cells than in the main window; the events in the population are listed per sample so this '
-    'can be checked. Unstained samples, single-stain controls (also copies of them elsewhere in the raw '
+    'can be checked. The table gives each sample\'s group (from the Groups tab, else its folder) and '
+    '<i>% unresolved</i>, the unresolved events as a share of the tag-positive events (barcoded + '
+    'unresolved); a value more than 3 robust SDs (1.4826 × the median absolute deviation, at least 1 '
+    'percentage point) above its group\'s median is shown in red (groups of 3 or more samples). <i>Per '
+    'group</i> below gives each group\'s median events in the population, barcoded events, % barcoded (the '
+    'transduction rate) and % unresolved over the ticked samples. Unstained samples, single-stain controls (also copies of them elsewhere in the raw '
     'folder, matched by file name) and bead samples are left out unless their <i>Include</i> tick box is '
     'ticked. <b>Phenotypes</b> are populations without a gate: a marker definition (CD3+ CD4+ FoxP3+ CD8-, '
     'from Honeychrome\'s cell-type database) resolved '
@@ -252,10 +268,12 @@ HELP = (
     'ticked phenotype as its CD45.1+ CD45.2- and CD45.1- CD45.2+ variants when the panel carries both. '
     'Phenotypes need <i>Live unmix</i>, and their fractional counts take the Frequencies test only; the Gating '
     'tab can highlight a phenotype\'s events (membership at least one half) over the gates. '
-    '<b>Select all</b> and <b>Deselect all</b> tick or untick every sample in the table. '
+    'The FRET backbone controls chosen in section 1 are listed but not ticked: they are controls, not '
+    'samples of the screen. <b>Select all</b> and <b>Deselect all</b> tick or untick every sample in the '
+    'table (Select all leaves the backbone controls unticked; tick one by hand to count it). '
     '<b>Count events</b> gates every sample and counts its events per combination in each population, '
     'and sums each combination\'s marker intensities for the marker test; the counts are kept with the '
-    'experiment and the marker sums in its <tt>cache/flowcode_analysis</tt> folder. To make counting again fast, '
+    'experiment and the marker sums in its <tt>state/flowcode_analysis</tt> folder. To make counting again fast, '
     'the first count keeps, for each sample, only what counting uses: the events inside the gate above every '
     'counted population that is drawn on scatter, Time or the viability dye (usually the viable gate), with the '
     'channels gates are drawn on (and, for barcoded events, the marker channels), in '
@@ -401,13 +419,15 @@ HELP = (
     'already made here: an atlas of guides against groups (cell numbers as colour, phenotype calls as dots), a '
     'dossier per guide and a written synopsis. It tests nothing itself, has its own help, and is added to the '
     'export.</p>'
-    '<p><b>Gating</b> (first tab, view only): the experiment\'s Unmixed Data plots and gates over the '
+    '<p><b>Gating</b> (first tab): the experiment\'s Unmixed Data plots and gates over the '
     'FlowCode-unmixed events of the sample picked in the sample browser, gated exactly as the counts (sample '
     'overrides included), in three views: <i>Uncorrected</i> (the experiment\'s own unmix of the raw file), '
     '<i>FlowCode standard</i> and <i>FlowCode calibrated</i> (with the per-sample combination calibration). '
-    'Highlight the barcoded events or one combination (red); the table gives each gate\'s % of its parent '
+    'Highlight the barcoded events or one combination (pink); the table gives each gate\'s % of its parent '
     'and how many highlighted events change side against the uncorrected view, which is unmixed too for that '
-    'comparison (both are cached). Gates are edited in the main window.</p>'
+    'comparison (both are cached). The plots work as in Unmixed Data (channels, axes, gates, new plots), on '
+    'the tab\'s own copy of the gating: edits there change neither the experiment\'s gates nor the counts, '
+    'and <i>Reset to Unmixed Data</i> discards them.</p>'
     '<p><b>Results.</b> Each statistics run is saved when it finishes and shown again when the experiment is '
     'reopened, with the current thresholds. It is marked <i>Out of date</i> (and cannot be exported) when the counts '
     'or other settings have changed since; run statistics again to update it. <i>View</i> chooses the table or '
@@ -542,8 +562,10 @@ class AnalysisPage(QWidget):
         self.no_fret_label = _label('', _INVALID_STYLE)
         self.no_fret_label.setVisible(False)
         self.body.addWidget(self.no_fret_label)
+        self._build_source(self.body)
         self.body.addWidget(fcfp.scrolling_help(HELP))
         outer.addWidget(head)
+        mark_focus_chrome(head)
         self.section_tabs = QTabWidget()
         self.section_tabs.setDocumentMode(True)
         outer.addWidget(self.section_tabs, stretch=1)
@@ -605,6 +627,7 @@ class AnalysisPage(QWidget):
         self.loo_status.setText('')
         self._clear_figure_tabs()
         self._show_auto_note(None)
+        self.gating_view.reset_session()
         self.shift_view.reset_session()
         self.synopsis_view.reset_session()
 
@@ -1014,10 +1037,16 @@ class AnalysisPage(QWidget):
         return repr((self.feature_map(), sorted(self.plugin.state.sample_libraries.items()),
                      sorted(self._library_samples())))
 
+    def _is_backbone(self, key: str) -> bool:
+        """The sample is one of the FRET backbone controls chosen in section 1."""
+        return key in set(self.plugin.state.backbones())
+
     def _default_use(self, key: str, info: dict) -> bool:
-        """A linked sample is used by default when its file is ok and, with
-        several libraries, it is not assigned to Other."""
-        return info['status'] in fa.USABLE_BY_DEFAULT and self.library_of(key) != OTHER_LIBRARY
+        """A linked sample is used by default when its file is ok, it is not
+        a FRET backbone control and, with several libraries, it is not
+        assigned to Other."""
+        return (info['status'] in fa.USABLE_BY_DEFAULT and not self._is_backbone(key)
+                and self.library_of(key) != OTHER_LIBRARY)
 
     def _left_out_note(self) -> str:
         """The samples left out of the counts for having no library."""
@@ -1062,15 +1091,19 @@ class AnalysisPage(QWidget):
     # Data
     # =====================================================================
 
-    def _build_data(self, lay):
+    def _build_source(self, lay):
+        """The data source, above the tabs: it applies to the Gating tab and
+        to the counts."""
         row = QHBoxLayout()
-        row.addWidget(QLabel('Source:'))
+        row.addWidget(QLabel('<b>Source:</b>'))
         self.source_combo = QComboBox()
         self.source_combo.addItem('Live unmix (raw files, as section 5 would export them)', fa.SOURCE_LIVE)
         self.source_combo.addItem('Exported files (written by section 5)', fa.SOURCE_EXPORTED)
         self.source_combo.setToolTip('Live unmix FlowCode-unmixes each raw file with the current '
                                      'characterisation and the experiment\'s unmixing method, without writing '
-                                     'files. Exported files reads what section 5 wrote.')
+                                     'files. Exported files reads what section 5 wrote; the page switches to it '
+                                     'when an export of every selected sample completes. Applies to the Gating '
+                                     'tab and the counts.')
         _no_wheel(self.source_combo)
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
         row.addWidget(self.source_combo, stretch=1)
@@ -1079,6 +1112,7 @@ class AnalysisPage(QWidget):
         self.source_note.setWordWrap(True)
         lay.addWidget(self.source_note)
 
+    def _build_data(self, lay):
         box = QGroupBox('Exported files')
         self.export_box = box
         bl = QVBoxLayout(box)
@@ -1180,7 +1214,8 @@ class AnalysisPage(QWidget):
 
         include_row = QHBoxLayout()
         select_all_btn = QPushButton('Select all')
-        select_all_btn.setToolTip('Tick every readable sample in the table below for counting.')
+        select_all_btn.setToolTip('Tick every readable sample in the table below for counting, except the FRET '
+                                  'backbone controls (tick those by hand to count them).')
         select_all_btn.clicked.connect(lambda: self._set_all_use(True))
         deselect_all_btn = QPushButton('Deselect all')
         deselect_all_btn.setToolTip('Untick every sample in the table below.')
@@ -1205,10 +1240,10 @@ class AnalysisPage(QWidget):
         include_row.addWidget(self.qc_pop_combo)
         lay.addLayout(include_row)
 
-        self.sample_table = QTableWidget(0, 11)
+        self.sample_table = QTableWidget(0, 13)
         self.sample_table.setHorizontalHeaderLabels([
-            'Use', 'Sample', 'File status', 'Events', 'In population', 'Barcoded', '% barcoded',
-            'Untransduced', 'Unresolved', 'Gini', 'Top combination (%)'])
+            'Use', 'Sample', 'Group', 'File status', 'Events', 'In population', 'Barcoded', '% barcoded',
+            'Untransduced', 'Unresolved', '% unresolved', 'Gini', 'Top combination (%)'])
         self.sample_table.verticalHeader().setVisible(False)
         self.sample_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.sample_table.horizontalHeader().setStretchLastSection(False)
@@ -1217,6 +1252,19 @@ class AnalysisPage(QWidget):
         self.sample_table.setMinimumHeight(260)
         self.sample_table.itemChanged.connect(self._on_use_changed)
         lay.addWidget(self.sample_table)
+        self.unresolved_note = _label('', _WARN_STYLE)
+        self.unresolved_note.setWordWrap(True)
+        lay.addWidget(self.unresolved_note)
+        group_label = QLabel('<b>Per group</b> (ticked samples, population shown)')
+        group_label.setToolTip(GROUP_QC_TOOLTIP)
+        lay.addWidget(group_label)
+        self.group_qc_table = QTableWidget(0, len(GROUP_QC_HEADERS))
+        self.group_qc_table.setHorizontalHeaderLabels(list(GROUP_QC_HEADERS))
+        self.group_qc_table.setToolTip(GROUP_QC_TOOLTIP)
+        self.group_qc_table.verticalHeader().setVisible(False)
+        self.group_qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.group_qc_table.setMinimumHeight(120)
+        lay.addWidget(self.group_qc_table)
 
     def _make_gate_tree(self):
         tree = QTreeWidget()
@@ -1243,6 +1291,42 @@ class AnalysisPage(QWidget):
         self.settings['source'] = value
         self._changed()
         self.rescan()
+        if self.gating_view.is_shown():
+            self.gating_view.start()
+
+    def adopt_exported_files(self, selected: list, exported: list) -> str:
+        """
+        After a section 5 export: switch the source to Exported files when
+        every sample selected for the export was written (*exported*) and
+        links to its new file. Samples the user left out of the export do not
+        matter. With Live unmix chosen, the export folder becomes the one just
+        written. Returns a note for the export page ('' when nothing changed).
+        """
+        if not selected:
+            return ''
+        missing = [k for k in selected if k not in set(exported)]
+        if missing:
+            return (f'The Analysis page keeps its source: {len(missing)} selected sample(s) were not exported '
+                    '(no AF library of 2 or more spectra, or no events).')
+        previous = {k: self.settings.get(k) for k in ('source', 'folder')}
+        if self.is_live():
+            self.settings['source'] = fa.SOURCE_EXPORTED
+            self.settings['folder'] = None
+        self.rescan()
+        files = (self.links or {}).get('files') or {}
+        expected = [k for k in exported if k in files]
+        unlinked = [k for k in expected if files[k]['status'] != fa.LINK_OK]
+        if unlinked:
+            self.settings.update(previous)
+            self.rescan()
+            return (f'The Analysis page keeps its source: {len(unlinked)} exported file(s) could not be linked '
+                    f'({", ".join(self._name(k) for k in unlinked[:3])}{"…" if len(unlinked) > 3 else ""}).')
+        self._changed()
+        if previous['source'] == fa.SOURCE_EXPORTED:
+            return ''
+        if self.gating_view.is_shown():
+            self.gating_view.start()
+        return 'The Analysis page now reads the exported files.'
 
     def _on_choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Folder of exported FlowCode files',
@@ -1340,13 +1424,14 @@ class AnalysisPage(QWidget):
         self.refresh_status()
 
     def _set_all_use(self, ticked: bool):
-        """Tick or untick every readable sample in the sample table for counting."""
+        """Tick or untick every readable sample in the sample table for
+        counting; Select all leaves the FRET backbone controls unticked."""
         if self.links is None:
             return
         use = self.settings.setdefault('use', {})
         for key, info in self.links['files'].items():
             if info['path'] is not None and info['status'] != fa.LINK_UNREADABLE:
-                use[key] = ticked
+                use[key] = ticked and not self._is_backbone(key)
         self._changed()
         self._check_counts_current()
         self._fill_data()
@@ -1782,12 +1867,25 @@ class AnalysisPage(QWidget):
             self.qc_pop_combo.setVisible(several)
             multi = self.multi_library()
             lib_labels = self.library_labels()
-            headers = (['Use', 'Sample'] + (['Library'] if multi else [])
+            headers = (['Use', 'Sample', 'Group'] + (['Library'] if multi else [])
                        + ['File status', 'Events', 'In population', 'Barcoded', '% barcoded', 'Untransduced',
-                          'Unresolved'] + (['Out of library'] if multi else []) + ['Gini', 'Top combination (%)'])
+                          'Unresolved', '% unresolved'] + (['Out of library'] if multi else [])
+                       + ['Gini', 'Top combination (%)'])
             self.sample_table.setColumnCount(len(headers))
             self.sample_table.setHorizontalHeaderLabels(headers)
             self.sample_table.setRowCount(len(files))
+            unresolved_col = headers.index('% unresolved')
+            qc_rows, pcts, groups, ticked_keys = {}, {}, {}, []
+            for key, info in files.items():
+                groups[key] = self._qc_group(key, info)
+                unit = fa.unit_id(key, shown_pop, several)
+                qc = self.qc.loc[unit] if self.qc is not None and unit in self.qc.index else None
+                qc_rows[key] = qc
+                usable = info['path'] is not None and info['status'] != fa.LINK_UNREADABLE
+                if qc is not None and usable and use.get(key, self._default_use(key, info)):
+                    ticked_keys.append(key)
+                    pcts[key] = fa.pct_unresolved(qc['barcoded'], qc['unresolved'])
+            flagged = fa.high_unresolved(pcts, groups)
             for r, (key, info) in enumerate(files.items()):
                 chk = _item('', data=key)
                 chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
@@ -1799,30 +1897,78 @@ class AnalysisPage(QWidget):
                 self.sample_table.setItem(r, 0, chk)
                 name = _item(self._name(key))
                 name.setToolTip(info['path'] or key)
+                if self._is_backbone(key):
+                    name.setToolTip(f"{info['path'] or key}\nFRET backbone control (section 1): not counted "
+                                    'unless ticked.')
                 self.sample_table.setItem(r, 1, name)
                 lib = self.library_of(key)
                 status = _item(info['status'] + (f" — {info['note']}" if info['note'] else ''))
-                unit = fa.unit_id(key, shown_pop, several)
-                qc = self.qc.loc[unit] if self.qc is not None and unit in self.qc.index else None
-                cells = [''] * (9 if multi else 8)
+                qc = qc_rows[key]
+                cells = [''] * (10 if multi else 9)
                 if qc is not None:
                     top = (f"{qc['top_combination']} ({_number(qc['top_share_pct'])})"
                            if qc['top_combination'] else '')
                     cells = ([_number(qc['events'], 0), _number(qc['in_population'], 0),
                               _number(qc['barcoded'], 0), _number(qc['pct_barcoded']),
-                              _number(qc['untransduced'], 0), _number(qc['unresolved'], 0)]
+                              _number(qc['untransduced'], 0), _number(qc['unresolved'], 0),
+                              _number(fa.pct_unresolved(qc['barcoded'], qc['unresolved']))]
                              + ([_number(qc['out_of_library'], 0)] if multi else [])
                              + [_number(qc['gini'], 2), top])
-                row = ([_item(lib_labels.get(lib, lib) if lib else '—')] if multi else []) + [status]
+                row = ([_item(groups[key])] + ([_item(lib_labels.get(lib, lib) if lib else '—')] if multi else [])
+                       + [status])
                 row += [_item(text) for text in cells]
                 for j, item in enumerate(row, start=2):
                     self.sample_table.setItem(r, j, item)
+                if key in flagged:
+                    item = self.sample_table.item(r, unresolved_col)
+                    item.setForeground(QColor(_ERROR_COLOUR))
+                    item.setToolTip(f'High: above {flagged[key]:.1f}%, the group median plus '
+                                    f'{fa.UNRESOLVED_FLAG_SDS:g} robust SDs of the group\'s samples. Check the '
+                                    'sample\'s tag staining, FRET correction and thresholds.')
+            self._fill_group_qc(ticked_keys, qc_rows, groups, pcts, flagged)
+            if flagged:
+                names = [self._name(k) for k in flagged]
+                self.unresolved_note.setText(
+                    f'{len(names)} ticked sample(s) have a high unresolved share for their group (red in '
+                    f'% unresolved): ' + ', '.join(names[:8]) + (' and more' if len(names) > 8 else '') + '.')
+            else:
+                self.unresolved_note.setText('')
             # Sized once after filling; the sample name is capped (and elided
             # in the middle) so the QC columns stay in view.
             self.sample_table.resizeColumnsToContents()
             self.sample_table.setColumnWidth(1, min(self.sample_table.columnWidth(1), SAMPLE_COLUMN_MAX_WIDTH))
         finally:
             self._filling = False
+
+    def _qc_group(self, key: str, info: dict) -> str:
+        """The sample's group on the Groups tab, else its folder: the raw
+        file's folder, or a linked file's export folder."""
+        group = (self.settings.get('sample_groups') or {}).get(key)
+        if group:
+            return str(group)
+        if fa.is_linked(key):
+            return Path(str(info.get('folder') or info.get('path') or key)).name
+        return Path(str(key)).parent.name
+
+    def _fill_group_qc(self, keys: list, qc_rows: dict, groups: dict, pcts: dict, flagged: dict):
+        """The per-group summary of the ticked samples (``fa.group_qc_summary``)."""
+        rows = [{'group': groups[k], 'in_population': qc_rows[k]['in_population'],
+                 'barcoded': qc_rows[k]['barcoded'], 'pct_barcoded': qc_rows[k]['pct_barcoded'],
+                 'pct_unresolved': pcts.get(k), 'flagged': k in flagged} for k in keys]
+        summary = fa.group_qc_summary(rows)
+        table = self.group_qc_table
+        table.setSortingEnabled(False)
+        table.setRowCount(len(summary))
+        for r, row in enumerate(summary.itertuples(index=False)):
+            values = [row.group, _number(row.samples, 0), _number(row.median_in_population, 0),
+                      _number(row.median_barcoded, 0), _number(row.median_pct_barcoded),
+                      _number(row.median_pct_unresolved), _number(row.high_unresolved, 0)]
+            for j, text in enumerate(values):
+                item = _item(text)
+                if j == len(values) - 1 and row.high_unresolved:
+                    item.setForeground(QColor(_ERROR_COLOUR))
+                table.setItem(r, j, item)
+        table.resizeColumnsToContents()
 
     def _fill_gate_tree(self):
         gating = self._controller().unmixed_gating
@@ -4187,6 +4333,7 @@ class AnalysisPage(QWidget):
         marker_ref = fst.MARKER_REFERENCES.get((stats.get('markers') or {}).get('reference'), '')
         marker_feature = self._shown_marker_feature()
         marker_pairing = self._unit_factor(s.get('pairing'), pairing=True) if marker_feature else None
+        marker_names = self.marker_names()
         pathways = stats.get('pathways')
         pathway_label = fst.comparison_label(*pair) if pair is not None else None
         pathway_set = self._shown_pathway(pathway_label)
@@ -4217,7 +4364,7 @@ class AnalysisPage(QWidget):
                                               s['marker_threshold'], s['fdr_scope'], is_dark, population,
                                               marker_ref, s['heatmap_order'], feature=marker_feature,
                                               pairing=marker_pairing, sample_labels=labels, group_colours=colours,
-                                              group_order=order))
+                                              group_order=order, marker_names=marker_names))
             if 'comparison' in wanted and pair is not None:
                 out.update(fst.comparison_figures(stats, pair, s['pval_threshold'], s['fc_threshold'],
                                                   s['fdr_scope'], is_dark, population, labels,
@@ -4283,12 +4430,22 @@ class AnalysisPage(QWidget):
         self.figure_tabs.insertTab(position, widget, title)
         return position
 
+    def marker_names(self) -> dict:
+        """{channel: antigen} for the marker figures and tables. A channel
+        without an antigen keeps its fluorophore name; when two channels
+        carry the same antigen, the fluorophore is added to tell them apart."""
+        names = self.shift_view._short_labels()
+        shown = list(names.values())
+        return {f: (n if shown.count(n) == 1 else f'{n} ({f})') for f, n in names.items()}
+
     def _marker_table(self):
         """The chosen marker group's results, most significant first."""
         markers = self.stats['markers']
         res = markers['results']
+        names = self.marker_names()
         view = res[res['comparison'] == self.cb_marker_comparison.currentText()]
-        cols = [c for c in ('combination', 'channel', 'logFC', 'CI.L', 'CI.R', 'n_samples', 'spillover', 'k',
+        view = view.assign(antigen=[names.get(c) or c for c in view['channel']])
+        cols = [c for c in ('combination', 'channel', 'antigen', 'logFC', 'CI.L', 'CI.R', 'n_samples', 'spillover', 'k',
                             'se_moderated', 'se_total', 'P.Value', 'cluster.adj.P.Val', 'stagewise.adj.P.Val',
                             'significant')
                 if c in view.columns]
@@ -4640,11 +4797,12 @@ class AnalysisPage(QWidget):
         colours, order = self.group_colours(), list(s.get('group_names') or [])
         population, labels, is_dark = self.counted_population(), self.unit_labels(), self.plugin.is_dark()
         fdr_scope = s['fdr_scope']
+        names = self.marker_names()
 
         def make():
             return fst.marker_value_figure(markers, feature, comparison, fdr_scope, is_dark, population, reference,
                                            pairing=pairing, sample_labels=labels, group_colours=colours,
-                                           group_order=order)
+                                           group_order=order, marker_names=names)
         return make
 
     def show_marker_values(self, feature: str):
@@ -4657,7 +4815,7 @@ class AnalysisPage(QWidget):
         if self._shown_marker_feature() is None:
             return
         make = self._marker_maker(feature)
-        title = f'Marker: {feature}'
+        title = f'Marker: {fst.marker_feature_name(feature, self.marker_names())}'
         try:
             item = {'fig': make(), 'title': title, 'error': None, 'make': make}
         except Exception as exc:
@@ -4680,7 +4838,8 @@ class AnalysisPage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, 'Marker', f'The figure could not be drawn: {exc}')
             return
-        fcfp.open_figure_window(self, fig, self._figure_name('marker_combination', f'Marker: {feature}'),
+        title = f'Marker: {fst.marker_feature_name(feature, self.marker_names())}'
+        fcfp.open_figure_window(self, fig, self._figure_name('marker_combination', title),
                                 folder=self.analysis_root())
 
     def _on_results_double_clicked(self, row: int, _col: int):
@@ -4993,6 +5152,7 @@ class AnalysisPage(QWidget):
             # written; only the set being written is held.
             drawn = {}
             marker_ref = fst.MARKER_REFERENCES.get((stats.get('markers') or {}).get('reference'), '')
+            marker_names = self.marker_names()
 
             def figure_of(which, key):
                 if which not in drawn:
@@ -5004,7 +5164,8 @@ class AnalysisPage(QWidget):
                     elif len(which) == 2:
                         drawn[which] = fst.marker_figures(stats['markers'], which[1], s['pval_threshold'],
                                                           s['marker_threshold'], s['fdr_scope'], is_dark,
-                                                          population, marker_ref, s['heatmap_order'])
+                                                          population, marker_ref, s['heatmap_order'],
+                                                          marker_names=marker_names)
                     else:
                         drawn[which] = fst.comparison_figures(stats, which, s['pval_threshold'],
                                                               s['fc_threshold'], s['fdr_scope'], is_dark,
@@ -5074,13 +5235,15 @@ class AnalysisPage(QWidget):
                 store, fcfp.OPTIONS_SCOPE, self._report_figure_key(name))))
                 for name, make in figures]
         shift_tables = self.shift_view.write_tables
+        marker_names = self.marker_names()
 
         def work(progress):
             written = fst.write_analysis_folder(folder, population=population, raw_counts=counts, meta=meta,
                                                 qc=qc, filtered=filtered, stats=stats, sample_table=sample_table,
                                                 settings_text=settings_text, figures=figures, sample_labels=labels,
                                                 progress=progress, no_fret=no_fret,
-                                                fdr_threshold=float(s['pval_threshold']), run_record=run_record)
+                                                fdr_threshold=float(s['pval_threshold']), run_record=run_record,
+                                                marker_names=marker_names)
             written = list(written) + list(shift_tables(folder)) + list(synopsis_tables(folder))
             progress(len(figures), len(figures), '')
             return written
@@ -5134,6 +5297,8 @@ class AnalysisPage(QWidget):
     def on_task_progress(self, key, n, total, text):
         if key in fshv.TASKS:
             self.shift_view.on_progress(key, n, total, text)
+        elif key in fsyv.TASKS:
+            self.synopsis_view.on_progress(key, n, total, text)
         elif key == fcgv.TASK:
             self.gating_view.on_progress(n, total, text)
         elif key == 'analysis_count' and text:

@@ -86,6 +86,7 @@ import numpy as np
 import pandas as pd
 
 from honeychrome.controller_components import differential_stats as ds
+from honeychrome.controller_components import experiment_paths
 
 MIN_SAMPLES_PER_GROUP = 3
 
@@ -1406,6 +1407,13 @@ def marker_feature(combination: str, channel: str) -> str:
     return f'{combination}: {channel}'
 
 
+def marker_feature_name(feature: str, marker_names: dict | None) -> str:
+    """*feature* (``marker_feature``) with its channel shown by its
+    *marker_names* entry ({channel: antigen}), the channel where it has none."""
+    combination, _sep, channel = feature.rpartition(': ')
+    return marker_feature(combination, (marker_names or {}).get(channel) or channel)
+
+
 def marker_deltas(sums: np.ndarray, counts: pd.DataFrame, channels: list, reference: str = 'controls',
                   control_combos: list | None = None, min_events: int = MARKER_DEFAULTS['min_events'],
                   removed: pd.DataFrame | None = None, return_means: bool = False,
@@ -1884,13 +1892,15 @@ def reapply_marker_thresholds(markers: dict, pval_threshold: float, threshold: f
 def marker_figures(markers: dict, comparison: str, pval_threshold: float, threshold: float, fdr_scope: str,
                    is_dark: bool, population: str, reference_name: str, heatmap_order: str = 'effect',
                    feature: str | None = None, pairing: dict | None = None, sample_labels: dict | None = None,
-                   group_colours: dict | None = None, group_order: list | None = None) -> dict:
+                   group_colours: dict | None = None, group_order: list | None = None,
+                   marker_names: dict | None = None) -> dict:
     """
     Figures of one marker comparison (a group): the combination × marker
     heatmap of significant differences, the volcano of every
     combination-marker pair and, with *feature*, that combination-marker
     pair's per-sample plot (``marker_value_figure``) ({key: {'fig',
-    'title', 'error', 'results', 'make'}}).
+    'title', 'error', 'results', 'make'}}). Markers are shown by their
+    *marker_names* entry ({channel: antigen}), the channel where it has none.
     """
     from honeychrome.view_components import differential_plots as dp
 
@@ -1906,10 +1916,12 @@ def marker_figures(markers: dict, comparison: str, pval_threshold: float, thresh
             out[key] = {'fig': None, 'title': tab_title, 'error': str(exc) or type(exc).__name__,
                         'results': None}
 
-    grid = view.assign(feature=view['combination'], comparison=view['channel'])
+    names = marker_names or {}
+    shown = view['channel'].map(lambda c: names.get(c) or c)
+    grid = view.assign(feature=view['combination'], comparison=shown)
     dominant = view['spillover_dominant'].fillna(False).astype(bool) if 'spillover_dominant' in view.columns \
         else pd.Series(False, index=view.index)
-    hatched = list(zip(view.loc[dominant, 'combination'], view.loc[dominant, 'channel']))
+    hatched = list(zip(view.loc[dominant, 'combination'], shown[dominant]))
 
     def heatmap():
         fig = dp.make_comparison_heatmap_figure(
@@ -1923,12 +1935,12 @@ def marker_figures(markers: dict, comparison: str, pval_threshold: float, thresh
     add('marker_volcano', 'Marker volcano', dp.make_volcano_figure, results=view, results_df=view,
         title=f'Markers: {comparison}', pval_threshold=pval_threshold, fc_threshold=threshold, is_dark=is_dark,
         fdr_scope=fdr_scope, x_label=MARKER_X_LABEL, run_label=run_label, group_a='reference',
-        group_b='combination')
+        group_b='combination', feature_labels=[marker_feature(c, n) for c, n in zip(view['combination'], shown)])
     if feature:
-        add('marker_combination', f'Marker: {feature}', marker_value_figure, markers=markers, feature=feature,
-            comparison=comparison, fdr_scope=fdr_scope, is_dark=is_dark, population=population,
-            reference_name=reference_name, pairing=pairing, sample_labels=sample_labels,
-            group_colours=group_colours, group_order=group_order)
+        add('marker_combination', f'Marker: {marker_feature_name(feature, names)}', marker_value_figure,
+            markers=markers, feature=feature, comparison=comparison, fdr_scope=fdr_scope, is_dark=is_dark,
+            population=population, reference_name=reference_name, pairing=pairing, sample_labels=sample_labels,
+            group_colours=group_colours, group_order=group_order, marker_names=names)
     return out
 
 
@@ -1986,7 +1998,7 @@ def marker_values(markers: dict, feature: str, comparison: str, pairing: dict | 
 def marker_value_figure(markers: dict, feature: str, comparison: str, fdr_scope: str, is_dark: bool,
                         population: str = '', reference_name: str = '', pairing: dict | None = None,
                         sample_labels: dict | None = None, group_colours: dict | None = None,
-                        group_order: list | None = None):
+                        group_order: list | None = None, marker_names: dict | None = None):
     """
     One combination-marker pair in every sample: a column per group (of the
     comparison's population and split level). In each column the reference
@@ -1996,6 +2008,7 @@ def marker_value_figure(markers: dict, feature: str, comparison: str, fdr_scope:
     sample's combination means in different groups are joined by faint lines
     within its pairing level (mouse). The title gives the difference, its CI
     and the stage-wise adjusted p-value in *comparison*, whose group is bold.
+    The marker is shown by its *marker_names* entry ({channel: antigen}).
     """
     from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
@@ -2039,7 +2052,8 @@ def marker_value_figure(markers: dict, feature: str, comparison: str, fdr_scope:
             tick.set_fontweight('bold')
     ax.tick_params(axis='y', labelsize=8)
     ax.set_ylabel('Mean transformed intensity', fontsize=9)
-    lines = [f'{population}: {feature}' if population else feature]
+    shown = marker_feature_name(feature, marker_names)
+    lines = [f'{population}: {shown}' if population else shown]
     res = markers['results']
     row = res[(res['comparison'] == comparison) & (res['feature'] == feature)]
     if not row.empty:
@@ -2088,8 +2102,8 @@ _SERIES_TAG = '__series__'
 
 def stats_path(experiment_dir) -> Path:
     """Folder of the last statistics run (a Honeycluster bundle: data.json
-    plus one CSV per table), in the experiment's cache."""
-    return Path(experiment_dir) / 'cache' / 'flowcode_analysis' / 'stats'
+    plus one CSV per table), in the experiment's state folder."""
+    return experiment_paths.state_dir(experiment_dir, 'flowcode_analysis', 'stats')
 
 
 def _storable(obj):
@@ -2200,7 +2214,7 @@ def write_analysis_folder(folder, *, population: str, raw_counts: pd.DataFrame, 
                           qc: pd.DataFrame, filtered, stats: dict | None, sample_table: pd.DataFrame,
                           settings_text: str, figures: list, sample_labels: dict | None = None,
                           progress=None, no_fret: bool = False, fdr_threshold: float = 0.05,
-                          run_record: dict | None = None) -> list:
+                          run_record: dict | None = None, marker_names: dict | None = None) -> list:
     """
     Write one analysis into *folder*:
 
@@ -2215,7 +2229,8 @@ def write_analysis_folder(folder, *, population: str, raw_counts: pd.DataFrame, 
     * ``library_sizes.csv`` — barcoded events and library size per sample;
     * ``clones.csv`` — expanded clones found, and whether each was removed
       (when the clone filter was on);
-    * ``markers.csv`` — the marker test of every group (when run);
+    * ``markers.csv`` — the marker test of every group (when run), each
+      channel's antigen (*marker_names*) beside it;
     * ``pathways.csv`` (one row per pathway and comparison),
       ``pathway_libraries.csv``, ``pathway_members.csv``,
       ``pathway_controls.csv`` (the NON-Targetting check) and
@@ -2280,8 +2295,12 @@ def write_analysis_folder(folder, *, population: str, raw_counts: pd.DataFrame, 
         clones = stats['clones'].copy()
         clones['sample'] = [labels.get(s, s) for s in clones['sample']]
         csv(clones, 'clones.csv', index=False)
+    marker_rows = None
     if stats and stats.get('markers') is not None:
-        csv(stats['markers']['results'], 'markers.csv', index=False)
+        marker_rows = stats['markers']['results'].copy()
+        marker_rows.insert(int(marker_rows.columns.get_loc('channel')) + 1, 'antigen',
+                           [(marker_names or {}).get(c) or c for c in marker_rows['channel']])
+        csv(marker_rows, 'markers.csv', index=False)
     pathways = (stats or {}).get('pathways')
     pathway_rows = None
     if pathways:
@@ -2346,10 +2365,9 @@ def write_analysis_folder(folder, *, population: str, raw_counts: pd.DataFrame, 
             cols = [c for c in ('test', 'comparison', 'feature', 'logFC', 'CI.L', 'CI.R', 'P.Value',
                                 'adj.P.Val', 'adj.P.Val.global') if c in sig.columns]
             drc_report.add_dataframe_pages(pdf, sig[cols], 'Significant combinations')
-        if stats and stats.get('markers') is not None:
-            res = stats['markers']['results']
-            sig = res[res['significant'].astype(bool)]
-            cols = [c for c in ('comparison', 'combination', 'channel', 'logFC', 'CI.L', 'CI.R', 'n_samples',
+        if marker_rows is not None:
+            sig = marker_rows[marker_rows['significant'].astype(bool)]
+            cols = [c for c in ('comparison', 'combination', 'antigen', 'channel', 'logFC', 'CI.L', 'CI.R', 'n_samples',
                                 'stagewise.adj.P.Val') if c in sig.columns]
             drc_report.add_dataframe_pages(pdf, sig[cols].rename(columns={'logFC': 'delta'}),
                                            'Significant marker differences')

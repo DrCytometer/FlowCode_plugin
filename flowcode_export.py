@@ -31,6 +31,7 @@ import gc
 import logging
 import math
 import os
+import sys
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ from pathlib import Path
 import numpy as np
 
 import honeychrome.settings as hc_settings
+from honeychrome.controller_components import experiment_paths
 from honeychrome.controller_components.functions import (
     FcsEventReader, apply_transfer_matrix, export_unmixed_sample_stream, iter_event_blocks,
 )
@@ -51,7 +53,7 @@ UNMIX_CHUNK_SIZE = 2_000_000
 PROBE_EVENTS = 5000
 JOB_LABEL = 'FlowCode export'
 
-LIVE_CACHE_SUBDIR = Path('cache') / 'flowcode_unmixed'
+LIVE_CACHE_SUBDIR = Path(experiment_paths.CACHE_FOLDER) / 'flowcode_unmixed'
 LIVE_CACHE_VERSION = 3
 
 
@@ -181,6 +183,66 @@ def export_relative_path(sample_path: str, layout: ExportLayout) -> Path:
     return Path(*sample_abs.parts[len(layout.raw_subdir_abs.parts):])
 
 
+def export_folder_for(sample_key: str, layout: ExportLayout, output_root=None) -> Path:
+    """Folder an exported sample is written to: its raw file's folder below
+    the raw samples subdirectory, under *output_root* (default: the
+    experiment's unmixed samples subdirectory)."""
+    rel = export_relative_path(sample_key, layout)
+    root = Path(output_root) if output_root is not None else layout.experiment_dir / layout.unmixed_subdirectory
+    return (root / rel).parent
+
+
+# Longest full path Windows accepts unless long paths are switched on:
+# MAX_PATH is 260 characters including the terminating null.
+WINDOWS_MAX_PATH = 259
+
+
+def windows_long_paths_enabled() -> bool:
+    """True when Windows' LongPathsEnabled setting is on (False when it
+    cannot be read)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SYSTEM\CurrentControlSet\Control\FileSystem') as key:
+            return bool(winreg.QueryValueEx(key, 'LongPathsEnabled')[0])
+    except (ImportError, OSError):
+        return False
+
+
+def too_long_paths(sample_keys, layout: ExportLayout, output_root, name_suffix: str,
+                   limit: int = WINDOWS_MAX_PATH) -> list:
+    """[(sample key, full path)] of the files an export would write whose
+    path is longer than *limit* characters, taken while the file is being
+    written (with its '.part' ending, the longest it gets)."""
+    out = []
+    for key in sample_keys:
+        name = layout.all_samples.get(key, Path(key).stem)
+        # The file name export_unmixed_sample_stream writes, while it is written.
+        path = export_folder_for(key, layout, output_root) / f'{name}{name_suffix} (Unmixed).fcs.part'
+        text = str(path.absolute())
+        if len(text) > limit:
+            out.append((key, text))
+    return out
+
+
+def long_path_problem(sample_keys, layout: ExportLayout, output_root, name_suffix: str,
+                      platform: str | None = None) -> str | None:
+    """On Windows without long paths, a message naming the files whose
+    paths would be too long to write (None when there are none, or on
+    another system). Such a write fails with "No such file or directory"."""
+    if (platform or sys.platform) != 'win32' or windows_long_paths_enabled():
+        return None
+    long = too_long_paths(sample_keys, layout, output_root, name_suffix, WINDOWS_MAX_PATH)
+    if not long:
+        return None
+    names = [layout.all_samples.get(key, Path(key).stem) for key, _path in long]
+    longest = max(len(path) for _key, path in long)
+    shown = ', '.join(names[:3]) + (f' and {len(names) - 3} more' if len(names) > 3 else '')
+    return (f'{len(long)} exported file(s) would have paths longer than Windows allows ({WINDOWS_MAX_PATH + 1} '
+            f'characters; the longest would be {longest}): {shown}. Choose a shorter output folder below '
+            '(for example C:\\FlowCode), use shorter folder or sample names, or ask an administrator to enable '
+            'long paths in Windows (the LongPathsEnabled setting), then export again.')
+
+
 # ---------------------------------------------------------------------------
 # One sample (worker-safe)
 # ---------------------------------------------------------------------------
@@ -278,15 +340,14 @@ class FlowCodeExporter(QObject):
         self.sample_keywords = sample_keywords
 
     def _output_folder(self, sample_key: str) -> Path:
-        rel = export_relative_path(sample_key, self.layout)
-        root = self.output_root or (self.layout.experiment_dir / self.layout.unmixed_subdirectory)
-        return (root / rel).parent
+        return export_folder_for(sample_key, self.layout, self.output_root)
 
     def _status(self, text: str):
         if self.bus is not None:
             self.bus.statusMessage.emit(f'FlowCode export: {text}')
 
     def run(self):
+        key = None
         try:
             from honeychrome import __version__
 
@@ -342,6 +403,7 @@ class FlowCodeExporter(QObject):
                 n_exported += 1
                 if self.sample_done is not None:
                     self.sample_done(key, n_events)
+            key = None
             self.progress.emit(total, total)
             if self.bus is not None:
                 destination = (str(self.output_root) if self.output_root is not None
@@ -352,8 +414,10 @@ class FlowCodeExporter(QObject):
                 self.bus.popupMessage.emit(message)
             self.finished.emit()
         except Exception as exc:
-            logger.exception('FlowCode export failed')
-            self.error.emit(str(exc) or type(exc).__name__)
+            where = '' if key is None else f' at sample "{key}"'
+            logger.exception(f'FlowCode export failed{where}')
+            reason = f'{type(exc).__name__}: {exc}' if str(exc) else type(exc).__name__
+            self.error.emit(f'{reason}{where}' if key is not None else reason)
 
 
 def estimate_time(sample_keys, layout: ExportLayout, af_by_sample: dict, probe_fn,
@@ -631,8 +695,7 @@ def live_sample_events(layout: ExportLayout, af, unmix_fn, sample_key: str, pnn:
             tmp = cache_path.with_suffix('.tmp.npz')
             np.savez(tmp, values=out[:, fl_cols])
             os.replace(tmp, cache_path)
-            from honeychrome.controller_components.unmix_method import prune_display_cache
-            prune_display_cache(cache_path.parent, max_cache_bytes)
+            experiment_paths.prune_cache(layout.experiment_dir, max_cache_bytes, folder='flowcode_unmixed')
         except OSError as exc:
             logger.warning(f'FlowCode live unmix: could not write the cache ({exc})')
     return out

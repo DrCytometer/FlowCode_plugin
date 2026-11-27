@@ -169,7 +169,9 @@ def _check_pop_out(panel, qtbot):
 
 def _settle(plugin, qtbot):
     """Wait for every background task and its thread to finish."""
-    qtbot.waitUntil(lambda: not plugin._tasks and all(t.isFinished() for t in plugin._threads), timeout=LONG)
+    import flowcode_unmix_tab as module
+
+    qtbot.waitUntil(lambda: not plugin._tasks and not module._RUNNING_TASKS, timeout=LONG)
 
 
 def _backbone_items(plugin) -> dict:
@@ -542,7 +544,8 @@ def test_section_three_gates_thresholds_and_restore(fp, qtbot, experiment):
     assert all(state.y_channels[t] == state.tag_map()[partners[t]] for t in syn.TAGS)
     panel = plugin.pages[3].thresholds
     assert panel.table.rowCount() == 5 and panel.isEnabled()
-    assert (panel.biplot.width(), panel.biplot.height()) == (fp.THRESHOLD_PLOT_SIZE, fp.THRESHOLD_PLOT_SIZE)
+    assert panel.biplot.width() == fp.THRESHOLD_PLOT_SIZE
+    qtbot.waitUntil(lambda: abs(panel.biplot.vb.width() - panel.biplot.vb.height()) <= 2, timeout=5000)
     saved_done = deepcopy(controller.experiment.process[fcs.PROCESS_KEY])
 
     # R thresholds file: matched by tag, then by fluorophore; imported values survive a re-confirm
@@ -655,8 +658,11 @@ def test_spectral_model_change_marks_section_three(fp, qtbot, experiment):
 # ---------------------------------------------------------------------------
 
 def _characterise(plugin, qtbot):
+    """Section 4; the samples are then debarcoded with the backbone
+    thresholds (the sample thresholds have their own test)."""
     from PySide6.QtCore import Qt
 
+    plugin.set_sample_threshold_mode(fcs.SAMPLE_THRESHOLDS_BACKBONE)
     plugin.tabs.setCurrentIndex(3)
     qtbot.mouseClick(plugin.pages[4].run_btn, Qt.LeftButton)
     qtbot.waitUntil(lambda: plugin.section_status(4) == ('done', 'Done') and plugin.characterisation is not None
@@ -725,8 +731,15 @@ def test_section_four_characterises_saves_and_restores(fp, qtbot, experiment):
     assert output.expression['n']['before'] == barcoded
     assert page.table.rowCount() == len(fc.design.combo_names)
     assert len(page.biplot_before._event_data) == len(output.display_idx)
+    shown_tab = page.section_tabs.currentIndex()
+    page.section_tabs.setCurrentIndex(page.SECTION_ASSESS)
     for plot in (page.biplot_before, page.biplot_after):
-        assert (plot.width(), plot.height()) == (fp.ASSESS_PLOT_SIZE, fp.ASSESS_PLOT_SIZE)
+        assert plot.width() == fp.ASSESS_PLOT_SIZE
+        def square(plot=plot):
+            sizes = (plot.width(), plot.height(), plot.vb.width(), plot.vb.height())
+            assert abs(sizes[2] - sizes[3]) <= 2, f'widget w, h and plot area w, h: {sizes}'
+        qtbot.waitUntil(square, timeout=5000)
+    page.section_tabs.setCurrentIndex(shown_tab)
     ids = np.asarray(output.result.ids)[output.display_idx]
     n_barcoded = int(((ids >= 1) & (ids <= fc.design.n_combos)).sum())
     assert n_barcoded > 0
@@ -824,7 +837,7 @@ def _text_value(text, key):
     raise KeyError(key)
 
 
-def test_section_five_adds_the_threshold_af_profiles_and_warns(fp, qtbot, experiment):
+def test_section_five_adds_the_threshold_af_profiles(fp, qtbot, experiment):
     controller = FlowCodeController(experiment)
     controller.experiment.samples['sample_af_profiles'] = {syn.BACKBONE: [syn.AF_PROFILE],
                                                            syn.OTHER_SAMPLE: [],
@@ -835,14 +848,9 @@ def test_section_five_adds_the_threshold_af_profiles_and_warns(fp, qtbot, experi
     _confirm(plugin, qtbot)
     _characterise(plugin, qtbot)
     plugin.tabs.setCurrentIndex(4)
-    page = plugin.pages[5]
     assert plugin.state.af_profile_names == [syn.AF_PROFILE]
     assert [k for k, _n, ok in plugin.export_candidates() if ok] == [syn.BACKBONE, syn.OTHER_SAMPLE]
-    note = plugin.export_af_note()
-    assert 'Mouse 1' in note and 'Backbone' not in note and 'Autofluorescence page of the AutoSpectral tab' in note
-    assert page.af_warn.text() == note
-    controller.experiment.samples['sample_af_profiles'][syn.OTHER_SAMPLE] = [syn.AF_PROFILE]
-    assert plugin.export_af_note() == ''
+    assert plugin.export_af_lists()[syn.OTHER_SAMPLE] == [syn.AF_PROFILE]
 
 
 def test_section_five_exports_flowcode_channels_and_summaries(fp, qtbot, experiment):
@@ -902,6 +910,8 @@ def test_section_five_exports_flowcode_channels_and_summaries(fp, qtbot, experim
     assert _text_value(text, 'FLOWCODEUNMIX') == fcs.PLUGIN_VERSION
     assert f'FC {design.combo_names[0]}={fcc.combo_key(design.combo_tags[0])}' in _text_value(text, 'FLOWCODECOMBOS')
     assert _text_value(text, 'FLOWCODESOURCE') == syn.BACKBONE
+    display = [_text_value(text, f'P{pnn.index(ch) + 1}DISPLAY') for ch in extra]
+    assert display[0] == 'LOG' and display[1] == 'LIN' and set(display[2:]) == {'LOG'}
     assert _text_value(text, 'FLOWCODECHARACTERISATION') == plugin.saved_spectra().characterisation_id()
     combos = events[:, [pnn.index(ch) for ch in extra[2:]]]
     flowcode = events[:, pnn.index('FlowCode')]
@@ -928,7 +938,7 @@ def test_section_five_exports_flowcode_channels_and_summaries(fp, qtbot, experim
     assert run['calibration'] == 'on' and run['settings']['calib_combos'] is True
     assert all({'combos', 'not_identifiable', 'weighting'} <= set(s['combo_scales']) for s in run['samples'])
     assert _text_value(text, 'FLOWCODECALIBRATION') == 'on'
-    assert 'Combination calibration' in page.result.text()
+    assert 'Combination calibration' not in page.result.text()
     assert run['settings']['rescue_toofew'] is True
     assert run['af_profiles'] == {syn.BACKBONE: [syn.AF_PROFILE], syn.OTHER_SAMPLE: [syn.AF_PROFILE]}
     assert [t['Tag'] for t in run['thresholds']] == list(design.tags)
@@ -1086,6 +1096,93 @@ def test_section_five_overrides_switch_off_or_scale_a_combination_in_the_export(
     _settle(plugin, qtbot)
 
 
+def test_sample_thresholds_are_set_on_the_samples_and_debarcode_them(fp, qtbot, experiment):
+    """Confirming the gates loads the ticked samples' gated events and sets
+    automatic thresholds on them, the plot follows the ticked samples, and
+    the samples' live unmix debarcodes with
+    the thresholds of the chosen source; until they are set the export and
+    the live unmix wait for them."""
+    import flowcode_analysis as fa
+    import flowcode_export as fce
+    from PySide6.QtCore import Qt
+
+    controller = FlowCodeController(experiment)
+    controller.experiment.samples['sample_af_profiles'] = {syn.BACKBONE: [syn.AF_PROFILE],
+                                                           syn.OTHER_SAMPLE: [syn.AF_PROFILE],
+                                                           syn.UNSTAINED_MATCHED: [syn.AF_PROFILE]}
+    plugin, _bus = _plugin(fp, qtbot, controller)
+    _choose_backbone(plugin, qtbot)
+    _load_gates(plugin, qtbot)
+    _confirm(plugin, qtbot)
+    _characterise(plugin, qtbot)
+    fc = plugin.export_spectra()
+    assert plugin.sample_debarcode_thresholds(fc) is None and plugin.export_problem() is None
+    assert 'sample_thresholds' not in plugin.live_unmixing_signature([syn.OTHER_SAMPLE])
+
+    plugin.tabs.setCurrentIndex(2)
+    page = plugin.pages[3]
+    page.open_section(page.SECTION_SAMPLE_THRESHOLDS)
+    section = page.samples
+    assert [k for k, _n, ok in plugin.sample_threshold_candidates() if ok] == [syn.OTHER_SAMPLE]
+    assert plugin.sample_threshold_selection() == [syn.OTHER_SAMPLE]
+    assert not hasattr(section, 'load_btn') and not hasattr(section, 'display_combo')
+    qtbot.waitUntil(lambda: plugin.sample_space is not None and not plugin.task_running('sample_space'),
+                    timeout=LONG)
+    plugin.set_sample_threshold_mode(fcs.SAMPLE_THRESHOLDS_AUTO)
+    tags = [t for t, _ch in plugin._space_tags]
+    assert sorted(plugin.state.sample_thresholds) == sorted(tags)
+    assert plugin.sample_thresholds_current() and plugin.export_problem() is None
+    assert plugin.sample_space.keys == [syn.OTHER_SAMPLE] and len(plugin.sample_space.owner) > 0
+    panel = section.thresholds
+    assert panel.table.rowCount() == len(tags) and panel.biplot._line.movable
+    assert panel.table.item(0, 3).flags() & Qt.ItemIsEditable
+    auto = [plugin.state.sample_thresholds[t]['auto_raw'] for t in fc.design.tags]
+    np.testing.assert_allclose(plugin.sample_debarcode_thresholds(fc), auto)
+    assert plugin.live_unmixing_signature([syn.OTHER_SAMPLE])['sample_thresholds'] == \
+        [round(float(v), 6) for v in auto]
+
+    # from the backbone's thresholds, dragging one line switches to setting
+    # them on the samples, the others kept at the backbone's values
+    section.mode_buttons[fcs.SAMPLE_THRESHOLDS_BACKBONE].setChecked(True)
+    panel.tag_list.setCurrentRow(1)
+    line = panel.biplot._line
+    line.setValue(line.value() + 0.3)
+    line.sigPositionChangeFinished.emit(line)
+    qtbot.waitUntil(lambda: plugin.state.sample_threshold_mode == fcs.SAMPLE_THRESHOLDS_INDIVIDUAL)
+    assert section.mode_buttons[fcs.SAMPLE_THRESHOLDS_INDIVIDUAL].isChecked()
+    assert plugin.state.sample_thresholds[tags[1]]['method'] == 'manual'
+    assert plugin.state.sample_thresholds[tags[0]]['method'] == 'backbone'
+    assert plugin.state.sample_thresholds[tags[0]]['raw'] == plugin.state.thresholds[tags[0]]['raw']
+
+    # set individually: every threshold out of reach leaves no tag positive
+    for tag in tags:
+        plugin.on_sample_threshold_changed(tag, 1e9)
+    assert all(rec['method'] == 'manual' for rec in plugin.state.sample_thresholds.values())
+    inputs = plugin.live_unmix_inputs([syn.OTHER_SAMPLE])
+    live = fce.live_sample_events(inputs['layout'], inputs['af_by_sample'][syn.OTHER_SAMPLE], inputs['unmix_fn'],
+                                  syn.OTHER_SAMPLE, inputs['pnn'], inputs['n_extra'])
+    assert np.all(fa.event_combo_ids(live, inputs['pnn'])[0] == 0)
+
+    # back to automatic: the manual values are kept but not used
+    plugin.set_sample_threshold_mode(fcs.SAMPLE_THRESHOLDS_AUTO)
+    np.testing.assert_allclose(plugin.sample_debarcode_thresholds(fc), auto)
+    assert plugin.state.sample_thresholds[tags[0]]['raw'] == 1e9
+
+    # unticking empties the plot and makes the thresholds wait; ticking the
+    # same sample again needs no new load
+    plugin.set_sample_threshold_selection([])
+    assert not plugin.sample_thresholds_current() and 'Set the sample thresholds' in plugin.export_problem()
+    with pytest.raises(ValueError, match='Set the sample thresholds'):
+        plugin.live_unmix_inputs([syn.OTHER_SAMPLE])
+    assert panel.table.rowCount() == 0
+    section.refresh()
+    assert section.load_status.text() == 'Tick at least one sample.'
+    plugin.set_sample_threshold_selection([syn.OTHER_SAMPLE])
+    assert plugin.sample_thresholds_current() and panel.table.rowCount() == len(tags)
+    qtbot.wait(800)
+    assert not plugin.task_running('sample_space')
+
+
 def test_live_unmix_equals_the_export_and_is_cached(fp, qtbot, experiment, monkeypatch):
     """The Analysis page's live unmix gives exactly the exported file's events,
     and a second unmix reads the cache instead of unmixing again."""
@@ -1221,6 +1318,7 @@ def test_gating_viewer_follows_the_sample_browser_with_the_experiments_plots(fp,
     import flowcode_analysis as fa
     import flowcode_export as fce
     import flowcode_gating as fcg
+    import flowcode_gating_view as fcgv
 
     controller = _with_unmixed_gate(FlowCodeController(experiment))
     controller.experiment.samples['sample_af_profiles'] = {syn.BACKBONE: [syn.AF_PROFILE],
@@ -1276,11 +1374,49 @@ def test_gating_viewer_follows_the_sample_browser_with_the_experiments_plots(fp,
     assert cells['percent'] == pytest.approx(100.0 * cells['n_in'] / records[syn.OTHER_SAMPLE]['events'])
     assert cells['changed'] is not None
     assert view.table.rowCount() == 1 and view.table.item(0, 0).text() == 'Cells'
-    assert [p.plot['channel_x'] for p in view._plots] == ['FSC-A', 'PE']   # the plot on a missing channel is left out
-    assert type(view._plots[0]).__mro__[1].__name__ == 'CytometryPlotWidget'
-    roi = view._plots[0].rois[0]
-    assert roi.label.gate_name == 'Cells' and roi.translatable is False
+    widgets = view.grid.plot_widgets
+    assert [p.plot['channel_x'] for p in widgets] == ['FSC-A', 'PE']   # the plot on a missing channel is left out
+    assert type(widgets[0]).__name__ == 'CytometryPlotWidget'
+    roi = widgets[0].rois[0]
+    assert roi.label.gate_name == 'Cells' and roi.translatable is True
     assert len(set(cache_dir.iterdir()) - cached) == 1          # the calibrated view is the counts' cache
+
+    # edits on the tab change its own copy, gated again without unmixing; never the experiment
+    def regated(version):
+        qtbot.waitUntil(lambda: view._version == version and not plugin.task_running(fcgv.TASK)
+                        and not view._edit_timer.isActive(), timeout=LONG)
+        _settle(plugin, qtbot)
+        return {g['name']: g for g in view.result['rows']}
+
+    progress.clear()
+    roi.setSize(roi.size() * 0.5)
+    moved = regated(view._version)['Cells']
+    assert view.local.edited and view.reset_btn.isEnabled() and 'Edited here' in view.status.text()
+    assert moved['n_in'] < cells['n_in'] and progress[-1] == (1, 1)          # gating only
+    data = view.result['data']
+    local_snapshot = view.local.worker_snapshot(syn.OTHER_SAMPLE)[0]
+    assert moved['n_in'] == fa.count_populations(data['event_data'], data['pnn'], syn.OTHER_SAMPLE, local_snapshot,
+                                                 ['Cells'])['Cells']['in_population']
+    assert fa.SampleGating.from_controller(controller).signature() == gating_before
+
+    fsc_id = controller.unmixed_transformations['FSC-A'].id
+    widgets[0].set_axis_transform(1, widgets[0].axis_bottom)
+    regated(view._version)
+    assert view.local.transforms['FSC-A'].id == 1 and controller.unmixed_transformations['FSC-A'].id == fsc_id
+
+    view._new_plot('PE', 'Count')
+    regated(view._version)
+    assert [p.plot['channel_x'] for p in view.grid.plot_widgets] == ['FSC-A', 'PE', 'PE']
+    assert len(view.local.plots) == 4 and len(controller.experiment.cytometry['plots']) == 3
+    assert len(view.result['data']['histograms']) == 3
+
+    view.result = None
+    view.reset_btn.click()
+    qtbot.waitUntil(lambda: view.result is not None, timeout=LONG)
+    _settle(plugin, qtbot)
+    assert not view.local.edited and not view.reset_btn.isEnabled()
+    assert {g['name']: g for g in view.result['rows']}['Cells']['n_in'] == cells['n_in']
+    assert len(view.grid.plot_widgets) == 2
 
     view.result = None
     view.view_combo.setCurrentIndex(view.view_combo.findData(fcg.VIEW_STANDARD))
@@ -1291,6 +1427,17 @@ def test_gating_viewer_follows_the_sample_browser_with_the_experiments_plots(fp,
                                     syn.OTHER_SAMPLE, inputs['pnn'], inputs['n_extra'])
     counted = fa.count_populations(events, inputs['pnn'], syn.OTHER_SAMPLE, page._gating_snapshot(), ['Cells'])
     assert standard['n_in'] == counted['Cells']['in_population']
+    # FlowCode's tag-abundance columns are on a logicle axis, the FlowCode ID on a linear one, and every
+    # highlighted event of a plot's source population is drawn
+    axes = view.result['data']['transformations']
+    assert axes[fcc.FLOWCODE_CHANNEL].id == 1 and axes[fcc.FLOWCODE_ID_CHANNEL].id == 0
+    assert all(axes[ch].id == 1 for ch in inputs['pnn'] if ch.startswith(fcc.COMBO_CHANNEL_PREFIX))
+    for plot, extra in zip(view.result['data']['plots'], view.result['overlay']):
+        if extra is not None and extra[0] == 'points':
+            source = view.result['data']['gate_membership'][plot['source_gate']]
+            barcoded = fcg.focus_mask(fa.event_combo_ids(view.result['data']['event_data'], inputs['pnn'])[0],
+                                      fcg.HIGHLIGHT_BARCODED, len(plugin.design().combo_names))
+            assert len(extra[1]) == extra[3] == int(np.sum(source & barcoded))
 
     view.result = None
     view.view_combo.setCurrentIndex(view.view_combo.findData(fcg.VIEW_UNCORRECTED))
@@ -1300,6 +1447,14 @@ def test_gating_viewer_follows_the_sample_browser_with_the_experiments_plots(fp,
     assert backbone['n_in'] == records[syn.BACKBONE]['in_population'] or view.view_combo.currentData() != \
         fcg.VIEW_CALIBRATED
     assert fa.SampleGating.from_controller(controller).signature() == gating_before
+
+    # unedited, the tab follows a change to the experiment's gates
+    shown = view.result['rows'][0]['n_in']
+    controller.unmixed_gating.get_gate('Cells').dimensions[0].max = 0.3
+    view.result = None
+    view.on_shown()
+    qtbot.waitUntil(lambda: view.result is not None, timeout=LONG)
+    assert view.result['rows'][0]['n_in'] < shown
     page.section_tabs.setCurrentIndex(1)
     assert browser[-1] is False
     _settle(plugin, qtbot)
@@ -1380,9 +1535,10 @@ def test_no_fret_backbone_debarcodes_without_correction_and_marks_every_output(f
         rows = list(csv.reader(fh))
     assert rows[0][-1] == 'Warning' and all(r[-1] == fcs.NO_FRET_WARNING for r in rows[1:])
 
+    assert 'now reads the exported files' in page5.run_status.text()
     plugin.tabs.setCurrentIndex(5)
     page6 = plugin.pages[6]
-    assert page6.is_live() and page6.uncorrected()
+    assert page6.source() == fa.SOURCE_EXPORTED and page6.uncorrected()
     page6.source_combo.setCurrentIndex(page6.source_combo.findData(fa.SOURCE_EXPORTED))
     page6.settings['gates'] = ['Cells']
     page6.refresh()
@@ -1636,8 +1792,8 @@ def test_several_libraries_export_names_and_analysis(fp, qtbot, experiment, monk
     assert row[f'h{1}'] == record['counts'][keys[1]] and row[nt] == record['counts'][keys[6]]
     assert page.meta.loc[syn.OTHER_SAMPLE, 'out_of_library'] == sum(record['counts'][k] for k in keys[7:])
     headers = [page.sample_table.horizontalHeaderItem(j).text() for j in range(page.sample_table.columnCount())]
-    assert headers[2] == 'Library' and 'Out of library' in headers
-    labels = {page.sample_table.item(r, 1).text(): page.sample_table.item(r, 2).text()
+    assert headers[2] == 'Group' and headers[3] == 'Library' and 'Out of library' in headers
+    labels = {page.sample_table.item(r, 1).text(): page.sample_table.item(r, 3).text()
               for r in range(page.sample_table.rowCount())}
     assert labels['Mouse 1'] == 'Metab B' and labels['Backbone'] == 'Other'
     assert page.samples_table.horizontalHeaderItem(2).text() == 'Library (section 2)'
@@ -2042,3 +2198,25 @@ def test_synopsis_tab_reads_the_results_and_draws(fp, qtbot, experiment):
     assert 'no statistics; phenotype only' in view.settings_text()
     page.reset_session()
     assert view.synopsis is None and view.atlas.figure is None
+
+
+def test_export_refuses_paths_too_long_for_windows(tmp_path, monkeypatch):
+    import flowcode_export as fce
+
+    raw = tmp_path / 'Raw'
+    (raw / 'Spleen SL1 + AAV-IL2').mkdir(parents=True)
+    key = 'Raw/Spleen SL1 + AAV-IL2/C1 31_LSRB34.2e_F_SL1_AAVIL2_Spleen_Spleen.fcs'
+    layout = SimpleNamespace(experiment_dir=tmp_path, raw_subdir_abs=raw.resolve(), unmixed_subdirectory='Unmixed',
+                             all_samples={key: Path(key).stem})
+    out = tmp_path / 'FlowCode Unmixed'
+    path = fce.export_folder_for(key, layout, out) / f'{Path(key).stem} FlowCode (Unmixed).fcs.part'
+    assert fce.too_long_paths([key], layout, out, ' FlowCode', limit=len(str(path))) == []
+    assert fce.too_long_paths([key], layout, out, ' FlowCode', limit=len(str(path)) - 1) == [(key, str(path))]
+
+    monkeypatch.setattr(fce, 'WINDOWS_MAX_PATH', len(str(path)) - 1)
+    monkeypatch.setattr(fce, 'windows_long_paths_enabled', lambda: False)
+    assert fce.long_path_problem([key], layout, out, ' FlowCode', platform='darwin') is None
+    message = fce.long_path_problem([key], layout, out, ' FlowCode', platform='win32')
+    assert message.startswith('1 exported file(s)') and Path(key).stem in message
+    monkeypatch.setattr(fce, 'windows_long_paths_enabled', lambda: True)
+    assert fce.long_path_problem([key], layout, out, ' FlowCode', platform='win32') is None

@@ -258,10 +258,6 @@ def test_export_af_library_adds_the_threshold_profiles():
     out = fs.export_af_assignments(assigned, ['s1', 's2', 's3'], ['F6'])
     assert out == {'s1': ['E7', 'F6'], 's2': ['F6'], 's3': ['F6'], 'control': ['E7']}
     assert assigned['s1'] == ['E7']
-    profiles = {'E7': {}, 'F6': {}}
-    assert fs.af_assignment_gaps(assigned, ['s1', 's2', 's3'], ['F6'], profiles) == ['s1', 's3']
-    assert fs.af_assignment_gaps(assigned, ['s1'], ['gone'], profiles) == []
-    assert fs.af_assignment_gaps(assigned, ['s1'], [], profiles) == []
 
 
 def test_best_match_breaks_ties_by_experiment_order():
@@ -535,7 +531,8 @@ def test_unmixing_inputs_are_not_saved():
 def test_section_settings_are_split_between_characterisation_and_export():
     assert set(fs.SECTION4_SETTINGS) == {f.name for f in dataclasses.fields(fc.CharacteriseSettings)}
     assert set(fs.SECTION5_SETTINGS) == {'tag_shift_min_n', 'correction', 'regressor', 'tandem_tags',
-                                         'tandem_z_min', 'tandem_min_combos', 'tandem_max_events'}
+                                         'tandem_z_min', 'tandem_min_combos', 'tandem_max_events',
+                                         'debarcode_after_correction'}
     assert not set(fs.RETIRED_SETTINGS) & set(fs.DEFAULT_SETTINGS)
     assert not set(fs.SECTION4_SETTINGS) & set(fs.SECTION5_SETTINGS)
     for key in fs.SECTION3_SETTINGS + fs.SECTION4_SETTINGS + fs.SECTION5_SETTINGS:
@@ -603,6 +600,49 @@ def test_combo_overrides_are_an_export_input_and_leave_the_default_untouched():
     assert state.run_status(5, 'fp') == ('done', '')
     old = fs.FlowCodeState.from_json({'settings': {'correction': 'combo'}})
     assert old.settings['combo_overrides'] == {}
+
+
+def test_sample_thresholds_follow_their_mode_and_only_stale_the_export():
+    state = _state_with_design(3)
+    tags = list(state.tag_map())
+    assert state.sample_threshold_mode == fs.SAMPLE_THRESHOLDS_AUTO
+    assert state.sample_threshold_values(tags) is None
+    state.sample_thresholds = {t: fs.threshold_record(100.0 * (i + 1), 'mixture', 50.0)
+                               for i, t in enumerate(tags)}
+    assert state.sample_threshold_values(tags) == [100.0, 200.0, 300.0]
+    state.mark_completed(4, 'fp')
+    state.mark_completed(5, 'fp')
+    state.sample_thresholds[tags[0]].update(raw=150.0, method='manual')
+    assert state.sample_threshold_values(tags) == [100.0, 200.0, 300.0]
+    assert state.run_status(5, 'fp') == ('done', '')
+    state.sample_threshold_mode = fs.SAMPLE_THRESHOLDS_INDIVIDUAL
+    assert state.sample_threshold_values(tags) == [150.0, 200.0, 300.0]
+    assert state.run_status(4, 'fp') == ('done', '')
+    assert state.run_status(5, 'fp') == ('stale', 'sample debarcoding thresholds changed')
+    state.sample_threshold_mode = fs.SAMPLE_THRESHOLDS_BACKBONE
+    assert state.sample_threshold_values(tags) is None
+    assert state.section_inputs(5, 'fp')['sample_thresholds'] is None
+    back = fs.FlowCodeState.from_json(json.loads(json.dumps(state.to_json())))
+    assert back.sample_threshold_mode == fs.SAMPLE_THRESHOLDS_BACKBONE and back.sample_thresholds == state.sample_thresholds
+
+
+def test_states_from_before_sample_thresholds_reuse_the_backbone_thresholds():
+    old = fs.FlowCodeState.from_json({'backbone_keys': ['Raw/bb.fcs']})
+    assert old.sample_threshold_mode == fs.SAMPLE_THRESHOLDS_BACKBONE
+    assert fs.FlowCodeState.from_json({'sample_threshold_mode': 'x'}).sample_threshold_mode == \
+        fs.SAMPLE_THRESHOLDS_AUTO
+
+
+def test_sample_threshold_inputs_follow_samples_libraries_and_the_debarcoding_space():
+    state = _state_with_design(3)
+    lists = {'Raw/a.fcs': ['AF a'], 'Raw/b.fcs': ['AF b']}
+    base = state.sample_threshold_inputs('fp', lists)
+    assert base == state.sample_threshold_inputs('fp', dict(reversed(list(lists.items()))))
+    assert base != state.sample_threshold_inputs('fp', {'Raw/a.fcs': ['AF a']})
+    assert base != state.sample_threshold_inputs('fp', {'Raw/a.fcs': ['AF a'], 'Raw/b.fcs': ['AF c']})
+    assert base != state.sample_threshold_inputs('other', lists)
+    state.gates[fs.CELLS_GATE] = {'vertices_raw': [[0, 0], [1, 0], [1, 1]]}
+    assert base != state.sample_threshold_inputs('fp', lists)
 
 
 def test_backbone_counts_follow_combos_through_a_rename():

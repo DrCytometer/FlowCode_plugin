@@ -25,7 +25,7 @@ follows the experiment's method set on the AutoSpectral tab
 (flowcode_method.py: per-cell AF, noise model, spectral variants, spectral
 corrections); whole samples are unmixed and written by flowcode_export.py.
 The state is saved with the experiment in ``process['flowcode_unmix']`` and the
-characterised backbone in ``cache/flowcode_spectra.npz``; event data are kept
+characterised backbone in ``state/flowcode_spectra.npz``; event data are kept
 for the session only and reloaded on demand.
 """
 
@@ -44,15 +44,17 @@ from types import SimpleNamespace
 import numpy as np
 from PySide6.QtCore import Qt, QEvent, QObject, QSettings, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListWidget,
-    QListWidgetItem, QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QTableWidget,
-    QTableWidgetItem, QTabWidget, QToolButton, QVBoxLayout, QWidget,
+    QListWidgetItem, QMenu, QMessageBox, QPushButton, QRadioButton, QScrollArea, QSizePolicy, QSpinBox,
+    QTableWidget, QTableWidgetItem, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 from flowkit import GatingStrategy, gates as fk_gates
 
 import honeychrome.settings as hc_settings
 from honeychrome.controller_components.af_auto_assign import folder_groups
+from honeychrome.view_components.focus_mode import mark_focus_chrome
+from honeychrome.controller_components import experiment_paths
 from honeychrome.controller_components.autospectral_functions import af_index_lookup
 from honeychrome.controller_components.cytometer_whitelist import singlet_channels
 from honeychrome.controller_components.functions import calc_hists, calc_stats, define_polygon_gate
@@ -133,6 +135,9 @@ METHOD_API_MESSAGE = (f'{plugin_name}: this version of Honeychrome does not appl
 
 DEBARCODE_ITEMS = (('Per-cell AF (default)', fcm.DEBARCODE_R1),
                    ("The experiment's unmixing method (AutoSpectral tab)", fcm.DEBARCODE_EXPERIMENT))
+AF_ABUNDANCE_ITEMS = (('Clamped (default)', fcm.AF_CLAMPED),
+                      ('Noise-aware', fcm.AF_NOISE_AWARE),
+                      ('Noise-aware with shape bend', fcm.AF_NOISE_AWARE_BEND))
 
 _HELP = {
     1: ('<p><b>Backbone</b>: the samples used to characterise the FlowCode unmixing error, usually pools '
@@ -144,7 +149,8 @@ _HELP = {
         '1 = identical); click a row to choose a different one. Its AF profiles, extracted on the '
         'Autofluorescence page of the AutoSpectral tab, are used for per-cell AF unmixing during debarcoding.</p>'
         '<p><b>Combinations CSV</b> (optional): the FlowCodeUnmix file with an <tt>Id</tt> column and '
-        'three tag columns. Without it, every 3-tag combination of the ticked tags is used.</p>'
+        'three tag columns, with or without a header row. Without it, every 3-tag combination of the ticked '
+        'tags is used.</p>'
         '<p><b>No FRET backbone</b>: for samples acquired before FRET backbone controls were run. The ticked '
         'samples then only set the gates, thresholds and rescue references (section 3); section 4 debarcodes '
         'them without fitting the FRET error, and sections 5 and 6 leave FRET, residual tag spillover and '
@@ -181,7 +187,30 @@ _HELP = {
         'crossover when the tag is bimodal, otherwise the upper 1% tail of the negatives, never below '
         'the 99.5th percentile of the unstained. Drag the red line or edit the raw value to change '
         'a threshold. <b>Import thresholds CSV</b> reads a FlowCodeUnmix thresholds file (Fluor, Tag, '
-        'Threshold_Raw), matching rows by tag name, then by fluorophore.</p>'),
+        'Threshold_Raw), matching rows by tag name, then by fluorophore.</p>'
+        '<p><b>Sample thresholds</b>: the thresholds the samples are debarcoded with (section 5 and the '
+        'Analysis page). A backbone control often stains differently from the samples (more non-specific '
+        'binding, dimmer barcodes), so a threshold that separates the backbone\'s positive and negative '
+        'cells can cut through the samples\' positives or negatives. Tick the samples to set them on '
+        '(<i>Select group</i> ticks one folder). When the gates are confirmed, and again whenever the ticked '
+        'samples change, events inside the FlowCode gates (up to the number in Advanced settings per sample) '
+        'are unmixed in the debarcoding space with each sample\'s own AF library and pooled, and the same '
+        'automatic rule as the backbone\'s sets a starting threshold per tag. The plot shows exactly the '
+        'ticked samples. Then choose <i>Re-use the backbone thresholds</i>, <i>Automatic thresholds on the '
+        'samples</i>, or <i>Set the thresholds on the samples</i>; dragging a red line or editing a raw '
+        'value switches to the last, starting from the thresholds drawn. One set of '
+        'sample thresholds debarcodes every sample; the backbone thresholds still debarcode the backbone '
+        'itself (section 4).</p>'
+        '<p><b>AF abundance</b> (Advanced settings): how much AF each cell is given in the per-cell AF '
+        'unmixing. <i>Clamped</i> (the default) is FlowCode\'s usual per-cell AF. <i>Noise-aware</i> reads '
+        'each cell\'s AF together with a prior fitted on its sample (the AutoSpectral tab\'s noise-aware '
+        'AF), and <i>with shape bend</i> also lets the AF spectrum of high-AF cells bend along shapes learnt '
+        'from the AF profile\'s unstained sample (with the noise model, M2pg instead gives less weight to '
+        'what such a bend could explain). Both need a noise model and the noise-aware AF abundance '
+        'on the AutoSpectral tab; otherwise the clamped AF is used. The setting applies to the final unmix '
+        '(sections 4 and 5); <i>Also in debarcoding</i> applies it to the debarcoding space too, which '
+        'moves cells relative to the thresholds, so the gates must be confirmed and section 4 run again. '
+        'The backbone\'s pooled events take the prior of the AF library\'s unstained sample.</p>'),
     4: ('<p><b>Debarcode and identify FRET spillover</b> debarcodes the gated backbone in the debarcoding '
         'space and rescues events with more than three positive tags whose tag pattern clearly matches one '
         'combination, and events with one or two positive tags that match a combination at a lower '
@@ -212,11 +241,20 @@ _HELP = {
         'frequencies and the rescue references, without the error model, the heatmap, the before/after '
         'plots or the tandem reference.</p>'),
     5: ('<p>Unmixes the selected samples with FlowCode error correction (unmix.flowcode.staged()): '
-        'per-cell AF unmixing with the sample\'s own AF library, debarcoding with the backbone '
-        'thresholds and too-many and too-few-tag rescue, subtraction of the characterised error from the '
+        'per-cell AF unmixing with the sample\'s own AF library, debarcoding with the sample thresholds '
+        '(section 3) and too-many and too-few-tag rescue, subtraction of the characterised error from the '
         'raw data, then the final unmix with the experiment\'s unmixing method (AutoSpectral tab: per-cell '
         'AF, the noise model or spectral variants, with the spectral corrections of the sample\'s group '
-        'when they are in use). Each file gets a '
+        'when they are in use).</p>'
+        '<p><b>Debarcode again after the FRET correction</b> (Advanced settings, on by default): FRET can '
+        'quench a tag so strongly that it falls below its threshold before the correction (for example a '
+        'BV421 tag in the same barcode as a dye that absorbs its light), so the cell shows only two tags '
+        'and stays unresolved, although the corrected data show all three. With this setting, every event '
+        'is corrected with its first call, unmixed again in the debarcoding space, and the events left '
+        'untransduced or unresolved are debarcoded a second time with the same thresholds and rescue; '
+        'barcoded events keep their first call, and the newly barcoded ones are then corrected with their '
+        'own combination\'s model. The summary\'s <i>Barcoded after correction</i> column counts them.</p>'
+        '<p>Each file gets a '
         '<tt>FlowCode</tt> channel (the median final abundance of a barcoded event\'s three tags, 0 '
         'otherwise), a <tt>FlowCode ID</tt> channel (0 untransduced, 1 to n the combination in table '
         'order, n + 1 unresolved) and one <tt>FC &lt;name&gt;</tt> channel per combination. The '
@@ -697,6 +735,44 @@ def _densify_record(record: dict, transforms: dict) -> dict:
 # Background work (no controller access; inputs are snapshotted)
 # ---------------------------------------------------------------------------
 
+class _TaskKeeper(QObject):
+    """
+    Holds each running task thread and its worker until the thread has
+    finished, then deletes the thread. A QThread destroyed while it runs
+    aborts the whole process ("QThread: Destroyed while thread is still
+    running"), so task threads are not children of the plugin widget, which
+    can be deleted while a task still runs (closing the window, or a test
+    tearing the widget down). Lives on the main thread, so the release runs
+    there, after the thread has stopped.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.running = {}
+
+    def hold(self, thread, worker):
+        self.running[id(thread)] = (thread, worker)
+        thread.finished.connect(self._release)
+
+    def _release(self):
+        thread = self.sender()
+        if thread is None or self.running.pop(id(thread), None) is None:
+            return
+        thread.wait()
+        thread.deleteLater()
+
+
+_task_keeper = None
+
+
+def _keeper() -> _TaskKeeper:
+    """The task keeper, made on first use (on the main thread)."""
+    global _task_keeper
+    if _task_keeper is None:
+        _task_keeper = _TaskKeeper()
+    return _task_keeper
+
+
 class _TaskWorker(QObject):
     """Runs ``fn(progress)`` on a worker thread."""
     finished = Signal(str, object)
@@ -882,12 +958,15 @@ def auto_cells_gate(data: BackboneData, singlet_record: dict | None, layout: Raw
 
 def compute_debarcode_space(backbone_fl: np.ndarray, unstained_fl: np.ndarray, spectra: np.ndarray,
                             fluor_names, tag_fluors, af_spectra: np.ndarray, pos_thresholds,
-                            magnitude_ceiling: float, settings: dict, progress, unmix_fn, engine: str) -> tuple:
+                            magnitude_ceiling: float, settings: dict, progress, unmix_fn, engine: str,
+                            backbone_log_ssc=None, unstained_log_ssc=None) -> tuple:
     """Debarcoding space of the gated events (*unmix_fn*: raw -> unmix
-    dict) and the automatic thresholds."""
+    dict; each event's log SSC as a second argument when given) and the
+    automatic thresholds."""
     progress(0, 2, f'unmixing ({engine})')
     space = fcc.debarcoding_space(backbone_fl, unstained_fl, spectra, fluor_names, tag_fluors, af_spectra,
-                                  pos_thresholds=pos_thresholds, unmix_fn=unmix_fn, engine=engine)
+                                  pos_thresholds=pos_thresholds, unmix_fn=unmix_fn, engine=engine,
+                                  backbone_log_ssc=backbone_log_ssc, unstained_log_ssc=unstained_log_ssc)
     progress(1, 2, 'thresholds')
     names = list(fluor_names)
     tag_cols = [names.index(f) for f in tag_fluors]
@@ -896,6 +975,69 @@ def compute_debarcode_space(backbone_fl: np.ndarray, unstained_fl: np.ndarray, s
                                         max_events=int(settings['threshold_max_events']))
     progress(2, 2, '')
     return space, thresholds
+
+
+@dataclass(eq=False)
+class SampleSpace:
+    """Pooled gated sample events in the debarcoding space, for the sample
+    thresholds."""
+    keys: list
+    unmixed: np.ndarray       # events x fluorophores (``_fluor_names`` order)
+    af_scale: np.ndarray
+    af_idx: np.ndarray
+    owner: np.ndarray         # index in *keys* of each event's sample
+    n_gated: list             # events inside the FlowCode gates, per sample
+    auto: list                # ``initial_thresholds`` of the pooled events, per tag
+    engine: str
+
+
+def load_sample_space(layout, keys, af_by_sample: dict, plan, records, fluor_order, tag_fluors, floor,
+                      magnitude_ceiling: float, settings: dict, progress, engine: str) -> SampleSpace:
+    """
+    Each sample's events inside the FlowCode gates (*records*; at most
+    ``sample_threshold_max_events``, a seeded subsample), unmixed in the
+    debarcoding space as the export does (``plan.debarcode`` with the
+    sample's own AF library, each event's log SSC for the noise-aware AF),
+    pooled, with the automatic thresholds of the pooled events
+    (``initial_thresholds``, never below the matched unstained *floor*).
+    *fluor_order* gives the order of the returned unmixed columns.
+    """
+    cap = int(settings['sample_threshold_max_events'])
+    names = list(layout.fluor_names)
+    order = [names.index(f) for f in fluor_order]
+    parts, scales, indices, owners, n_gated = [], [], [], [], []
+    for i, key in enumerate(keys):
+        progress(i, len(keys) + 1, f'sample {i + 1} of {len(keys)}')
+        reader = fce.open_reader(layout, key)
+        try:
+            raw = np.asarray(reader.read(0, reader.n_events), dtype=np.float64)
+        finally:
+            reader.close()
+        gated = fcc.gate_records_mask(raw, layout.pnn_raw_export, records) if records else None
+        rows = np.arange(len(raw)) if gated is None else np.flatnonzero(gated)
+        n_gated.append(int(rows.size))
+        rows = rows[seeded_subsample_indices(rows.size, cap, key, seed=42)]
+        sub = raw[rows]
+        del raw
+        raw_fl = np.ascontiguousarray(sub[:, list(layout.fl_ids_raw)])
+        log_ssc = plan.log_ssc(sub, layout.pnn_raw_export)
+        out = plan.debarcode(raw_fl, af_by_sample[key], key, log_ssc)
+        parts.append(np.asarray(out['unmixed'], dtype=np.float64)[:, order])
+        scales.append(np.asarray(out['af_scale'], dtype=np.float64))
+        indices.append(np.asarray(out['af_idx']))
+        owners.append(np.full(len(rows), i, dtype=np.int64))
+    progress(len(keys), len(keys) + 1, 'thresholds')
+    unmixed = np.concatenate(parts) if parts else np.zeros((0, len(order)))
+    tag_cols = [list(fluor_order).index(f) for f in tag_fluors]
+    auto = fcc.initial_thresholds(unmixed[:, tag_cols], floor, magnitude_ceiling,
+                                  min_delta_bic=float(settings['threshold_min_delta_bic']),
+                                  max_events=int(settings['threshold_max_events']))
+    progress(len(keys) + 1, len(keys) + 1, '')
+    return SampleSpace(keys=list(keys), unmixed=unmixed,
+                       af_scale=np.concatenate(scales) if scales else np.zeros(0),
+                       af_idx=np.concatenate(indices) if indices else np.zeros(0, dtype=np.int64),
+                       owner=np.concatenate(owners) if owners else np.zeros(0, dtype=np.int64),
+                       n_gated=n_gated, auto=auto, engine=engine)
 
 
 @dataclass(eq=False)
@@ -929,13 +1071,15 @@ def _display_axes(fluor_names, transforms: dict, magnitude_ceiling: float) -> di
     return axes
 
 
-def _unmix_rows(final_fn, raw: np.ndarray, rows: np.ndarray, n_fluors: int) -> dict:
+def _unmix_rows(final_fn, raw: np.ndarray, rows: np.ndarray, n_fluors: int, log_ssc=None) -> dict:
     """*final_fn* on *rows* of *raw*, scattered into full-length arrays (NaN
-    unmixed and AF abundance, AF index 0 elsewhere)."""
+    unmixed and AF abundance, AF index 0 elsewhere); with *log_ssc* (each
+    event's log SSC) its rows go to *final_fn* as a second argument."""
     out = {'unmixed': np.full((len(raw), n_fluors), np.nan), 'af_scale': np.full(len(raw), np.nan),
            'af_idx': np.zeros(len(raw), dtype=np.int64)}
     if rows.size:
-        part = final_fn(np.ascontiguousarray(raw[rows], dtype=np.float64))
+        block = np.ascontiguousarray(raw[rows], dtype=np.float64)
+        part = final_fn(block) if log_ssc is None else final_fn(block, log_ssc[rows])
         out['unmixed'][rows] = part['unmixed']
         out['af_scale'][rows] = part['af_scale']
         out['af_idx'][rows] = np.asarray(part['af_idx'], dtype=np.int64)
@@ -946,7 +1090,8 @@ def run_characterisation(raw_fl: np.ndarray, debarcode_unmixed: np.ndarray, unst
                          thresholds: np.ndarray, spectra: np.ndarray, fluor_names, detectors,
                          af_mean: np.ndarray, rescue_floor, magnitude_ceiling: float, settings: dict,
                          final_fn, engine: str, transforms: dict, labels: dict, progress,
-                         tandems=(), debarcode_af_scale=None, fit_error: bool = True) -> CharacteriseOutput:
+                         tandems=(), debarcode_af_scale=None, fit_error: bool = True,
+                         log_ssc=None) -> CharacteriseOutput:
     """Characterise the gated backbone, then unmix the events the figures
     show (the display subsample and the panel expression groups) with the
     export's final unmix, without and with the FlowCode correction.
@@ -958,6 +1103,8 @@ def run_characterisation(raw_fl: np.ndarray, debarcode_unmixed: np.ndarray, unst
                          too-few rescue.
     fit_error          : False debarcodes only (no FRET backbone); the
                          events are then unmixed once, uncorrected.
+    log_ssc            : each backbone event's log SSC for the noise-aware
+                         AF of the final unmix, or None.
     """
     progress(0, 3, 'debarcoding and fitting the FlowCode error')
     char_settings = fcc.CharacteriseSettings(**{f.name: settings[f.name]
@@ -974,8 +1121,9 @@ def run_characterisation(raw_fl: np.ndarray, debarcode_unmixed: np.ndarray, unst
     negative, barcoded = fcc.expression_event_indices(result.ids, design, max_events)
     rows = np.union1d(np.union1d(display_idx, negative), barcoded)
     progress(1, 3, f'unmixing {rows.size:,} backbone events before and after correction ({engine})')
-    before = _unmix_rows(final_fn, raw_fl, rows, len(fluor_names))
-    after = _unmix_rows(final_fn, result.corrected_raw, rows, len(fluor_names)) if fit_error else before
+    before = _unmix_rows(final_fn, raw_fl, rows, len(fluor_names), log_ssc)
+    after = (_unmix_rows(final_fn, result.corrected_raw, rows, len(fluor_names), log_ssc) if fit_error
+             else before)
     progress(2, 3, 'preparing the figures')
     summary = fcc.debarcode_summary(result.ids, design, rescued=len(result.rescued),
                                     rescued_toofew=len(result.rescued_toofew))
@@ -1085,6 +1233,7 @@ class _SideTabWidget(QWidget):
         divider = QFrame()
         divider.setFrameShape(QFrame.VLine)
         divider.setFrameShadow(QFrame.Sunken)
+        mark_focus_chrome(self._nav, divider)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1168,6 +1317,8 @@ class _Page(QWidget):
         self.body.setAlignment(Qt.AlignTop)
         self.body.setSpacing(10)
         if tabbed:
+            # The head and the controls above the tabs give way to the tabs in focus mode.
+            mark_focus_chrome(body)
             self.section_tabs = QTabWidget()
             self.section_tabs.setDocumentMode(True)
             self.section_tabs.currentChanged.connect(
@@ -1465,7 +1616,7 @@ class InputsPage(_Page):
         problems = []
         if not candidates:
             problems.append('No unstained samples found. Tag the unstained sample in the sample browser, '
-                            "or include 'unstained' in its name.")
+                            "or include 'Unstained' (or 'Unst') in its name.")
         elif state.unstained_key is None:
             problems.append('Choose the matched unstained sample.')
         _set_message(self.unstained_msg, problems)
@@ -2563,7 +2714,7 @@ class ThresholdPanel(QWidget):
         self.tag_list.currentRowChanged.connect(self._on_tag_selected)
         top.addWidget(self.tag_list, alignment=Qt.AlignTop)
         self.biplot = _ThresholdBiplot(controller)
-        self.biplot.setFixedSize(THRESHOLD_PLOT_SIZE, THRESHOLD_PLOT_SIZE)
+        self.biplot.setFixedWidth(THRESHOLD_PLOT_SIZE)
         self.biplot.thresholdMoved.connect(self._on_line_moved)
         self.biplot.channelChanged.connect(self._on_channels_changed)
         top.addWidget(self.biplot, alignment=Qt.AlignTop)
@@ -2632,6 +2783,11 @@ class ThresholdPanel(QWidget):
         self.table.setRowCount(0)
         self._tags = []
 
+    def set_thresholds(self, thresholds: dict):
+        """Show *thresholds* ({tag: threshold record}) on the same events."""
+        self._thresholds = thresholds
+        self.update_table()
+
     def update_table(self):
         self._filling = True
         try:
@@ -2699,8 +2855,178 @@ class ThresholdPanel(QWidget):
         QTimer.singleShot(0, lambda: self.thresholdChanged.emit(tag, value))
 
 
+SAMPLE_THRESHOLD_MODE_ITEMS = (
+    (fcs.SAMPLE_THRESHOLDS_BACKBONE, 'Re-use the backbone thresholds'),
+    (fcs.SAMPLE_THRESHOLDS_AUTO, 'Automatic thresholds on the samples'),
+    (fcs.SAMPLE_THRESHOLDS_INDIVIDUAL, 'Set the thresholds on the samples'),
+)
+
+
+class SampleThresholdsSection(QWidget):
+    """Section 3's Sample thresholds tab: the source of the samples'
+    debarcoding thresholds, the samples they are set on, and their
+    threshold panel over the pooled samples (or one folder of them)."""
+
+    def __init__(self, plugin, parent=None):
+        super().__init__(parent)
+        self.plugin = plugin
+        self._filling = False
+        self._groups = {}
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        hint = QLabel('The thresholds the samples are debarcoded with (export and Analysis). The backbone is '
+                      'always debarcoded with the backbone thresholds.')
+        hint.setWordWrap(True)
+        hint.setStyleSheet(_HINT_STYLE)
+        lay.addWidget(hint)
+
+        grp = QGroupBox('Samples the thresholds are set on')
+        box = QVBoxLayout(grp)
+        row = QHBoxLayout()
+        all_btn = QPushButton('Select all')
+        all_btn.clicked.connect(lambda: self.plugin.set_sample_threshold_selection(None))
+        none_btn = QPushButton('Select none')
+        none_btn.clicked.connect(lambda: self.plugin.set_sample_threshold_selection([]))
+        self.sample_count = QLabel('')
+        self.sample_count.setStyleSheet(_HINT_STYLE)
+        row.addWidget(all_btn)
+        row.addWidget(none_btn)
+        row.addWidget(self.sample_count, stretch=1)
+        box.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(QLabel('Group:'))
+        self.group_combo = QComboBox()
+        self.group_combo.setToolTip('The folders of the listed samples, as in the sample browser.')
+        _no_wheel(self.group_combo)
+        row.addWidget(self.group_combo, stretch=1)
+        self.select_group_btn = QPushButton('Select group')
+        self.select_group_btn.clicked.connect(lambda: self._select_group(True))
+        self.deselect_group_btn = QPushButton('Deselect group')
+        self.deselect_group_btn.clicked.connect(lambda: self._select_group(False))
+        row.addWidget(self.select_group_btn)
+        row.addWidget(self.deselect_group_btn)
+        box.addLayout(row)
+        self.sample_list = QListWidget()
+        self.sample_list.setMinimumHeight(140)
+        self.sample_list.setMaximumHeight(220)
+        self.sample_list.itemChanged.connect(self._on_sample_item_changed)
+        box.addWidget(self.sample_list)
+        self.load_status = QLabel('')
+        self.load_status.setWordWrap(True)
+        box.addWidget(self.load_status)
+        lay.addWidget(grp)
+
+        grp = QGroupBox('Debarcode the samples with')
+        row = QHBoxLayout(grp)
+        self.mode_group = QButtonGroup(self)
+        self.mode_buttons = {}
+        for value, text in SAMPLE_THRESHOLD_MODE_ITEMS:
+            button = QRadioButton(text)
+            self.mode_group.addButton(button)
+            self.mode_buttons[value] = button
+            button.toggled.connect(lambda checked, v=value: self._on_mode(v, checked))
+            row.addWidget(button)
+        row.addStretch()
+        lay.addWidget(grp)
+        self.message = QLabel('')
+        self.message.setWordWrap(True)
+        self.message.setStyleSheet(_HINT_STYLE)
+        lay.addWidget(self.message)
+        self.thresholds = ThresholdPanel(plugin.controller)
+        self.thresholds.thresholdChanged.connect(self.plugin.on_sample_threshold_changed)
+        self.thresholds.yChannelChanged.connect(self.plugin.on_y_channel_changed)
+        self.thresholds.autoAllRequested.connect(self.plugin.on_sample_thresholds_auto_all)
+        self.thresholds.resetRequested.connect(self.plugin.on_sample_threshold_reset)
+        self.thresholds.importRequested.connect(self._on_import)
+        lay.addWidget(self.thresholds)
+
+    def _on_mode(self, value: str, checked: bool):
+        if checked and not self._filling:
+            self.plugin.set_sample_threshold_mode(value)
+
+    def _on_import(self):
+        c = self.plugin.controller
+        start = str(Path(c.experiment_dir) / OUTPUT_SUBDIR)
+        path, _ = QFileDialog.getOpenFileName(self, 'Import sample thresholds', start, 'CSV files (*.csv)')
+        if path:
+            self.plugin.import_thresholds(path, samples=True)
+
+    def _checked_keys(self) -> list:
+        return [self.sample_list.item(i).data(Qt.UserRole) for i in range(self.sample_list.count())
+                if self.sample_list.item(i).checkState() == Qt.Checked]
+
+    def _on_sample_item_changed(self, _item):
+        if not self._filling:
+            self.plugin.set_sample_threshold_selection(self._checked_keys())
+
+    def _select_group(self, checked: bool):
+        """Tick (or untick) the samples of the group chosen in the drop-down,
+        keeping the rest of the selection."""
+        members = set(self._groups.get(self.group_combo.currentData()) or [])
+        if not members:
+            return
+        selected = set(self.plugin.sample_threshold_selection())
+        selected = selected | members if checked else selected - members
+        self.plugin.set_sample_threshold_selection(
+            [k for k, _n, ok in self.plugin.sample_threshold_candidates() if ok and k in selected])
+
+    def refresh(self):
+        plugin = self.plugin
+        state = plugin.state
+        self._filling = True
+        try:
+            for value, button in self.mode_buttons.items():
+                button.setChecked(value == state.sample_threshold_mode)
+            candidates = plugin.sample_threshold_candidates()
+            selected = set(plugin.sample_threshold_selection())
+            self.sample_list.clear()
+            for key, name, eligible in candidates:
+                item = QListWidgetItem(name)
+                item.setData(Qt.UserRole, key)
+                if eligible:
+                    item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                    item.setCheckState(Qt.Checked if key in selected else Qt.Unchecked)
+                else:
+                    item.setFlags(Qt.ItemIsUserCheckable)
+                    item.setCheckState(Qt.Unchecked)
+                    item.setToolTip('Assign AF profiles on the Autofluorescence page of the AutoSpectral tab.')
+                self.sample_list.addItem(item)
+            n_eligible = sum(1 for _k, _n, ok in candidates if ok)
+            self.sample_count.setText(f'{len(selected)} of {n_eligible} sample(s) selected.')
+            current = self.group_combo.currentData()
+            self._groups = folder_groups([key for key, _n, _ok in candidates])
+            self.group_combo.clear()
+            for folder, keys in self._groups.items():
+                self.group_combo.addItem(f'{folder} ({len(keys)})', folder)
+            self.group_combo.setCurrentIndex(max(self.group_combo.findData(current), 0))
+            for widget in (self.group_combo, self.select_group_btn, self.deselect_group_btn):
+                widget.setEnabled(bool(self._groups))
+        finally:
+            self._filling = False
+        busy = plugin.task_running('sample_space')
+        if not busy:
+            self.load_status.setText(plugin.sample_space_status())
+        current = plugin.sample_thresholds_current()
+        self.thresholds.setEnabled(plugin.sample_space is not None)
+        if state.sample_threshold_mode == fcs.SAMPLE_THRESHOLDS_BACKBONE:
+            self.message.setText('The samples are debarcoded with the backbone thresholds, drawn here on the '
+                                 'samples. Dragging a line or editing a value switches to setting them on the '
+                                 'samples.')
+        elif not current:
+            self.message.setText('The sample thresholds are set when the sample events are loaded (Load events '
+                                 'and Confirm gates): the export and the Analysis page wait for them.')
+        elif state.sample_threshold_mode == fcs.SAMPLE_THRESHOLDS_AUTO:
+            self.message.setText('The samples are debarcoded with the automatic thresholds of the pooled '
+                                 'samples. Dragging a line or editing a value switches to setting them on the '
+                                 'samples.')
+        else:
+            self.message.setText('The samples are debarcoded with the thresholds set here. Drag the red line '
+                                 'or edit the raw value.')
+
+
 class GatesPage(_Page):
-    SECTION_GATES, SECTION_THRESHOLDS, SECTION_ADVANCED = range(3)
+    SECTION_GATES, SECTION_THRESHOLDS, SECTION_SAMPLE_THRESHOLDS, SECTION_ADVANCED = range(4)
 
     def __init__(self, plugin, parent=None):
         super().__init__(plugin, 3, parent, tabbed=True)
@@ -2747,7 +3073,8 @@ class GatesPage(_Page):
         row = QHBoxLayout()
         self.confirm_btn = QPushButton('Confirm gates')
         self.confirm_btn.setStyleSheet(_PRIMARY_BUTTON_STYLE)
-        self.confirm_btn.setToolTip('Unmix the gated events in the debarcoding space and set starting thresholds.')
+        self.confirm_btn.setToolTip('Unmix the gated backbone and the samples ticked on the Sample thresholds tab '
+                                    'in the debarcoding space and set starting thresholds for both.')
         self.confirm_btn.clicked.connect(lambda: self.plugin.compute_debarcode_space(confirm=True))
         self.confirm_status = QLabel('')
         self.confirm_status.setWordWrap(True)
@@ -2767,6 +3094,9 @@ class GatesPage(_Page):
         self.thresholds.importRequested.connect(self._on_import_thresholds)
         lay.addWidget(self.thresholds)
 
+        self.samples = SampleThresholdsSection(plugin)
+        self.add_section('Sample thresholds').addWidget(self.samples)
+
         self._build_advanced(self.add_section('Advanced settings'))
         self.restore_open_section()
 
@@ -2785,6 +3115,7 @@ class GatesPage(_Page):
             'landmark_expand': _float_spin(1.0, 3.0, 2, 0.1),
             'threshold_max_events': _int_spin(1_000, 1_000_000, 10_000),
             'threshold_min_delta_bic': _float_spin(0.0, 1000.0, 1, 1.0),
+            'sample_threshold_max_events': _int_spin(1_000, 1_000_000, 5_000),
         }
         labels = {
             'backbone_max_events': 'Backbone events read per file (max):',
@@ -2795,6 +3126,7 @@ class GatesPage(_Page):
             'landmark_expand': 'Enlarge the landmark gate (x):',
             'threshold_max_events': 'Threshold events (max):',
             'threshold_min_delta_bic': 'Bimodality ΔBIC:',
+            'sample_threshold_max_events': 'Sample threshold events per sample (max):',
         }
         tips = {
             'backbone_max_events': 'Cleaned events read from each backbone file before gating; the files are '
@@ -2803,6 +3135,9 @@ class GatesPage(_Page):
                                    'allows (about 300 MB per million events on a 64-detector cytometer).',
             'landmark_expand': 'Each vertex of the automatic FlowCode Cells gate is moved this many times as far '
                                'from the gate centre. Applies the next time Auto is pressed.',
+            'sample_threshold_max_events': 'Events inside the FlowCode gates read from each sample ticked on the '
+                                           'Sample thresholds tab; they are pooled to set the sample '
+                                           'thresholds.',
         }
         for key, widget in self.adv.items():
             form.addRow(labels[key], widget)
@@ -2820,12 +3155,37 @@ class GatesPage(_Page):
         _no_wheel(self.debarcode_method)
         self.debarcode_method.currentIndexChanged.connect(self._on_debarcode_method)
         form.addRow('Debarcode with:', self.debarcode_method)
-        self.default_keys = (*self.adv, 'debarcode_method')
+        self.af_abundance = QComboBox()
+        for text, value in AF_ABUNDANCE_ITEMS:
+            self.af_abundance.addItem(text, value)
+        self.af_abundance.setToolTip(
+            'The AF abundance of the per-cell AF unmixing (final unmix, sections 4 and 5). Noise-aware needs '
+            'a noise model and the noise-aware AF abundance on the AutoSpectral tab; otherwise the clamped '
+            'AF is used.')
+        _no_wheel(self.af_abundance)
+        self.af_abundance.currentIndexChanged.connect(self._on_af_abundance)
+        form.addRow('AF abundance:', self.af_abundance)
+        self.debarcode_af = QCheckBox('Also in debarcoding')
+        self.debarcode_af.setToolTip(
+            'Use the AF abundance above in the per-cell AF debarcoding space as well. Cells move relative to '
+            'the thresholds: confirm the gates and run section 4 again.')
+        self.debarcode_af.toggled.connect(self._on_debarcode_af)
+        form.addRow('', self.debarcode_af)
+        self.default_keys = (*self.adv, 'debarcode_method', 'af_abundance', 'debarcode_af')
 
     def _on_debarcode_method(self, _index):
         value = self.debarcode_method.currentData()
         if value != self.plugin.state.settings.get('debarcode_method'):
             self.plugin.on_setting_changed('debarcode_method', value)
+
+    def _on_af_abundance(self, _index):
+        value = self.af_abundance.currentData()
+        if value != self.plugin.state.settings.get('af_abundance'):
+            self.plugin.on_setting_changed('af_abundance', value)
+
+    def _on_debarcode_af(self, checked: bool):
+        if bool(checked) != bool(self.plugin.state.settings.get('debarcode_af')):
+            self.plugin.on_setting_changed('debarcode_af', bool(checked))
 
     def _on_import_thresholds(self):
         c = self.plugin.controller
@@ -2845,6 +3205,15 @@ class GatesPage(_Page):
         self.debarcode_method.setCurrentIndex(
             max(self.debarcode_method.findData(plugin.debarcode_method()), 0))
         self.debarcode_method.blockSignals(False)
+        af_value = state.settings.get('af_abundance', fcm.AF_CLAMPED)
+        self.af_abundance.blockSignals(True)
+        self.af_abundance.setCurrentIndex(max(self.af_abundance.findData(af_value), 0))
+        self.af_abundance.blockSignals(False)
+        self.debarcode_af.blockSignals(True)
+        self.debarcode_af.setChecked(bool(state.settings.get('debarcode_af')))
+        self.debarcode_af.blockSignals(False)
+        self.debarcode_af.setEnabled(af_value != fcm.AF_CLAMPED
+                                     and plugin.debarcode_method() == fcm.DEBARCODE_R1)
         self.restore_btn.setEnabled(not plugin.settings_at_defaults(self.default_keys))
 
         ready = plugin.section_ready(3)
@@ -2855,7 +3224,8 @@ class GatesPage(_Page):
             pass
         elif data is None:
             self.load_status.setText('Load events reads the backbone and matched unstained to show the gates and '
-                                     'thresholds.' if ready else 'Complete sections 1 and 2 first.')
+                                     'thresholds; once the gates are confirmed, the samples ticked on the Sample '
+                                     'thresholds tab are read too.' if ready else 'Complete sections 1 and 2 first.')
         else:
             names = ', '.join(_sample_name(plugin.controller, key) for key in data.backbone_keys)
             self.load_status.setText(
@@ -2879,6 +3249,7 @@ class GatesPage(_Page):
             self.threshold_msg.setText('The gates changed: confirm them again to update the debarcoding space.')
         else:
             self.threshold_msg.setText('Confirm the gates to set thresholds.')
+        self.samples.refresh()
 
     def update_counts(self):
         data = self.plugin.backbone_data
@@ -3006,7 +3377,7 @@ class CharacterisePage(_Page):
         self.biplot_before = _TagBiplot('Uncorrected', plugin.controller)
         self.biplot_after = _TagBiplot('Corrected', plugin.controller)
         for source, target in ((self.biplot_before, self.biplot_after), (self.biplot_after, self.biplot_before)):
-            source.setFixedSize(ASSESS_PLOT_SIZE, ASSESS_PLOT_SIZE)
+            source.setFixedWidth(ASSESS_PLOT_SIZE)
             source.channelChanged.connect(lambda x, y, t=target: self._mirror_channels(t, x, y))
             source.scalingChanged.connect(lambda axis, tr, t=target: t.set_scaling(axis, tr))
             row.addWidget(source, alignment=Qt.AlignTop)
@@ -3338,8 +3709,6 @@ class ExportPage(_Page):
         self.sample_list.setMinimumHeight(240)
         self.sample_list.itemChanged.connect(self._on_sample_item_changed)
         lay.addWidget(self.sample_list, stretch=1)
-        self.af_warn = _message_label(_WARN_STYLE)
-        lay.addWidget(self.af_warn)
 
         lay = self.add_section('Output')
         row = QHBoxLayout()
@@ -3383,6 +3752,15 @@ class ExportPage(_Page):
             lambda _i: self._on_choice('regressor', self.regressor))
         form.addRow('Correction (correction):', self.correction)
         form.addRow('Correction regressors (regressor):', self.regressor)
+        self.second_pass = QCheckBox('Debarcode again after the FRET correction')
+        self.second_pass.setToolTip(
+            'Events left untransduced or unresolved are debarcoded a second time on the FRET-corrected data. '
+            'A tag quenched by FRET (e.g. a BV421 donor in the same barcode as its acceptor) can fall below '
+            'its threshold before the correction although it is clearly positive after it.')
+        self.second_pass.toggled.connect(
+            lambda checked: None if self._filling else self.plugin.on_setting_changed('debarcode_after_correction',
+                                                                                     bool(checked)))
+        form.addRow('', self.second_pass)
         self.adv = {'tag_shift_min_n': _int_spin(0, 10_000_000, 10)}
         labels = {'tag_shift_min_n': 'Events per tag for the rescue shift (tag.shift.min.n):'}
         for key, widget in self.adv.items():
@@ -3500,8 +3878,8 @@ class ExportPage(_Page):
         lay.addWidget(ogrp)
         self._override_rows = None
         self._override_widgets = {}
-        self.default_keys = ('correction', 'regressor', *self.adv, 'tandem_tags', *self.tandem_adv,
-                             *self.calib_checks, *self.calib_adv, 'combo_overrides')
+        self.default_keys = ('correction', 'regressor', 'debarcode_after_correction', *self.adv, 'tandem_tags',
+                             *self.tandem_adv, *self.calib_checks, *self.calib_adv, 'combo_overrides')
 
     # -- refresh -------------------------------------------------------------
 
@@ -3513,11 +3891,12 @@ class ExportPage(_Page):
             self.method_line.setText(plugin.method_line())
             self.controls_check.setChecked(bool(state.settings.get('export_include_controls')))
             self._fill_samples()
-            _set_message(self.af_warn, [plugin.export_af_note()])
             self.folder_label.setText(str(plugin.export_folder()))
             self.default_btn.setEnabled(bool(state.output_folder))
             for widget, key in ((self.correction, 'correction'), (self.regressor, 'regressor')):
                 widget.setCurrentIndex(max(widget.findData(state.settings[key]), 0))
+            self.second_pass.setChecked(bool(state.settings.get('debarcode_after_correction', True)))
+            self.second_pass.setEnabled(state.settings.get('correction') != 'none' and not state.no_fret)
             for key, widget in self.adv.items():
                 widget.blockSignals(True)
                 widget.setValue(state.settings[key])
@@ -3788,12 +4167,15 @@ class PluginWidget(QWidget):
         self._experiment_key = None
         self._active = False
         self._tasks = {}
-        self._task_experiment = {}
         self._threads = []
+        self._task_experiment = {}
         self._change_pending = False
         self._pending_load = None
         self._pending_auto = None
         self._pending_space = None
+        self._pending_sample_space = None
+        self._sample_space_attempt = None
+        self._sample_space_ticket = 0
         self._pending_char = None
         self._after_space = None
         self._saved_cache = None
@@ -3853,6 +4235,8 @@ class PluginWidget(QWidget):
     def _reset_session(self):
         self.backbone_data = None
         self.debarcode_space = None
+        self.sample_space = None
+        self._sample_space_attempt = None
         self.characterisation = None
         self._load_signature = None
         self._space_inputs = None
@@ -3982,6 +4366,7 @@ class PluginWidget(QWidget):
             self._reset_session()
             self.pages[3].panel.clear()
             self.pages[3].thresholds.clear()
+            self.pages[3].samples.thresholds.clear()
         for n, page in self.pages.items():
             kind, text = self.section_status(n)
             if kind == 'done' and n in (4, 5) and self.state.no_fret:
@@ -4521,16 +4906,30 @@ class PluginWidget(QWidget):
         self.state_changed(save=save)
         self.pages[3].update_counts()
 
-    def _gated_inputs(self):
-        """Gated backbone and capped gated unstained detector values."""
+    def _gated_rows(self):
+        """Rows of the gated backbone and of the capped gated unstained."""
         data = self.backbone_data
         panel = self.pages[3].panel
         cells = panel.masks()[fcs.CELLS_GATE]
-        backbone_fl = np.asarray(data.fl[cells], dtype=np.float64)
         un_mask = np.flatnonzero(panel.unstained_mask())
         cap = int(self.state.settings['unstained_max_events'])
         un_idx = un_mask[seeded_subsample_indices(len(un_mask), cap, data.unstained_key, seed=42)]
+        return cells, un_idx
+
+    def _gated_inputs(self):
+        """Gated backbone and capped gated unstained detector values."""
+        data = self.backbone_data
+        cells, un_idx = self._gated_rows()
+        backbone_fl = np.asarray(data.fl[cells], dtype=np.float64)
         return backbone_fl, np.asarray(data.un_fl[un_idx], dtype=np.float64)
+
+    def _gated_log_ssc(self, plan) -> tuple:
+        """Log SSC of the gated backbone and capped gated unstained for the
+        noise-aware AF (``plan.log_ssc``; Nones when clamped)."""
+        data = self.backbone_data
+        cells, un_idx = self._gated_rows()
+        channels = list(data.scatter_channels)
+        return plan.log_ssc(data.scatter[cells], channels), plan.log_ssc(data.un_scatter[un_idx], channels)
 
     def compute_debarcode_space(self, confirm: bool):
         data = self.backbone_data
@@ -4571,9 +4970,11 @@ class PluginWidget(QWidget):
                                'tags': list(zip([state.tag_names[ch] for ch in tag_fluors], tag_fluors)),
                                'ceiling': ceiling}
         self.pages[3].confirm_status.setText(f'Unmixing the gated events ({engine})…')
+        backbone_ssc, unstained_ssc = self._gated_log_ssc(plan) if plan.debarcode_af else (None, None)
         if self._start_task('space', lambda progress: compute_debarcode_space(
                 backbone_fl, unstained_fl, spectra, names, tag_fluors, af, pos, ceiling, settings,
-                progress, lambda raw: plan.debarcode(raw, af_state), engine)):
+                progress, lambda raw, log_ssc=None: plan.debarcode(raw, af_state, None, log_ssc), engine,
+                backbone_log_ssc=backbone_ssc, unstained_log_ssc=unstained_ssc)):
             self.refresh()
 
     def _on_space_finished(self, result):
@@ -4612,6 +5013,8 @@ class PluginWidget(QWidget):
             f'Debarcoding space: {len(space.backbone):,} backbone and {n_un:,} unstained events '
             f'({space.engine}).')
         self._show_thresholds()
+        if follow is None:
+            self.schedule_sample_space(0)
         if pending['confirm']:
             self.pages[3].open_section(GatesPage.SECTION_THRESHOLDS)
         self.state_changed(save=pending['confirm'])
@@ -4674,24 +5077,28 @@ class PluginWidget(QWidget):
     def on_y_channel_changed(self, tag: str, channel: str):
         self.state.y_channels[tag] = channel
         self.pages[3].thresholds.update_table()
+        self.pages[3].samples.thresholds.update_table()
         self.state_changed()
 
-    def import_thresholds(self, path) -> bool:
+    def import_thresholds(self, path, samples: bool = False) -> bool:
         """Set thresholds from a FlowCodeUnmix thresholds CSV; tags the file
-        does not name keep theirs."""
-        panel = self.pages[3].thresholds
+        does not name keep theirs. With *samples*, the sample thresholds."""
+        panel = self.pages[3].samples.thresholds if samples else self.pages[3].thresholds
         state = self.state
+        if samples:
+            self._take_over_sample_thresholds()
+        records = state.sample_thresholds if samples else state.thresholds
         try:
             rows = fcc.read_thresholds_csv(path)
         except (OSError, ValueError, UnicodeDecodeError) as exc:
             panel.import_msg.setStyleSheet(_ERROR_STYLE)
             _set_message(panel.import_msg, [f'Could not import {Path(path).name}: {exc}'])
             return False
-        tags = [t for t, _ch in (self._space_tags or []) if t in state.thresholds]
-        fluors = [ch for t, ch in (self._space_tags or []) if t in state.thresholds]
+        tags = [t for t, _ch in (self._space_tags or []) if t in records]
+        fluors = [ch for t, ch in (self._space_tags or []) if t in records]
         matched, unmatched = fcc.match_thresholds(rows, tags, fluors)
         for tag, raw in matched.items():
-            state.thresholds[tag].update(raw=raw, method='imported')
+            records[tag].update(raw=raw, method='imported')
         lines = [f'Imported {len(matched)} of {len(tags)} thresholds from {Path(path).name}.']
         missing = [t for t in tags if t not in matched]
         if missing:
@@ -4717,6 +5124,247 @@ class PluginWidget(QWidget):
             return
         rec.update(raw=rec['auto_raw'], method=rec['auto_method'])
         self.pages[3].thresholds.update_table()
+        self.state_changed()
+
+    # -- sample thresholds -------------------------------------------------------
+
+    def _af_eligible(self, keys) -> list:
+        """(key, name, has an AF library of at least 2 spectra) of *keys*; the
+        library is ``fcs.export_af_profile_names``: the sample's assignment
+        plus the profiles the thresholds were set with."""
+        c = self.controller
+        af_profiles = _process(c).get('af_profiles') or {}
+        assigned = c.experiment.samples.get('sample_af_profiles') or {}
+        out = []
+        for key in keys:
+            names = fcs.export_af_profile_names(assigned.get(key), self.state.af_profile_names)
+            n = sum(len(af_profiles[name].get('spectra') or []) for name in names if name in af_profiles)
+            out.append((key, _sample_name(c, key), n >= 2))
+        return out
+
+    def sample_threshold_candidates(self) -> list:
+        """(key, name, has an AF library) of every sample the sample
+        thresholds can be set on: all but single-stain controls, unstained
+        samples and the backbone."""
+        backbones = set(self.state.backbones())
+        keys = [k for k in fcs.backbone_candidates(self.controller.experiment.samples) if k not in backbones]
+        return self._af_eligible(keys)
+
+    def sample_threshold_selection(self) -> list:
+        """Ticked samples with an AF library (all of them by default)."""
+        eligible = [key for key, _name, ok in self.sample_threshold_candidates() if ok]
+        chosen = self.state.sample_threshold_keys
+        if chosen is None:
+            return eligible
+        chosen = set(chosen)
+        return [key for key in eligible if key in chosen]
+
+    def set_sample_threshold_selection(self, keys):
+        """Tick *keys* (None: every sample); the plot follows at once and the
+        sample events are loaded again shortly after."""
+        self.state.sample_threshold_keys = None if keys is None else list(keys)
+        self.show_sample_thresholds()
+        self.state_changed()
+        self.schedule_sample_space()
+
+    def schedule_sample_space(self, delay_ms: int = 600):
+        """Call ``ensure_sample_space`` after *delay_ms*, once for a burst of
+        calls (ticking several samples one after another)."""
+        self._sample_space_ticket += 1
+        ticket = self._sample_space_ticket
+        QTimer.singleShot(delay_ms, lambda: ticket == self._sample_space_ticket and self.ensure_sample_space())
+
+    def ensure_sample_space(self):
+        """Load the ticked samples' gated events in the debarcoding space,
+        unless they are loaded, loading, or already failed with the same
+        inputs (Load events clears that)."""
+        if self.state is None or not self.debarcode_space_current() or self.task_running('sample_space'):
+            return
+        keys = self.sample_threshold_selection()
+        if not keys:
+            return
+        inputs = self._sample_threshold_inputs(keys)
+        space = self.sample_space
+        if space is not None and space.keys == keys and self.state.sample_thresholds_inputs == inputs:
+            return
+        if inputs == self._sample_space_attempt:
+            return
+        self._sample_space_attempt = inputs
+        self.load_sample_threshold_events()
+
+    def set_sample_threshold_mode(self, mode: str):
+        if mode not in fcs.SAMPLE_THRESHOLD_MODES or mode == self.state.sample_threshold_mode:
+            return
+        self.state.sample_threshold_mode = mode
+        self.pages[3].samples.thresholds.set_thresholds(self.sample_display_thresholds())
+        self.state_changed()
+
+    def sample_display_thresholds(self) -> dict:
+        """{tag: threshold record} the Sample thresholds tab shows: the
+        backbone's, the automatic ones of the samples, or the user's."""
+        state = self.state
+        if state.sample_threshold_mode == fcs.SAMPLE_THRESHOLDS_BACKBONE:
+            return state.thresholds
+        if state.sample_threshold_mode == fcs.SAMPLE_THRESHOLDS_AUTO:
+            return {t: {**rec, 'raw': rec.get('auto_raw'), 'method': rec.get('auto_method')}
+                    for t, rec in state.sample_thresholds.items()}
+        return state.sample_thresholds
+
+    def _sample_threshold_inputs(self, keys=None) -> dict:
+        keys = self.sample_threshold_selection() if keys is None else list(keys)
+        return self.state.sample_threshold_inputs(self.fingerprint(), self.export_af_lists(keys))
+
+    def sample_thresholds_current(self) -> bool:
+        """Whether every tag has a sample threshold set on the ticked
+        samples with the current debarcoding space."""
+        state = self.state
+        tags = [state.tag_names.get(ch, ch) for ch in state.tag_channels()]
+        return (state.sample_thresholds_inputs is not None and all(t in state.sample_thresholds for t in tags)
+                and state.sample_thresholds_inputs == self._sample_threshold_inputs())
+
+    def sample_threshold_problem(self) -> str | None:
+        """Why the samples cannot be debarcoded now, or None."""
+        state = self.state
+        if state.sample_threshold_mode == fcs.SAMPLE_THRESHOLDS_BACKBONE or self.sample_thresholds_current():
+            return None
+        again = ' again: the samples, their AF libraries or the debarcoding space changed' \
+            if state.sample_thresholds_inputs else ''
+        return f'Set the sample thresholds (section 3: Load events, then Confirm gates){again}.'
+
+    def sample_debarcode_thresholds(self, fc) -> np.ndarray | None:
+        """The samples' debarcoding thresholds in *fc*'s tag order, or None
+        for the backbone's (``fc.thresholds``)."""
+        values = self.state.sample_threshold_values(list(fc.design.tags))
+        return None if values is None else np.asarray(values, dtype=float)
+
+    def sample_space_status(self) -> str:
+        space = self.sample_space
+        state = self.state
+        if not self.debarcode_space_current():
+            if self.sample_thresholds_current():
+                return 'The sample thresholds are set. Load events to view or change them.'
+            return 'The ticked samples are read when the gates are confirmed (Load events, then Confirm gates).'
+        if not self.sample_threshold_selection():
+            return 'Tick at least one sample.'
+        if space is None:
+            return 'Waiting to read the ticked samples.'
+        text = (f'{len(space.owner):,} events inside the FlowCode gates from {len(space.keys)} sample(s) '
+                f'({space.engine}).')
+        if state.sample_thresholds_inputs != self._sample_threshold_inputs():
+            text += ' The samples or their AF libraries changed: reading them again.' \
+                if self._sample_space_attempt != self._sample_threshold_inputs() else \
+                ' The samples changed but could not be read again: press Load events.'
+        return text
+
+    def load_sample_threshold_events(self):
+        """Unmix the gated events of the ticked samples in the debarcoding
+        space and set the samples' automatic thresholds on them."""
+        state = self.state
+        page = self.pages[3].samples
+        if not self.debarcode_space_current() or self.task_running('sample_space'):
+            return
+        keys = self.sample_threshold_selection()
+        if not keys:
+            page.load_status.setText('Tick at least one sample.')
+            return
+        c = self.controller
+        self._sync_unmixing_inputs()
+        plan = self.unmix_plan(keys)
+        af_by_sample = {key: plan.af_for(names) for key, names in self.export_af_lists(keys).items()}
+        missing = [_sample_name(c, k) for k, af in af_by_sample.items() if af is None]
+        if missing:
+            page.load_status.setText('The AF libraries of ' + ', '.join(missing) + ' could not be read.')
+            return
+        layout = fce.build_export_layout(c)
+        records = [state.gates[name] for name in fcs.GATE_NAMES if name in state.gates]
+        tag_fluors = [ch for _t, ch in self._space_tags]
+        engine = 'per-cell AF' if plan.debarcode_method == fcm.DEBARCODE_R1 else plan.label
+        floor = np.asarray(self.debarcode_space.floor, dtype=float)
+        ceiling = self._space_ceiling
+        settings = dict(state.settings)
+        fluor_order = _fluor_names(c)
+        self._pending_sample_space = {'inputs': self._sample_threshold_inputs(keys), 'keys': list(keys)}
+        if self._start_task('sample_space', lambda progress: load_sample_space(
+                layout, keys, af_by_sample, plan, records, fluor_order, tag_fluors, floor, ceiling, settings,
+                progress, engine)):
+            page.load_status.setText(f'Unmixing the gated events of {len(keys)} sample(s) ({engine})…')
+            self.refresh()
+
+    def _on_sample_space_finished(self, space: SampleSpace):
+        pending, self._pending_sample_space = self._pending_sample_space, None
+        state = self.state
+        if pending is None or pending['keys'] != self.sample_threshold_selection() \
+                or pending['inputs'] != self._sample_threshold_inputs(pending['keys']):
+            self.schedule_sample_space(0)
+            return
+        self.sample_space = space
+        tags = [t for t, _ch in self._space_tags]
+        for tag, item in zip(tags, space.auto):
+            old = state.sample_thresholds.get(tag)
+            if old is not None and old.get('method') in fcs.USER_THRESHOLD_METHODS:
+                state.sample_thresholds[tag] = fcs.threshold_record(old['raw'], old['method'], item['delta_bic'],
+                                                                    item['raw'], item['method'])
+            else:
+                state.sample_thresholds[tag] = fcs.threshold_record(item['raw'], item['method'], item['delta_bic'])
+        state.sample_thresholds = {t: v for t, v in state.sample_thresholds.items() if t in set(tags)}
+        state.sample_thresholds_inputs = pending['inputs']
+        self.show_sample_thresholds()
+        self.state_changed()
+
+    def show_sample_thresholds(self):
+        """Draw the loaded events of the ticked samples with the sample
+        thresholds."""
+        space = self.sample_space
+        section = self.pages[3].samples
+        ticked = set(self.sample_threshold_selection()) if space is not None else set()
+        rows = np.flatnonzero(np.isin(space.owner, [i for i, k in enumerate(space.keys) if k in ticked])) \
+            if ticked else np.zeros(0, dtype=np.int64)
+        if not len(rows) or not self._space_tags:
+            section.thresholds.clear()
+            return
+        cap = int(self.state.settings['threshold_display_max_events'])
+        idx = rows[seeded_subsample_indices(len(rows), cap, 'flowcode_sample_threshold_display', seed=42)]
+        display = self.unmixed_display(space.unmixed, space.af_scale, space.af_idx, idx)
+        section.thresholds.set_data(display, self._space_tags, self.sample_display_thresholds(),
+                                    self.state.y_channels, self._space_ceiling)
+
+    def _take_over_sample_thresholds(self):
+        """Switch the samples to thresholds set on the samples, starting from
+        the thresholds drawn: the backbone's or the automatic ones."""
+        state = self.state
+        mode = state.sample_threshold_mode
+        if mode == fcs.SAMPLE_THRESHOLDS_INDIVIDUAL:
+            return
+        for tag, rec in state.sample_thresholds.items():
+            if mode == fcs.SAMPLE_THRESHOLDS_BACKBONE and tag in state.thresholds:
+                rec.update(raw=float(state.thresholds[tag]['raw']), method='backbone')
+            elif mode == fcs.SAMPLE_THRESHOLDS_AUTO:
+                rec.update(raw=rec['auto_raw'], method=rec['auto_method'])
+        state.sample_threshold_mode = fcs.SAMPLE_THRESHOLDS_INDIVIDUAL
+        self.pages[3].samples.thresholds.set_thresholds(state.sample_thresholds)
+
+    def on_sample_threshold_changed(self, tag: str, raw: float):
+        if self.state.sample_thresholds.get(tag) is None:
+            return
+        self._take_over_sample_thresholds()
+        self.state.sample_thresholds[tag].update(raw=float(raw), method='manual')
+        self.pages[3].samples.thresholds.update_table()
+        self.state_changed()
+
+    def on_sample_thresholds_auto_all(self):
+        self._take_over_sample_thresholds()
+        for rec in self.state.sample_thresholds.values():
+            rec.update(raw=rec['auto_raw'], method=rec['auto_method'])
+        self.pages[3].samples.thresholds.update_table()
+        self.state_changed()
+
+    def on_sample_threshold_reset(self, tag: str):
+        rec = self.state.sample_thresholds.get(tag)
+        if rec is None:
+            return
+        self._take_over_sample_thresholds()
+        rec.update(raw=rec['auto_raw'], method=rec['auto_method'])
+        self.pages[3].samples.thresholds.update_table()
         self.state_changed()
 
     def load_events(self):
@@ -4798,11 +5446,13 @@ class PluginWidget(QWidget):
         tandems = [] if not fit_error else [cand['tandem'] for cand in self.tandem_candidates()
                                             if cand['tandem'] is not None]
         args = (backbone_fl, space.backbone, unstained_fl, design, thresholds, spectra, names, detectors,
-                space.af_mean, space.rescue_floor, ceiling, settings, lambda raw: plan.final(raw, af_state), engine,
-                transforms, labels)
+                space.af_mean, space.rescue_floor, ceiling, settings,
+                lambda raw, log_ssc=None: plan.final(raw, af_state, None, log_ssc), engine, transforms, labels)
         af_scale = space.af_scale
+        backbone_ssc = self._gated_log_ssc(plan)[0]
         if self._start_task('characterise', lambda progress: run_characterisation(
-                *args, progress, tandems, debarcode_af_scale=af_scale, fit_error=fit_error)):
+                *args, progress, tandems, debarcode_af_scale=af_scale, fit_error=fit_error,
+                log_ssc=backbone_ssc)):
             self.refresh()
 
     def _on_characterise_finished(self, output: CharacteriseOutput):
@@ -4833,7 +5483,7 @@ class PluginWidget(QWidget):
         the R-compatible thresholds and combinations files."""
         experiment_dir = Path(self.controller.experiment_dir)
         fc = output.result.spectra
-        meta = fcc.save_flowcode_spectra(fc, experiment_dir / 'cache' / SPECTRA_FILE)
+        meta = fcc.save_flowcode_spectra(fc, experiment_paths.state_dir(experiment_dir, SPECTRA_FILE))
         out_dir = experiment_dir / OUTPUT_SUBDIR
         out_dir.mkdir(parents=True, exist_ok=True)
         fcc.write_thresholds_csv(out_dir / 'thresholds.csv', design, fc.thresholds, fcc.logicle_transform(ceiling))
@@ -4848,7 +5498,7 @@ class PluginWidget(QWidget):
         meta = self.state.characterisation
         if not meta or self.controller is None:
             return None
-        path = Path(self.controller.experiment_dir) / 'cache' / SPECTRA_FILE
+        path = experiment_paths.state_dir(self.controller.experiment_dir, SPECTRA_FILE)
         try:
             stamp = (str(path), path.stat().st_mtime_ns, meta.get('fingerprint'))
         except OSError:
@@ -4961,35 +5611,10 @@ class PluginWidget(QWidget):
         listed too when the section 5 setting includes them. The library is
         ``fcs.export_af_profile_names``: the sample's assignment plus the
         profiles the thresholds were set with."""
-        c = self.controller
-        samples = c.experiment.samples
-        af_profiles = _process(c).get('af_profiles') or {}
-        assigned = samples.get('sample_af_profiles') or {}
+        samples = self.controller.experiment.samples
         keys = list(samples.get('all_samples') or {}) if self.state.settings.get('export_include_controls') \
             else fcs.backbone_candidates(samples)
-        out = []
-        for key in keys:
-            names = fcs.export_af_profile_names(assigned.get(key), self.state.af_profile_names)
-            n = sum(len(af_profiles[name].get('spectra') or []) for name in names if name in af_profiles)
-            out.append((key, _sample_name(c, key), n >= 2))
-        return out
-
-    def export_af_note(self) -> str:
-        """Warning for selected samples whose AutoSpectral AF assignment lacks
-        the AF profiles the thresholds were set with ('' when none)."""
-        c = self.controller
-        if c is None or c.experiment is None:
-            return ''
-        keys = self.export_selection()
-        gaps = fcs.af_assignment_gaps(c.experiment.samples.get('sample_af_profiles') or {}, keys,
-                                      self.state.af_profile_names, _process(c).get('af_profiles') or {})
-        if not gaps:
-            return ''
-        names = [_sample_name(c, key) for key in gaps]
-        shown = ', '.join(names[:5]) + (f' and {len(names) - 5} more' if len(names) > 5 else '')
-        return (f'{len(gaps)} selected sample(s) are not assigned the AF profile(s) the thresholds were set with '
-                f'({", ".join(self.state.af_profile_names)}): {shown}. They are added to these samples\' AF '
-                f'library for the export; check the assignments on the Autofluorescence page of the AutoSpectral tab.')
+        return self._af_eligible(keys)
 
     def export_selection(self) -> list:
         """Selected samples that can be exported (all of them by default)."""
@@ -5143,7 +5768,10 @@ class PluginWidget(QWidget):
         """``flowcode_method.UnmixPlan`` with the debarcoding library and the
         export libraries of *sample_keys*. Main thread."""
         lists = [list(self.state.af_profile_names)] + list(self.export_af_lists(list(sample_keys)).values())
-        return fcm.build_plan(self.controller, self.debarcode_method(), lists)
+        settings = self.state.settings
+        return fcm.build_plan(self.controller, self.debarcode_method(), lists,
+                              af_mode=settings.get('af_abundance', fcm.AF_CLAMPED),
+                              debarcode_af=bool(settings.get('debarcode_af')))
 
     def _sync_unmixing_inputs(self):
         """Record in the state what the section run records compare: the
@@ -5514,7 +6142,27 @@ class PluginWidget(QWidget):
             'gates': {name: (self.state.gates.get(name) or {}).get('vertices_raw') for name in fcs.GATE_NAMES},
             'settings': settings,
             'tandems': tandems,
+            **self._af_abundance_signature(),
+            **self._sample_threshold_signature(fc),
         }
+
+    def _sample_threshold_signature(self, fc) -> dict:
+        """The sample thresholds' part of the live unmixing signature: empty
+        when the backbone's are re-used, so caches made before sample
+        thresholds existed stay valid."""
+        values = self.sample_debarcode_thresholds(fc)
+        return {} if values is None else {'sample_thresholds': [round(float(v), 6) for v in values]}
+
+    def _af_abundance_signature(self) -> dict:
+        """The AF abundance setting's part of the live unmixing signature:
+        empty for the clamped default, so caches made before the setting
+        existed stay valid."""
+        mode = self.state.settings.get('af_abundance', fcm.AF_CLAMPED)
+        if mode == fcm.AF_CLAMPED:
+            return {}
+        from honeychrome.controller_components import af_posterior
+        return {'af_abundance': [mode, bool(self.state.settings.get('debarcode_af')),
+                                 af_posterior.signature(af_posterior.noise_context(self.controller))]}
 
     def live_unmix_inputs(self, keys, overrides: dict | None = None) -> dict:
         """What a worker needs to FlowCode-unmix *keys* as section 5 would
@@ -5526,6 +6174,9 @@ class PluginWidget(QWidget):
         ValueError when it cannot. Main thread."""
         if self.section_status(4)[0] != 'done':
             raise ValueError('Characterise the backbone in section 4 first.')
+        problem = self.sample_threshold_problem()
+        if problem:
+            raise ValueError(problem)
         fc = self.export_spectra()
         layout = fce.build_export_layout(self.controller)
         self._sync_unmixing_inputs()
@@ -5567,7 +6218,7 @@ class PluginWidget(QWidget):
             return str(exc)
         if not self.export_selection():
             return 'Select at least one sample.'
-        return None
+        return self.sample_threshold_problem()
 
     def export_library_gaps(self, sample_keys) -> list:
         """Samples of *sample_keys* that need a library and have none
@@ -5669,13 +6320,6 @@ class PluginWidget(QWidget):
         if last.get('tandem_tags'):
             text += (f' Tandem breakdown ({", ".join(last["tandem_tags"])}) was corrected in '
                      f'{last.get("tandem_corrected", 0)} sample(s); the estimates are in the same file.')
-        calibration = last.get('calibration')
-        if calibration:
-            text += ' Combination calibration (calibrated / identifiable; largest changes):<br>' + '<br>'.join(
-                f'&nbsp;&nbsp;{name}: {row["calibrated"]} / {row["identifiable"]}'
-                + (f'; {", ".join(f"{c} {v:.2f}" for c, v in row["largest"])}' if row['largest'] else '')
-                + (f'; not identifiable: {", ".join(row["not_identifiable"])}' if row['not_identifiable'] else '')
-                for name, row in calibration.items())
         overrides = last.get('overrides')
         if overrides:
             text += ('<br>FRET correction overridden: ' + ', '.join(
@@ -5702,6 +6346,10 @@ class PluginWidget(QWidget):
             page.set_run_status(f'Could not prepare the export: {exc}', problem=True)
             return
         sample_keys = self.export_selection()
+        too_long = fce.long_path_problem(sample_keys, layout, self.export_folder(), EXPORT_NAME_SUFFIX)
+        if too_long:
+            page.set_run_status(too_long, problem=True)
+            return
         if not fc.fret_corrected and not self.confirm_no_fret(
                 f'Unmix and export {len(sample_keys)} sample(s) without FRET correction?'):
             page.set_run_status('Export cancelled.')
@@ -5712,6 +6360,7 @@ class PluginWidget(QWidget):
         self._sync_unmixing_inputs()
         design = fc.design
         job = {'design': design, 'folder': self.export_folder(), 'current': None, 'samples': [],
+               'selected': list(sample_keys),
                'inputs': state.section_inputs(5, self.fingerprint()), 'fc': fc, 'tandems': [], 'tandem': None,
                'scales': None, 'calibrate': self.calibration_mode(fc) != 'off',
                'overrides': self.export_overrides(fc)}
@@ -5837,7 +6486,8 @@ class PluginWidget(QWidget):
                                         tandem_pool=tandem_pool, on_tandem=on_tandem,
                                         debarcode_fn=plan.debarcode,
                                         calibration_record=state.gates.get(fcs.SINGLETS_GATE),
-                                        noise=self._calibration_noise(plan), on_scales=on_scales)
+                                        noise=self._calibration_noise(plan), on_scales=on_scales,
+                                        log_ssc_fn=plan.log_ssc, thresholds=self.sample_debarcode_thresholds(fc))
         extra_channels = ([fcc.FLOWCODE_CHANNEL, fcc.FLOWCODE_ID_CHANNEL]
                           + [fcc.combo_channel_name(n) for n in design.combo_names])
         keywords = {
@@ -5846,6 +6496,10 @@ class PluginWidget(QWidget):
             'FLOWCODECHARACTERISATION': fc.characterisation_id(),
         }
         keywords['FLOWCODECALIBRATION'] = self.calibration_mode(fc)
+        # the FlowCode and per-combination channels hold tag abundances: displayed like fluorescence
+        for i, channel in enumerate(fce.export_pnn(layout, extra_channels), start=1):
+            if channel == fcc.FLOWCODE_CHANNEL or channel.startswith(fcc.COMBO_CHANNEL_PREFIX):
+                keywords[f'P{i}DISPLAY'] = 'LOG'
         combo_overrides = (fcc.combination_overrides(settings.get('combo_overrides'), design)
                            if fc.fret_corrected and settings.get('correction') == 'combo' else {})
         if combo_overrides:
@@ -5884,18 +6538,20 @@ class PluginWidget(QWidget):
         events = sum(s['total_events'] for _n, s in rows)
         barcoded = sum(sum(s['per_combo'].values()) for _n, s in rows)
         tandem_corrected = sum(1 for _n, s in rows if any(r['beta'] for r in s.get('tandem') or ()))
-        calibration = ({name: fcc.calibration_summary(s.get('combo_scales'), job['design']) for name, s in rows}
-                       if job['calibrate'] else None)
         state.last_export = {'time': datetime.now().strftime('%Y-%m-%d %H:%M'), 'folder': str(folder),
                              'n_samples': len(rows), 'events': int(events), 'barcoded': int(barcoded),
                              'tandem_tags': [t.fluor for t in job['tandems']],
                              'tandem_corrected': int(tandem_corrected),
-                             'no_fret': not job['fc'].fret_corrected, 'calibration': calibration,
-                             'overrides': dict(job['overrides'])}
+                             'no_fret': not job['fc'].fret_corrected, 'overrides': dict(job['overrides'])}
         if job['inputs'] == state.section_inputs(5, self.fingerprint()):
             state.mark_completed(5, self.fingerprint())
-        page.set_run_status(f'Done: {len(rows)} sample(s) exported.')
         self.state_changed()
+        try:
+            note = self.pages[6].adopt_exported_files(job['selected'], [key for key, _s in job['samples']])
+        except Exception:
+            logger.exception('FlowCode: the Analysis page could not switch to the exported files')
+            note = ''
+        page.set_run_status(f'Done: {len(rows)} sample(s) exported.' + (f' {note}' if note else ''))
 
     def _run_record(self, job) -> dict:
         """FlowCode_run.json: what the export used."""
@@ -5916,6 +6572,7 @@ class PluginWidget(QWidget):
             'matched_unstained': state.unstained_key,
             'thresholds': [{'Fluor': f, 'Tag': t, 'Threshold_Raw': float(r)}
                            for f, t, r in zip(design.fluors, design.tags, fc.thresholds)],
+            'sample_thresholds': self._sample_threshold_record(fc, design),
             'combinations': [{'Id': n, 'tags': list(t), 'channel': fcc.combo_channel_name(n),
                               'error': ('none' if not fc.fret_corrected else
                                         'combo' if fc.combo_error[g] is not None else 'pairwise')}
@@ -5942,6 +6599,17 @@ class PluginWidget(QWidget):
                 'merge_same_names': bool(state.merge_same_names)} if state.multi_library else {}),
             'samples': [{'sample': key, **summary} for key, summary in job['samples']],
         }
+
+    def _sample_threshold_record(self, fc, design) -> dict:
+        """The run record's sample thresholds: their source and, unless the
+        backbone's are re-used, the samples they were set on and the values."""
+        state = self.state
+        values = self.sample_debarcode_thresholds(fc)
+        if values is None:
+            return {'mode': fcs.SAMPLE_THRESHOLDS_BACKBONE}
+        return {'mode': state.sample_threshold_mode, 'samples': self.sample_threshold_selection(),
+                'thresholds': [{'Fluor': f, 'Tag': t, 'Threshold_Raw': float(r)}
+                               for f, t, r in zip(design.fluors, design.tags, values)]}
 
     def _write_library_combinations(self):
         """``FlowCode/combinations <library>.csv`` per library, in the
@@ -5976,7 +6644,7 @@ class PluginWidget(QWidget):
     def _start_task(self, key: str, fn) -> bool:
         if key in self._tasks:
             return False
-        thread = QThread(self)
+        thread = QThread()
         worker = _TaskWorker(key, fn)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -5985,6 +6653,7 @@ class PluginWidget(QWidget):
         worker.progress.connect(self._on_task_progress)
         worker.finished.connect(thread.quit)
         worker.error.connect(thread.quit)
+        _keeper().hold(thread, worker)
         thread.finished.connect(self._reap_threads)
         self._tasks[key] = worker
         self._task_experiment[key] = self._experiment_key
@@ -5993,9 +6662,9 @@ class PluginWidget(QWidget):
         return True
 
     def _reap_threads(self):
-        for thread in [t for t in self._threads if t.isFinished()]:
-            self._threads.remove(thread)
-            thread.deleteLater()
+        """Forget this plugin's finished task threads (the task keeper
+        deletes them)."""
+        self._threads = [t for t in self._threads if not t.isFinished()]
 
     def _on_task_progress(self, key, n, total, text):
         if self.bus is not None and total:
@@ -6006,6 +6675,8 @@ class PluginWidget(QWidget):
             self.pages[5].set_fix_status(f'{text}…')
         if key == 'load' and text:
             self.pages[3].load_status.setText(f'Reading the {text}…')
+        elif key == 'sample_space' and text:
+            self.pages[3].samples.load_status.setText(f'Unmixing the sample events: {text}…')
         elif key == 'match' and text:
             self.pages[1].match_status.setText(f'Matching scatter… ({n}/{total})')
         elif key == 'characterise' and text:
@@ -6032,6 +6703,8 @@ class PluginWidget(QWidget):
             self._on_auto_cells_finished(result)
         elif key == 'space':
             self._on_space_finished(result)
+        elif key == 'sample_space':
+            self._on_sample_space_finished(result)
         elif key == 'characterise':
             self._on_characterise_finished(result)
         self.refresh()
@@ -6055,6 +6728,9 @@ class PluginWidget(QWidget):
             self.pages[3].gate_controls[fcs.CELLS_GATE][2].setText(f'Automatic gate failed: {message}')
         elif key == 'space':
             self.pages[3].confirm_status.setText(f'Error: {message}')
+        elif key == 'sample_space':
+            self._pending_sample_space = None
+            self.pages[3].samples.load_status.setText(f'Could not load the sample events: {message}')
         elif key == 'characterise':
             self.pages[4].run_status.setText(f'Error: {message}')
         if key in ('load', 'space', 'auto_cells') and self._after_space is not None:

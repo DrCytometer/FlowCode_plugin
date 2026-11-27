@@ -9,10 +9,10 @@ copy of the figure from its maker and resizes it with the window (as
 Honeycluster's Pop Out does); its Save button starts in the same folder.
 Saved files are reported in the main window's status bar.
 
-Each exportable figure has a Fit to width box that sizes it to the width of
-the page and follows the page as the window is resized. It is checked by
-default; whether it is checked is remembered per figure (``figure_key``, or
-the panel's first name), so a figure can be kept at its own size.
+Each exportable figure has a Fit menu (width, height, whole figure or off)
+that sizes it to the page and follows the page as the window is resized.
+Width is the default; the choice is remembered per figure (``figure_key``,
+or the panel's first name), so a figure can be kept at its own size.
 
 Message figures ("Run the characterisation…") are shown at their own size
 without the controls.
@@ -33,12 +33,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QSizePolicy, QVBoxLayout, QWidget
 
 import honeychrome.settings as hc_settings
 from honeychrome.view_components.scalable_figure_widget import (
-    ScalableFigureWidget, figure_toolbar, initial_scale_for, report_saved,
+    FIT_WIDTH, ScalableFigureWidget, figure_toolbar, initial_scale_for, report_saved,
     scrollable_canvas_class,
 )
 
@@ -47,8 +47,6 @@ OPTIONS_SCOPE = 'flowcode'
 HELP_HEIGHT_FRACTION = 0.45
 HELP_MIN_HEIGHT = 160
 _INVALID_NAME_CHARS = re.compile(r'[\\/:*?"<>|]')
-# The FlowCode plugin's store for UI toggles (as in flowcode_unmix_tab).
-_SETTINGS_ORG, _SETTINGS_APP = 'honeychrome', 'plugin_FlowCodeUnmix'
 
 
 def scrolling_help(text: str) -> QWidget:
@@ -176,15 +174,8 @@ class FigurePanel(QWidget):
         key = str(getattr(self, 'figure_key', None) or self.name).split(' ')[0]
         return fo.FigureOptionsRef(store, OPTIONS_SCOPE, key)
 
-    def _fit_width_key(self) -> str:
-        return f"figure_fit_width/{getattr(self, 'figure_key', None) or self._first_name}"
-
-    def _fit_width_setting(self) -> bool:
-        value = QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(self._fit_width_key(), True)
-        return str(value).lower() == 'true'
-
-    def _save_fit_width(self, checked: bool):
-        QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue(self._fit_width_key(), bool(checked))
+    def _fit_key(self) -> str:
+        return f"flowcode/{getattr(self, 'figure_key', None) or self._first_name}"
 
     @property
     def canvas(self):
@@ -201,8 +192,7 @@ class FigurePanel(QWidget):
             self.view = _PanelFigure(self, fig, title=self.name, experiment_dir='',
                                      pop_out=self.pop_out if make is not None else None,
                                      initial_scale=initial_scale_for(fig), parent=self,
-                                     options=self.options_ref(), fit_width=self._fit_width_setting())
-            self.view.fitWidthToggled.connect(self._save_fit_width)
+                                     options=self.options_ref(), fit=FIT_WIDTH, fit_key=self._fit_key())
             self.holder.addWidget(self.view, stretch=1)
         else:
             self.view = scrollable_canvas_class()(fig)
@@ -260,7 +250,7 @@ class FigurePanel(QWidget):
         finally:
             QApplication.restoreOverrideCursor()
         if fig is None:
-            QMessageBox.warning(self, 'Pop Out', f'The figure could not be drawn: {error}')
+            QMessageBox.warning(self, 'Pop Out failed', f'The figure could not be drawn: {error}')
             return
         open_figure_window(self, fig, self.name, connect=self.connect_canvas,
                            folder=self._folder_fn())
